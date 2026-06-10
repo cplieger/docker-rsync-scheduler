@@ -16,7 +16,7 @@ It can also be used one-shot by overriding the command.
 
 ### Why this design
 
-- **Client only** — ships `openssh-client`, not `openssh-server`. No `sshd`, no listening service, no host keys, smaller attack surface. This is a tool that *pushes/pulls*, not a target that *receives*.
+- **Client only** — ships `openssh-client`, not `openssh-server`. No `sshd`, no listening service, no host keys, smaller attack surface. This is a tool that _pushes/pulls_, not a target that _receives_.
 - **No bundled logic** — no entrypoint script, no cron, no env-to-config translation. You supply the sync command (and, for scheduled use, the scheduler). This keeps the image generic and the orchestration explicit in your own config.
 - **Pinned + reproducible** — Alpine base pinned by digest; `rsync` and `openssh-client` pinned by version and tracked by [Renovate](https://github.com/renovatebot/renovate).
 - **Multi-arch** — `linux/amd64` and `linux/arm64`.
