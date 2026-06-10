@@ -42,7 +42,7 @@ services:
     environment:
       LOG_LEVEL: "info"
       CONFIG_PATH: "/config/config.yaml"
-      SYNC_INTERVAL: "1h"   # Go duration; "off" disables the built-in scheduler
+      SYNC_INTERVAL: "6h"   # Go duration; "off" disables the built-in scheduler
       SYNC_TIMEOUT: "10m"
     volumes:
       - ./config.yaml:/config/config.yaml:ro
@@ -56,7 +56,7 @@ The container runs in one of two modes, selected by `SYNC_INTERVAL`.
 
 ### Built-in scheduler (default)
 
-Set `SYNC_INTERVAL` to a Go duration (`1h`, `30m`, `15m`, …). The container runs a sync pass at startup and then every interval. This is the zero-dependency default; nothing else is required. On an unset or unparseable (non-sentinel) value it falls back to `1h`.
+Set `SYNC_INTERVAL` to a Go duration (`6h`, `1h`, `30m`, …). The container runs a sync pass at startup and then every interval. This is the zero-dependency default; nothing else is required. On an unset or unparseable (non-sentinel) value it falls back to `6h`.
 
 ### External scheduler
 
@@ -81,7 +81,7 @@ services:
       SYNC_TIMEOUT: "10m"
     labels:
       ofelia.enabled: "true"
-      ofelia.job-exec.rsync-sync.schedule: "@every 1h"
+      ofelia.job-exec.rsync-sync.schedule: "@every 6h"
       ofelia.job-exec.rsync-sync.command: "docker-rsync-scheduler sync"
       ofelia.job-exec.rsync-sync.no-overlap: "true"
     volumes:
@@ -99,7 +99,7 @@ Overlapping passes are prevented in both modes by an advisory file lock (`flock`
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
 | `CONFIG_PATH` | Path to the YAML config inside the container | `/config/config.yaml` | No |
-| `SYNC_INTERVAL` | Built-in scheduler cadence as a Go duration (e.g. `1h`, `30m`, `15m`). The first pass runs at startup; subsequent passes fire every interval thereafter. Set to `off` (or `disabled`/`0`) to disable the built-in scheduler and trigger passes externally — see [Scheduling modes](#scheduling-modes). Falls back to `1h` on an unset or unparseable (non-sentinel) value. | `1h` | No |
+| `SYNC_INTERVAL` | Built-in scheduler cadence as a Go duration (e.g. `6h`, `1h`, `30m`). The first pass runs at startup; subsequent passes fire every interval thereafter. Set to `off` (or `disabled`/`0`) to disable the built-in scheduler and trigger passes externally — see [Scheduling modes](#scheduling-modes). Falls back to `6h` on an unset or unparseable (non-sentinel) value. | `6h` | No |
 | `SYNC_TIMEOUT` | Per-job rsync timeout as a Go duration (e.g. `10m`, `1h`). Falls back to the default on unset or unparseable values. | `10m` | No |
 | `LOG_LEVEL` | Log level: `debug`, `info`, `warn`, or `error` | `info` | No |
 

@@ -63,9 +63,9 @@ const (
 	defaultSyncTimeout = 10 * time.Minute
 
 	// defaultInterval is the fallback built-in scheduler cadence when
-	// SYNC_INTERVAL is unset or unparseable (non-sentinel). One hour keeps
+	// SYNC_INTERVAL is unset or unparseable (non-sentinel). Six hours keeps
 	// mirrors fresh without thrashing a slow remote.
-	defaultInterval = 1 * time.Hour
+	defaultInterval = 6 * time.Hour
 
 	// lockFilePath guards against overlapping sync passes. flock(2) on this
 	// file serialises runs both in-process (the built-in ticker racing the
