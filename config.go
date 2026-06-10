@@ -134,7 +134,8 @@ func loadConfig() (config, error) {
 
 	info, statErr := os.Stat(path)
 	if statErr != nil {
-		slog.Error("config not found", "path", path, "error", statErr)
+		slog.Error("config not found", "path", path, "error", statErr,
+			"hint", "mount a config.yaml at this path — see config.example.yaml in the repo")
 		return config{}, fmt.Errorf("stat config %q: %w", path, statErr)
 	}
 	if info.Size() > configCapBytes {

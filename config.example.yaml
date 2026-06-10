@@ -1,0 +1,32 @@
+# docker-rsync-scheduler — example configuration.
+#
+# Copy to config.yaml and edit, then mount it at /config/config.yaml
+# (or point CONFIG_PATH elsewhere). The container fails fast with a clear
+# error if the config is missing or invalid.
+#
+# Each job pushes <local>/ to <remote_host>:<remote_path>/ one-way over
+# rsync+ssh. A missing or empty <local> directory skips that job rather than
+# letting --delete wipe the remote. Scheduling is controlled by the
+# SYNC_INTERVAL env var (default 6h built-in; set SYNC_INTERVAL=off to disable
+# the built-in loop and trigger passes externally via `docker-rsync-scheduler sync`).
+#
+# Placeholder hosts use the RFC 5737 documentation range (192.0.2.0/24).
+
+jobs:
+  - name: certs                          # required, unique; used as a log key
+    local: /sources/certs                # required, absolute path inside the container
+    remote_host: root@192.0.2.10         # required, [user@]host
+    remote_path: /srv/certs              # required, absolute path on the remote
+    remote_uid: 1000                     # optional; with remote_gid -> rsync --chown=uid:gid
+    remote_gid: 1000                     # optional
+    ssh_key: /keys/id_ed25519            # required, private key path inside the container (host file mode 0600)
+    delete: true                         # optional (default false) -> rsync --delete when true
+    excludes:                            # optional, per-job exclude patterns (plus the built-in globals)
+      - "**/*.lock"
+      - "logs"
+
+  - name: appconfig                      # a second, minimal job (no chown, no delete)
+    local: /sources/appconfig
+    remote_host: deploy@192.0.2.11
+    remote_path: /etc/myapp
+    ssh_key: /keys/id_ed25519

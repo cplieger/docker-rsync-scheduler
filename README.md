@@ -105,6 +105,8 @@ Overlapping passes are prevented in both modes by an advisory file lock (`flock`
 
 ### Config schema (`config.yaml`)
 
+A ready-to-edit [`config.example.yaml`](config.example.yaml) ships in the repo — copy it to `config.yaml` and edit. The container **fails fast** with a clear error if the config is missing or invalid.
+
 ```yaml
 jobs:
   - name: caddy                          # required, unique, used as a log key
