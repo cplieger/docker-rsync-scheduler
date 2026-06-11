@@ -1,5 +1,5 @@
 # check=error=true
-FROM golang:1.26-trixie@sha256:0dcba0d95dbfb072e9917a106b9e07d7cc298097dc83e9307056ef1889de654d AS go-builder
+FROM golang:1.26-trixie@sha256:0f4938e8d12c5c64fbf0d5d15e950c437ad4c65f761890cfbb466fee75a7bbaa AS go-builder
 ENV GOTOOLCHAIN=auto
 
 WORKDIR /src
