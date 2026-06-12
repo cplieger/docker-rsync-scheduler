@@ -6,7 +6,6 @@
 ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)
 ![base: Alpine](https://img.shields.io/badge/base-Alpine-0D597F?logo=alpinelinux)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/docker-rsync-scheduler/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/docker-rsync-scheduler)
-[![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 
 Push local directories to a remote host over rsync-and-ssh on a schedule — structured logs, no metrics, no open ports.
 
