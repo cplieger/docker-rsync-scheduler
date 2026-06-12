@@ -24,7 +24,7 @@ Reads a YAML config defining _N_ sync jobs. For each job it runs `rsync` over `s
 
 - _Scheduler your way._ Ships with a self-contained Go interval scheduler so you don't need external cron, systemd timers, or orchestrator-level scheduling. Set `SYNC_INTERVAL` to a Go duration and the container runs one pass at startup (immediate freshness on deploy) then every interval. If you already run a central scheduler (Ofelia, cron), set `SYNC_INTERVAL=off` and trigger passes with `docker exec rsync docker-rsync-scheduler sync` instead. See [Scheduling modes](#scheduling-modes).
 - _Overlap lock._ A single advisory file lock (`flock` on `/tmp/.docker-rsync-scheduler.lock`) serialises every sync pass — the built-in ticker racing the startup pass in-process, and an external `sync` exec racing the ticker cross-process — so two passes never run at once.
-- _Three subcommands._ `daemon` (PID 1, the default command; dispatches built-in vs external based on `SYNC_INTERVAL`), `sync` (one pass, exit 0 if all jobs succeed, 1 if any fail), and `health` (the Docker probe). The built-in startup pass, the interval pass, and the `sync` subcommand share one sync-pass function.
+- _Subcommands._ `daemon` (PID 1, the default command; dispatches built-in vs external based on `SYNC_INTERVAL`), `sync` (one pass, exit 0 if all jobs succeed, 1 if any fail), and `health` (the Docker probe). The built-in startup pass, the interval pass, and the `sync` subcommand share one sync-pass function.
 - _No shell._ Each job is executed via `exec.CommandContext` with an explicit argument slice. The `-e "ssh ..."` value is a single argument that rsync splits internally — nothing is ever interpreted by a shell.
 - _Injection guardrails._ Config is validated at startup: required fields present, names unique, `local`/`remote_path` absolute, `remote_host` matched against a strict pattern, and every field rejected if it contains shell metacharacters or control characters as defense-in-depth. The ssh key must exist and be readable.
 - _Bounded resources._ Per-job timeout via context (default 10m, override with `SYNC_TIMEOUT`); captured rsync stderr is bounded to 1 MB so a chatty subprocess cannot OOM the container.
@@ -158,12 +158,12 @@ _Why it runs as root._ The container runs as root by design: it must read host-o
 
 All dependencies are updated automatically via [Renovate](https://github.com/renovatebot/renovate) and pinned by digest or version for reproducibility.
 
-| Dependency | Version | Source |
-|------------|---------|--------|
-| golang | `1.26-trixie` | [Go](https://hub.docker.com/_/golang) |
-| alpine | `3.24.0` | [Docker Hub](https://hub.docker.com/_/alpine) |
-| rsync | `3.4.3-r1` | [Alpine](https://pkgs.alpinelinux.org/package/v3.24/main/x86_64/rsync) |
-| openssh-client | `10.3_p1-r0` | [Alpine](https://pkgs.alpinelinux.org/package/v3.24/main/x86_64/openssh-client) |
+| Dependency | Source |
+|------------|--------|
+| golang | [Go](https://hub.docker.com/_/golang) |
+| alpine | [Docker Hub](https://hub.docker.com/_/alpine) |
+| rsync | [Alpine](https://pkgs.alpinelinux.org/packages?name=rsync) |
+| openssh-client | [Alpine](https://pkgs.alpinelinux.org/packages?name=openssh-client) |
 
 Runtime Go modules: [`github.com/cplieger/health`](https://github.com/cplieger/health) and [`gopkg.in/yaml.v3`](https://gopkg.in/yaml.v3).
 
