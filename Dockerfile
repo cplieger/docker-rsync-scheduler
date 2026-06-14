@@ -14,10 +14,11 @@ FROM alpine:3.24.0@sha256:a2d49ea686c2adfe3c992e47dc3b5e7fa6e6b5055609400dc2acae
 
 # No apk version pins: the digest-pinned base fixes the Alpine release line, so
 # package-revision pins only strand the build on an Alpine release bump.
-# --upgrade is load-bearing: it pulls patched transitive deps (libcrypto3/libssl3,
-# etc.) that the pinned base image pre-installs at an older, CVE-affected
-# revision; plain `apk add` would leave the already-satisfied base OpenSSL unpatched.
-RUN apk add --no-cache --upgrade \
+# apk upgrade is load-bearing: it floats forward base packages the pinned base
+# pre-installs at an older, CVE-affected revision (libcrypto3/libssl3, etc.) —
+# plain `apk add` leaves already-satisfied base packages unpatched.
+RUN apk upgrade --no-cache \
+    && apk add --no-cache \
         rsync \
         openssh-client
 
