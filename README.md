@@ -1,13 +1,14 @@
 # docker-rsync-scheduler
 
-[![CI](https://github.com/cplieger/docker-rsync-scheduler/actions/workflows/ci.yaml/badge.svg)](https://github.com/cplieger/docker-rsync-scheduler/actions/workflows/ci.yaml)
-[![GitHub release](https://img.shields.io/github/v/release/cplieger/docker-rsync-scheduler)](https://github.com/cplieger/docker-rsync-scheduler/releases)
 [![Image Size](https://ghcr-badge.egpl.dev/cplieger/docker-rsync-scheduler/size)](https://github.com/cplieger/docker-rsync-scheduler/pkgs/container/docker-rsync-scheduler)
 ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)
 ![base: Alpine](https://img.shields.io/badge/base-Alpine-0D597F?logo=alpinelinux)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/docker-rsync-scheduler/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/docker-rsync-scheduler)
-[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/docker-rsync-scheduler/badges/coverage.json)](https://github.com/cplieger/docker-rsync-scheduler/actions/workflows/coverage.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/cplieger/docker-rsync-scheduler)](https://goreportcard.com/report/github.com/cplieger/docker-rsync-scheduler)
+[![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/docker-rsync-scheduler/badges/coverage.json)](https://github.com/cplieger/docker-rsync-scheduler/actions/workflows/coverage.yml)
+[![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/docker-rsync-scheduler/badges/mutation.json)](https://github.com/cplieger/docker-rsync-scheduler/issues?q=label%3Agremlins-tracker)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13209/badge)](https://www.bestpractices.dev/projects/13209)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/docker-rsync-scheduler/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/docker-rsync-scheduler)
+[![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/docker-rsync-scheduler/releases)
 
 Push local directories to a remote host over rsync-and-ssh on a schedule — structured logs, no metrics, no open ports.
 
