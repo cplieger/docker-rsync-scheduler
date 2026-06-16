@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -219,6 +220,14 @@ func TestHasShellMeta(t *testing.T) {
 		{"glob exclude", "**/*.lock", false},
 		{"ipv6 host", "2001:db8::1", false},
 		{"dash and dot", "host-1.example.com", false},
+		// 0x20 (space) is the boundary of the r < 0x20 control-char guard:
+		// it must be treated as a printable, allowed character. A `<` -> `<=`
+		// off-by-one would wrongly reject it.
+		{"space is printable", "a b", false},
+		// 0x1f (unit separator) is the last control char below the boundary.
+		{"unit separator is control", "a\x1fb", true},
+		// 0x7f (DEL) is the explicit second control-char branch.
+		{"del is control", "a\x7fb", true},
 		{"semicolon", "a;b", true},
 		{"pipe", "a|b", true},
 		{"ampersand", "a&b", true},
@@ -367,6 +376,97 @@ func TestLoadConfigMissingFile(t *testing.T) {
 	}
 }
 
+func TestCheckReadable(t *testing.T) {
+	t.Run("readable file returns nil", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "key")
+		if err := os.WriteFile(path, []byte("k"), 0o600); err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+
+		if err := checkReadable(path); err != nil {
+			t.Errorf("checkReadable(%q) = %v, want nil", path, err)
+		}
+	})
+
+	// A missing file must surface a genuine not-exist error. If the err != nil
+	// guard is negated, the function skips the early return and instead closes
+	// a nil *os.File, which reports os.ErrInvalid ("invalid argument") rather
+	// than the real not-exist cause — a regression this assertion catches.
+	t.Run("missing file returns a not-exist error", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "absent")
+
+		err := checkReadable(path)
+
+		if err == nil {
+			t.Fatalf("checkReadable(%q) = nil, want error", path)
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("checkReadable(%q) = %v, want an os.ErrNotExist", path, err)
+		}
+	})
+}
+
+// TestLoadConfig_acceptsExactlyCapBytes pins the upper boundary of the size
+// guard: a config of exactly configCapBytes must be accepted, because the
+// guard rejects only files strictly larger than the cap. A `>` -> `>=`
+// off-by-one would reject a file sitting precisely on the limit.
+func TestLoadConfig_acceptsExactlyCapBytes(t *testing.T) {
+	dir := t.TempDir()
+	key := filepath.Join(dir, "id_ed25519")
+	if err := os.WriteFile(key, []byte("k\n"), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+	cfgPath := filepath.Join(dir, "config.yaml")
+
+	doc := "jobs:\n  - name: caddy\n    local: /sources/caddy\n" +
+		"    remote_host: root@host\n    remote_path: /srv/caddy\n" +
+		"    ssh_key: " + key + "\n"
+	// Pad to exactly the cap with a trailing full-line YAML comment so the
+	// document stays valid while landing on the boundary byte count.
+	pad := configCapBytes - len(doc)
+	if pad < 1 {
+		t.Fatalf("base doc is %d bytes, already >= cap %d", len(doc), configCapBytes)
+	}
+	doc += "#" + strings.Repeat("x", pad-1)
+	if len(doc) != configCapBytes {
+		t.Fatalf("padded doc = %d bytes, want exactly %d", len(doc), configCapBytes)
+	}
+	if err := os.WriteFile(cfgPath, []byte(doc), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("CONFIG_PATH", cfgPath)
+	t.Setenv("SYNC_INTERVAL", "")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig at exactly cap (%d bytes) = %v, want success", configCapBytes, err)
+	}
+	if len(cfg.Jobs) != 1 || cfg.Jobs[0].Name != "caddy" {
+		t.Errorf("loadConfig = %+v, want one caddy job", cfg.Jobs)
+	}
+}
+
+// TestLoadConfig_rejectsOverCapBytes covers the other side of the boundary:
+// one byte over the cap must be rejected by the size guard.
+func TestLoadConfig_rejectsOverCapBytes(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	doc := strings.Repeat("#", configCapBytes+1)
+	if err := os.WriteFile(cfgPath, []byte(doc), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("CONFIG_PATH", cfgPath)
+
+	_, err := loadConfig()
+
+	if err == nil {
+		t.Fatal("loadConfig one byte over cap = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Errorf("loadConfig over cap error = %q, want to contain 'exceeds'", err)
+	}
+}
+
 func TestLoadSyncTimeout(t *testing.T) {
 	t.Run("default when unset", func(t *testing.T) {
 		t.Setenv("SYNC_TIMEOUT", "")
@@ -388,6 +488,21 @@ func TestLoadSyncTimeout(t *testing.T) {
 	})
 	t.Run("default on non-positive", func(t *testing.T) {
 		t.Setenv("SYNC_TIMEOUT", "-5m")
+		if got := loadSyncTimeout(); got != defaultSyncTimeout {
+			t.Errorf("loadSyncTimeout() = %v, want %v", got, defaultSyncTimeout)
+		}
+	})
+	// Exactly zero is the boundary of the d <= 0 guard: a parseable "0"
+	// duration must fall back to the default, not be used as a 0s timeout.
+	// A `<=` -> `<` off-by-one would let the zero through.
+	t.Run("default on zero", func(t *testing.T) {
+		t.Setenv("SYNC_TIMEOUT", "0")
+		if got := loadSyncTimeout(); got != defaultSyncTimeout {
+			t.Errorf("loadSyncTimeout() = %v, want %v", got, defaultSyncTimeout)
+		}
+	})
+	t.Run("default on zero seconds", func(t *testing.T) {
+		t.Setenv("SYNC_TIMEOUT", "0s")
 		if got := loadSyncTimeout(); got != defaultSyncTimeout {
 			t.Errorf("loadSyncTimeout() = %v, want %v", got, defaultSyncTimeout)
 		}

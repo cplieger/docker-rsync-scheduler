@@ -131,6 +131,7 @@ Every job also receives a fixed set of global excludes: `.stfolder`, `.stversion
 | Mount | Description |
 |-------|-------------|
 | `/config/config.yaml` | The YAML config (mount read-only). Override the path with `CONFIG_PATH`. |
+| `/config/known_hosts` | Optional SSH known_hosts file (mount read-only). When present, enables strict host-key pinning instead of TOFU. See [SSH host-key verification](#ssh-host-key-verification). |
 | `/keys/<name>` | SSH private key(s). Mount read-only; the host file must be mode `0600`. |
 | (your sources) | The `local` directories referenced by your jobs. Mount read-only. |
 
@@ -147,6 +148,25 @@ HEALTHCHECK --interval=60s --timeout=5s --retries=3 --start-period=30s \
 
 No network listener, no HTTP server, no exposed ports. The image ships `openssh-client` only — no `sshd`. Each job is executed with an explicit argument slice via `exec.CommandContext`; nothing is passed through a shell. Config fields are validated and rejected if they contain shell metacharacters or control characters, even though the arg-list exec already prevents interpretation.
 
+### SSH host-key verification
+
+By default the container uses `StrictHostKeyChecking=accept-new` (Trust On First Use). This lets a fresh deploy connect without pre-provisioning host keys, but trusts the first key it sees.
+
+For stricter security, mount a read-only `known_hosts` file at `/config/known_hosts`. When this file is present the container switches to `StrictHostKeyChecking=yes` with an explicit `UserKnownHostsFile`, rejecting connections to any host whose key does not match the pinned entry. This prevents MITM attacks at the cost of requiring the operator to maintain the `known_hosts` file.
+
+Generate it from your remote:
+
+```bash
+ssh-keyscan -t ed25519 192.168.1.87 > known_hosts
+```
+
+Then mount it into the container:
+
+```yaml
+volumes:
+  - ./known_hosts:/config/known_hosts:ro
+```
+
 | Tool | Result |
 |------|--------|
 | [govulncheck](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) | No vulnerabilities in call graph |
@@ -155,7 +175,7 @@ No network listener, no HTTP server, no exposed ports. The image ships `openssh-
 | [gitleaks](https://github.com/gitleaks/gitleaks) | No secrets detected |
 | [hadolint](https://github.com/hadolint/hadolint) | Clean |
 
-_Why it runs as root._ The container runs as root by design: it must read host-owned source files (e.g. uid 568) across multiple bind mounts and write `known_hosts` on first contact (`StrictHostKeyChecking=accept-new`). A fixed non-root `USER` would break both. Mount sources read-only and use a dedicated, least-privilege SSH key on the remote.
+_Why it runs as root._ The container runs as root by design: it must read host-owned source files (e.g. uid 568) across multiple bind mounts. A fixed non-root `USER` would break this. Mount sources read-only and use a dedicated, least-privilege SSH key on the remote.
 
 ## Dependencies
 

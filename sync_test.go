@@ -28,10 +28,18 @@ func argJob(delete bool, uid, gid *int, excludes []string) *job {
 	}
 }
 
-const wantSSH = "ssh -i /keys/id_ed25519 -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10"
+const (
+	wantSSHAcceptNew = "ssh -i /keys/id_ed25519 -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10"
+	wantSSHStrict    = "ssh -i /keys/id_ed25519 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/config/known_hosts -o BatchMode=yes -o ConnectTimeout=10"
+)
 
 func TestBuildRsyncArgs(t *testing.T) {
 	t.Parallel()
+
+	// Ensure baseline tests run with known_hosts absent (accept-new mode).
+	origKH := knownHostsExists
+	knownHostsExists = func() bool { return false }
+	t.Cleanup(func() { knownHostsExists = origKH })
 
 	t.Run("minimal has no delete or chown", func(t *testing.T) {
 		t.Parallel()
@@ -111,7 +119,7 @@ func TestBuildRsyncArgs(t *testing.T) {
 		t.Parallel()
 		got := buildRsyncArgs(argJob(true, new(0), new(0), []string{"logs"}))
 		want := []string{
-			"-rlptD", "--delete", "--chown=0:0", "--stats", "-e", wantSSH,
+			"-rlptD", "--delete", "--chown=0:0", "--stats", "-e", wantSSHAcceptNew,
 			"--exclude=.stfolder", "--exclude=.stversions",
 			"--exclude=.DS_Store", "--exclude=Thumbs.db",
 			"--exclude=logs",
@@ -121,6 +129,64 @@ func TestBuildRsyncArgs(t *testing.T) {
 			t.Errorf("buildRsyncArgs =\n  %v\nwant\n  %v", got, want)
 		}
 	})
+}
+
+func TestSSHCommand_KnownHostsAbsent(t *testing.T) {
+	t.Parallel()
+	orig := knownHostsExists
+	knownHostsExists = func() bool { return false }
+	t.Cleanup(func() { knownHostsExists = orig })
+
+	got := sshCommand("/keys/id_ed25519")
+	if got != wantSSHAcceptNew {
+		t.Errorf("sshCommand (no known_hosts) = %q, want %q", got, wantSSHAcceptNew)
+	}
+	if !strings.Contains(got, "StrictHostKeyChecking=accept-new") {
+		t.Error("expected accept-new when known_hosts is absent")
+	}
+	if strings.Contains(got, "UserKnownHostsFile") {
+		t.Error("UserKnownHostsFile must not be present when known_hosts is absent")
+	}
+}
+
+func TestSSHCommand_KnownHostsPresent(t *testing.T) {
+	t.Parallel()
+	orig := knownHostsExists
+	knownHostsExists = func() bool { return true }
+	t.Cleanup(func() { knownHostsExists = orig })
+
+	got := sshCommand("/keys/id_ed25519")
+	if got != wantSSHStrict {
+		t.Errorf("sshCommand (known_hosts present) = %q, want %q", got, wantSSHStrict)
+	}
+	if !strings.Contains(got, "StrictHostKeyChecking=yes") {
+		t.Error("expected StrictHostKeyChecking=yes when known_hosts is present")
+	}
+	if !strings.Contains(got, "UserKnownHostsFile=/config/known_hosts") {
+		t.Error("expected UserKnownHostsFile=/config/known_hosts when known_hosts is present")
+	}
+	if !strings.Contains(got, "BatchMode=yes") {
+		t.Error("BatchMode=yes must always be present")
+	}
+	if !strings.Contains(got, "ConnectTimeout=10") {
+		t.Error("ConnectTimeout=10 must always be present")
+	}
+}
+
+func TestBuildRsyncArgs_KnownHostsPresent(t *testing.T) {
+	t.Parallel()
+	orig := knownHostsExists
+	knownHostsExists = func() bool { return true }
+	t.Cleanup(func() { knownHostsExists = orig })
+
+	got := buildRsyncArgs(argJob(false, nil, nil, nil))
+	i := slices.Index(got, "-e")
+	if i == -1 || i+1 >= len(got) {
+		t.Fatalf("-e argument missing in %v", got)
+	}
+	if got[i+1] != wantSSHStrict {
+		t.Errorf("ssh arg (known_hosts) = %q, want %q", got[i+1], wantSSHStrict)
+	}
 }
 
 func hasChown(args []string) bool {
@@ -135,8 +201,8 @@ func assertSSHArg(t *testing.T, args []string) {
 	if i == -1 || i+1 >= len(args) {
 		t.Fatalf("-e argument missing in %v", args)
 	}
-	if args[i+1] != wantSSH {
-		t.Errorf("ssh arg = %q, want %q", args[i+1], wantSSH)
+	if args[i+1] != wantSSHAcceptNew {
+		t.Errorf("ssh arg = %q, want %q", args[i+1], wantSSHAcceptNew)
 	}
 }
 
@@ -307,10 +373,40 @@ func TestCappedBuffer(t *testing.T) {
 	})
 }
 
+// TestCappedBuffer_capEnforcedAcrossWrites pins the remaining-room arithmetic
+// (max - current length). A first write half-fills the buffer; the second
+// write must be truncated against the *remaining* room, not the full cap.
+// Observing the exact retained bytes (not just the reported count) catches a
+// `-` -> `+` mutation of the remaining computation, which would let the second
+// write overflow the cap to "abcdef".
+func TestCappedBuffer_capEnforcedAcrossWrites(t *testing.T) {
+	t.Parallel()
+	b := &cappedBuffer{max: 4}
+
+	n1, _ := b.Write([]byte("ab"))
+	n2, _ := b.Write([]byte("cdef"))
+
+	if n1 != 2 || n2 != 4 {
+		t.Errorf("Write lengths = (%d, %d), want (2, 4)", n1, n2)
+	}
+	if b.String() != "abcd" {
+		t.Errorf("cappedBuffer after writes = %q, want abcd", b.String())
+	}
+	if len(b.String()) > 4 {
+		t.Errorf("cappedBuffer length = %d, want <= cap 4", len(b.String()))
+	}
+}
+
 func TestTail(t *testing.T) {
 	t.Parallel()
 	if got := tail("short", 100); got != "short" {
 		t.Errorf("tail no truncation = %q, want short", got)
+	}
+	// len(s) == n is the boundary of the len(s) <= n guard: the string fits
+	// exactly and must be returned verbatim with no truncation marker. A
+	// `<=` -> `<` off-by-one would prepend the marker here.
+	if got := tail("abc", 3); got != "abc" {
+		t.Errorf("tail(%q, 3) = %q, want abc (len == n, returned verbatim)", "abc", got)
 	}
 	got := tail("abcdefghij", 3)
 	if !strings.HasSuffix(got, "hij") {
@@ -373,6 +469,41 @@ func TestProperty_ParseStatsNeverPanics(t *testing.T) {
 		got := parseStats(in)
 		if got.files < 0 || got.bytes < 0 {
 			rt.Fatalf("parseStats(%q) = %+v, want non-negative", in, got)
+		}
+	})
+}
+
+// TestProperty_CappedBufferNeverExceedsMax asserts the two core invariants of
+// cappedBuffer across any sequence of writes: the retained bytes never exceed
+// max, and they are exactly the first min(total, max) bytes of the
+// concatenated input. This is the round-trip/bound counterpart to the
+// table-driven cap test and robustly kills arithmetic mutations of the
+// remaining-room computation.
+func TestProperty_CappedBufferNeverExceedsMax(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		max := rapid.IntRange(0, 64).Draw(rt, "max")
+		chunks := rapid.SliceOfN(rapid.SliceOfN(rapid.Byte(), 0, 16), 0, 8).Draw(rt, "chunks")
+
+		b := &cappedBuffer{max: max}
+		var concat []byte
+		for _, chunk := range chunks {
+			n, err := b.Write(chunk)
+			if err != nil {
+				rt.Fatalf("Write(%q) returned error %v", chunk, err)
+			}
+			if n != len(chunk) {
+				rt.Fatalf("Write(%q) reported n=%d, want %d (full length always reported)", chunk, n, len(chunk))
+			}
+			concat = append(concat, chunk...)
+		}
+
+		got := b.String()
+		if len(got) > max {
+			rt.Fatalf("buffer length %d exceeds max %d", len(got), max)
+		}
+		wantLen := min(len(concat), max)
+		if want := string(concat[:wantLen]); got != want {
+			rt.Fatalf("buffer = %q, want %q (first %d bytes of input)", got, want, wantLen)
 		}
 	})
 }
