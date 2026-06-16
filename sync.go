@@ -65,10 +65,36 @@ type jobResult struct {
 	success    bool
 }
 
+// knownHostsPath is the conventional location for a user-supplied
+// known_hosts file. When this file is present (mounted read-only by
+// the operator), ssh switches from TOFU (accept-new) to strict host-key
+// pinning — a stronger security posture for environments where the remote
+// host key is pre-known.
+const knownHostsPath = "/config/known_hosts"
+
+// knownHostsExists reports whether a known_hosts file is present at the
+// conventional path. Extracted as a package-level variable so tests can
+// override it without touching the filesystem.
+var knownHostsExists = func() bool {
+	_, err := os.Stat(knownHostsPath)
+	return err == nil
+}
+
 // sshCommand builds the single -e argument string. rsync splits it
 // internally; there is no shell, so the key path (already validated to
 // contain no whitespace or metacharacters) needs no quoting.
+//
+// When a known_hosts file exists at /config/known_hosts, the command uses
+// StrictHostKeyChecking=yes with an explicit UserKnownHostsFile. When
+// absent, it uses accept-new (TOFU) so first-run works without
+// pre-provisioning host keys.
 func sshCommand(key string) string {
+	if knownHostsExists() {
+		return fmt.Sprintf(
+			"ssh -i %s -o StrictHostKeyChecking=yes -o UserKnownHostsFile=%s -o BatchMode=yes -o ConnectTimeout=10",
+			key, knownHostsPath,
+		)
+	}
 	return fmt.Sprintf(
 		"ssh -i %s -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10",
 		key,

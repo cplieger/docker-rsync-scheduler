@@ -43,25 +43,37 @@ func main() {
 	}
 }
 
+// loadRuntime performs the shared startup sequence for both the daemon
+// and the sync subcommand: configures the logger, loads and validates
+// the config, and reads the sync timeout. It returns a health marker
+// without setting or cleaning it — callers manage the marker lifecycle
+// differently (daemon defers Cleanup; sync deliberately does not).
+func loadRuntime() (config, time.Duration, *health.Marker, error) {
+	setupLogger()
+
+	cfg, err := loadConfig()
+	if err != nil {
+		return config{}, 0, nil, err
+	}
+	timeout := loadSyncTimeout()
+	marker := health.NewMarker(healthMarkerPath)
+	return cfg, timeout, marker, nil
+}
+
 // run is the composition root for the long-running container (the `daemon`
 // subcommand and the default no-arg command). It loads config, wires the
 // health marker, and dispatches to the built-in interval scheduler or the
 // idle external-trigger loop based on cfg.ScheduleEnabled. Returning an
 // error exits non-zero.
 func run(ctx context.Context) error {
-	setupLogger()
-
-	cfg, err := loadConfig()
+	cfg, timeout, marker, err := loadRuntime()
 	if err != nil {
 		return err
 	}
-	timeout := loadSyncTimeout()
+	defer marker.Cleanup()
 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	marker := health.NewMarker(healthMarkerPath)
-	defer marker.Cleanup()
 
 	if cfg.ScheduleEnabled {
 		runBuiltin(ctx, marker, cfg, timeout)
@@ -137,15 +149,14 @@ func runExternal(ctx context.Context, marker *health.Marker, cfg config) {
 // file must persist so the running container's healthcheck reflects this
 // run.
 func runSync(ctx context.Context) int {
-	setupLogger()
-
-	cfg, err := loadConfig()
+	cfg, timeout, marker, err := loadRuntime()
 	if err != nil {
 		return 1
 	}
-	timeout := loadSyncTimeout()
+	// NOTE: marker.Cleanup() is deliberately NOT deferred here. The marker
+	// must persist after exit so the long-running container's healthcheck
+	// reflects this externally-triggered run.
 
-	marker := health.NewMarker(healthMarkerPath)
 	failCount := runSyncPass(ctx, cfg, timeout, "external", defaultCommandRunner)
 	marker.Set(failCount == 0)
 
