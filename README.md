@@ -155,11 +155,13 @@ By default the container uses `StrictHostKeyChecking=accept-new` (Trust On First
 For stricter security, mount a read-only `known_hosts` file at `/config/known_hosts`. When this file is present the container switches to `StrictHostKeyChecking=yes` with an explicit `UserKnownHostsFile`, rejecting connections to any host whose key does not match the pinned entry. This prevents MITM attacks at the cost of requiring the operator to maintain the `known_hosts` file.
 
 Generate it from your remote:
+
 ```bash
 ssh-keyscan -t ed25519 192.168.1.87 > known_hosts
 ```
 
 Then mount it into the container:
+
 ```yaml
 volumes:
   - ./known_hosts:/config/known_hosts:ro
