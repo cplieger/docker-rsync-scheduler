@@ -297,11 +297,9 @@ type cappedBuffer struct {
 
 func (c *cappedBuffer) Write(p []byte) (int, error) {
 	if remaining := c.max - c.buf.Len(); remaining > 0 {
-		if len(p) > remaining {
-			c.buf.Write(p[:remaining])
-		} else {
-			c.buf.Write(p)
-		}
+		// Append at most `remaining` bytes: min() clamps the slice to whichever
+		// of the input length or the leftover room is smaller.
+		c.buf.Write(p[:min(len(p), remaining)])
 	}
 	return len(p), nil
 }

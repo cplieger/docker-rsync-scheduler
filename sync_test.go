@@ -34,7 +34,10 @@ const (
 )
 
 func TestBuildRsyncArgs(t *testing.T) {
-	t.Parallel()
+	// Not parallel: this test overrides the shared package-level knownHostsExists
+	// var; running it concurrently with the other knownHostsExists-overriding
+	// tests is a data race on that var (go test -race). The subtests below only
+	// read the var (via buildRsyncArgs) and stay parallel.
 
 	// Ensure baseline tests run with known_hosts absent (accept-new mode).
 	origKH := knownHostsExists
@@ -132,7 +135,7 @@ func TestBuildRsyncArgs(t *testing.T) {
 }
 
 func TestSSHCommand_KnownHostsAbsent(t *testing.T) {
-	t.Parallel()
+	// Not parallel: overrides the shared package-level knownHostsExists var.
 	orig := knownHostsExists
 	knownHostsExists = func() bool { return false }
 	t.Cleanup(func() { knownHostsExists = orig })
@@ -150,7 +153,7 @@ func TestSSHCommand_KnownHostsAbsent(t *testing.T) {
 }
 
 func TestSSHCommand_KnownHostsPresent(t *testing.T) {
-	t.Parallel()
+	// Not parallel: overrides the shared package-level knownHostsExists var.
 	orig := knownHostsExists
 	knownHostsExists = func() bool { return true }
 	t.Cleanup(func() { knownHostsExists = orig })
@@ -174,7 +177,7 @@ func TestSSHCommand_KnownHostsPresent(t *testing.T) {
 }
 
 func TestBuildRsyncArgs_KnownHostsPresent(t *testing.T) {
-	t.Parallel()
+	// Not parallel: overrides the shared package-level knownHostsExists var.
 	orig := knownHostsExists
 	knownHostsExists = func() bool { return true }
 	t.Cleanup(func() { knownHostsExists = orig })
