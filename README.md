@@ -100,12 +100,12 @@ Overlapping passes are prevented in both modes by an advisory file lock (`flock`
 
 ### Environment variables
 
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| `CONFIG_PATH` | Path to the YAML config inside the container | `/config/config.yaml` | No |
-| `SYNC_INTERVAL` | Built-in scheduler cadence as a Go duration (e.g. `6h`, `1h`, `30m`). The first pass runs at startup; subsequent passes fire every interval thereafter. Set to `off` (or `disabled`/`0`) to disable the built-in scheduler and trigger passes externally — see [Scheduling modes](#scheduling-modes). Falls back to `6h` on an unset or unparseable (non-sentinel) value. | `6h` | No |
-| `SYNC_TIMEOUT` | Per-job rsync timeout as a Go duration (e.g. `10m`, `1h`). Falls back to the default on unset or unparseable values. | `10m` | No |
-| `LOG_LEVEL` | Log level: `debug`, `info`, `warn`, or `error` | `info` | No |
+| Variable        | Description                                                                                                                                                                                                                                                                                                                                                               | Default               | Required |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- | -------- |
+| `CONFIG_PATH`   | Path to the YAML config inside the container                                                                                                                                                                                                                                                                                                                              | `/config/config.yaml` | No       |
+| `SYNC_INTERVAL` | Built-in scheduler cadence as a Go duration (e.g. `6h`, `1h`, `30m`). The first pass runs at startup; subsequent passes fire every interval thereafter. Set to `off` (or `disabled`/`0`) to disable the built-in scheduler and trigger passes externally — see [Scheduling modes](#scheduling-modes). Falls back to `6h` on an unset or unparseable (non-sentinel) value. | `6h`                  | No       |
+| `SYNC_TIMEOUT`  | Per-job rsync timeout as a Go duration (e.g. `10m`, `1h`). Falls back to the default on unset or unparseable values.                                                                                                                                                                                                                                                      | `10m`                 | No       |
+| `LOG_LEVEL`     | Log level: `debug`, `info`, `warn`, or `error`                                                                                                                                                                                                                                                                                                                            | `info`                | No       |
 
 ### Config schema (`config.yaml`)
 
@@ -128,12 +128,12 @@ Every job also receives a fixed set of global excludes: `.stfolder`, `.stversion
 
 ### Volumes
 
-| Mount | Description |
-|-------|-------------|
-| `/config/config.yaml` | The YAML config (mount read-only). Override the path with `CONFIG_PATH`. |
+| Mount                 | Description                                                                                                                                                                  |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/config/config.yaml` | The YAML config (mount read-only). Override the path with `CONFIG_PATH`.                                                                                                     |
 | `/config/known_hosts` | Optional SSH known_hosts file (mount read-only). When present, enables strict host-key pinning instead of TOFU. See [SSH host-key verification](#ssh-host-key-verification). |
-| `/keys/<name>` | SSH private key(s). Mount read-only; the host file must be mode `0600`. |
-| (your sources) | The `local` directories referenced by your jobs. Mount read-only. |
+| `/keys/<name>`        | SSH private key(s). Mount read-only; the host file must be mode `0600`.                                                                                                      |
+| (your sources)        | The `local` directories referenced by your jobs. Mount read-only.                                                                                                            |
 
 ## Healthcheck
 
@@ -167,13 +167,13 @@ volumes:
   - ./known_hosts:/config/known_hosts:ro
 ```
 
-| Tool | Result |
-|------|--------|
-| [govulncheck](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) | No vulnerabilities in call graph |
-| [golangci-lint](https://golangci-lint.run/) (gosec, gocritic) | 0 issues |
-| [trivy](https://trivy.dev/) | Inherits the Alpine base image scan |
-| [gitleaks](https://github.com/gitleaks/gitleaks) | No secrets detected |
-| [hadolint](https://github.com/hadolint/hadolint) | Clean |
+| Tool                                                                | Result                              |
+| ------------------------------------------------------------------- | ----------------------------------- |
+| [govulncheck](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) | No vulnerabilities in call graph    |
+| [golangci-lint](https://golangci-lint.run/) (gosec, gocritic)       | 0 issues                            |
+| [trivy](https://trivy.dev/)                                         | Inherits the Alpine base image scan |
+| [gitleaks](https://github.com/gitleaks/gitleaks)                    | No secrets detected                 |
+| [hadolint](https://github.com/hadolint/hadolint)                    | Clean                               |
 
 _Why it runs as root._ The container runs as root by design: it must read host-owned source files (e.g. uid 568) across multiple bind mounts. A fixed non-root `USER` would break this. Mount sources read-only and use a dedicated, least-privilege SSH key on the remote.
 
@@ -181,11 +181,11 @@ _Why it runs as root._ The container runs as root by design: it must read host-o
 
 All dependencies are updated automatically via [Renovate](https://github.com/renovatebot/renovate). Base images and Go modules are pinned by digest/version; the `rsync`/`openssh-client` apk packages are installed unpinned so they track the digest-pinned base.
 
-| Dependency | Source |
-|------------|--------|
-| golang | [Go](https://hub.docker.com/_/golang) |
-| alpine | [Docker Hub](https://hub.docker.com/_/alpine) |
-| rsync | [Alpine](https://pkgs.alpinelinux.org/packages?name=rsync) |
+| Dependency     | Source                                                              |
+| -------------- | ------------------------------------------------------------------- |
+| golang         | [Go](https://hub.docker.com/_/golang)                               |
+| alpine         | [Docker Hub](https://hub.docker.com/_/alpine)                       |
+| rsync          | [Alpine](https://pkgs.alpinelinux.org/packages?name=rsync)          |
 | openssh-client | [Alpine](https://pkgs.alpinelinux.org/packages?name=openssh-client) |
 
 Runtime Go modules: [`github.com/cplieger/health`](https://github.com/cplieger/health) and [`gopkg.in/yaml.v3`](https://gopkg.in/yaml.v3).
