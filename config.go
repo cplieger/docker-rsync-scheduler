@@ -1,3 +1,4 @@
+// Package main runs a scheduled rsync-over-ssh daemon that pushes local directories to a remote host.
 package main
 
 import (
