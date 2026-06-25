@@ -117,7 +117,8 @@ func runBuiltin(ctx context.Context, hc *healthController, cfg config, timeout t
 	hc.markInitial(false) // unhealthy until the first pass completes
 
 	slog.Info("container started (built-in scheduling)",
-		"jobs", len(cfg.Jobs), "config", configPath(), "interval", cfg.Interval)
+		"jobs", len(cfg.Jobs), "config", configPath(), "interval", cfg.Interval,
+		"ssh_hostkey_mode", sshHostKeyMode())
 
 	var watcher sync.WaitGroup
 	watcher.Go(func() {
@@ -150,7 +151,8 @@ func runExternal(ctx context.Context, hc *healthController, cfg config) {
 
 	slog.Info("container started (external scheduling)",
 		"jobs", len(cfg.Jobs), "config", configPath(),
-		"trigger", "docker-rsync-scheduler sync")
+		"trigger", "docker-rsync-scheduler sync",
+		"ssh_hostkey_mode", sshHostKeyMode())
 
 	<-ctx.Done()
 	slog.Info("shutting down", "cause", context.Cause(ctx))

@@ -180,6 +180,27 @@ func TestSSHCommand_KnownHostsPresent(t *testing.T) {
 	}
 }
 
+func TestSSHHostKeyMode(t *testing.T) {
+	// Not parallel: overrides the shared package-level knownHostsExists var,
+	// matching the TestSSHCommand_* convention.
+	orig := knownHostsExists
+	t.Cleanup(func() { knownHostsExists = orig })
+
+	t.Run("known_hosts present reports strict", func(t *testing.T) {
+		knownHostsExists = func() bool { return true }
+		if got := sshHostKeyMode(); got != "strict" {
+			t.Errorf("sshHostKeyMode() with known_hosts present = %q, want \"strict\"", got)
+		}
+	})
+
+	t.Run("known_hosts absent reports accept-new", func(t *testing.T) {
+		knownHostsExists = func() bool { return false }
+		if got := sshHostKeyMode(); got != "accept-new" {
+			t.Errorf("sshHostKeyMode() with known_hosts absent = %q, want \"accept-new\"", got)
+		}
+	})
+}
+
 func TestBuildRsyncArgs_KnownHostsPresent(t *testing.T) {
 	// Not parallel: overrides the shared package-level knownHostsExists var.
 	orig := knownHostsExists
@@ -797,6 +818,48 @@ func TestRunPass_emptySourceSkippedNotCountedAsFailure(t *testing.T) {
 	}
 }
 
+// TestRunPass_shutdownInterruptedJobIsNotCountedAsFailure pins the completion of
+// the l-f8 fix: when graceful shutdown cancels the context mid-pass, the
+// interrupted in-flight job must NOT count as a failure (runJob treats it as
+// "not a real failure"), the remaining jobs must NOT be started under the dead
+// context, and the resulting interrupted-clean pass (failed==0) must take
+// healthSignal's no-write carve-out and exit 0 — so no false-unhealthy marker
+// outlives the drain.
+func TestRunPass_shutdownInterruptedJobIsNotCountedAsFailure(t *testing.T) {
+	// Not parallel: contends on the real lockFilePath.
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var calls int
+	newCmd := func(cmdCtx context.Context, _ string, _ ...string) *exec.Cmd {
+		calls++
+		cancel() // graceful shutdown lands while this first job is in flight
+		return exec.CommandContext(cmdCtx, "sleep", "30")
+	}
+	src := newRunJobSource(t)
+	cfg := config{Jobs: []job{*runJobJob(src), *runJobJob(src)}}
+
+	r := runPass(ctx, cfg, time.Minute, "test", newCmd)
+
+	if calls != 1 {
+		t.Errorf("commandRunner calls = %d, want 1 (the second job must be skipped under the cancelled context)", calls)
+	}
+	if r.disposition != passRan {
+		t.Fatalf("disposition = %v, want passRan (%v)", r.disposition, passRan)
+	}
+	if r.failed != 0 {
+		t.Errorf("failed = %d, want 0 (a shutdown-interrupted job is a graceful drain, not a failure)", r.failed)
+	}
+	if !r.interrupted {
+		t.Error("interrupted = false, want true")
+	}
+	if set, _ := r.healthSignal(); set {
+		t.Error("healthSignal set = true, want false (interrupted-clean must not write a false-unhealthy marker)")
+	}
+	if got := r.exitStatus(); got != 0 {
+		t.Errorf("exitStatus() = %d, want 0 (interrupted-clean exits success)", got)
+	}
+}
+
 // captureLogs installs a text slog handler over a buffer for the duration of
 // the test and returns the buffer. The caller must NOT be parallel: it mutates
 // the global slog default.
@@ -906,6 +969,40 @@ func TestPassResult_exitStatus(t *testing.T) {
 	}
 }
 
+// TestPassResult_healthSignal pins healthSignal's full (set, healthy) contract
+// across every disposition, including the interrupted-clean carve-out (a clean
+// pass cut short by shutdown writes no signal so it cannot stamp a
+// false-unhealthy marker). healthSignal is otherwise reached only indirectly
+// through healthController.apply, which asserts the marker side effect rather
+// than the return contract, so this is the direct guard.
+func TestPassResult_healthSignal(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		res         passResult
+		wantSet     bool
+		wantHealthy bool
+	}{
+		{"ran clean writes healthy", passResult{disposition: passRan, failed: 0}, true, true},
+		{"ran with failures writes unhealthy", passResult{disposition: passRan, failed: 2}, true, false},
+		{"interrupted clean carries no signal", passResult{disposition: passRan, failed: 0, interrupted: true}, false, false},
+		{"interrupted with failure writes unhealthy", passResult{disposition: passRan, failed: 1, interrupted: true}, true, false},
+		{"lock error writes unhealthy", passResult{disposition: passLockErr}, true, false},
+		{"deferred carries no signal", passResult{disposition: passDeferred}, false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			r := tt.res
+			set, healthy := r.healthSignal()
+			if set != tt.wantSet || healthy != tt.wantHealthy {
+				t.Errorf("healthSignal() = (set=%v, healthy=%v), want (set=%v, healthy=%v)",
+					set, healthy, tt.wantSet, tt.wantHealthy)
+			}
+		})
+	}
+}
+
 // TestDefaultCommandRunner_structural pins the graceful-shutdown construction
 // of the real commandRunner that every runJob/runPass test bypasses via a fake:
 // a 5s WaitDelay before SIGKILL, a non-nil SIGTERM Cancel closure, and the
@@ -936,5 +1033,18 @@ func TestDefaultCommandRunner_cancelSignalsProcess(t *testing.T) {
 	cancel()
 	if err := cmd.Wait(); err == nil {
 		t.Errorf("Wait() = nil, want a termination error from the cancelled process")
+	}
+}
+
+// TestPassResult_exitStatus_unknownDispositionFailsSafe pins the fail-safe
+// default arm of exitStatus (sync.go): an unhandled disposition must exit
+// non-zero (1) rather than report success for an outcome no branch understood.
+// The three real dispositions are covered by TestPassResult_exitStatus; this
+// reaches the final return via an out-of-range passDisposition.
+func TestPassResult_exitStatus_unknownDispositionFailsSafe(t *testing.T) {
+	t.Parallel()
+	r := passResult{disposition: passDisposition(99)}
+	if got := r.exitStatus(); got != 1 {
+		t.Errorf("exitStatus() for an unhandled disposition = %d, want 1 (fail safe non-zero)", got)
 	}
 }
