@@ -18,7 +18,7 @@ Reads a YAML config defining _N_ sync jobs. For each job it runs `rsync` over `s
 
 - One-way mirror of each configured local directory to a `[user@]host:/path`
 - Per-job `--delete`, `--chown=uid:gid`, and exclude patterns
-- Empty-source guard: a missing or empty source is skipped so `--delete` can never wipe the remote
+- Empty-source guard: a job whose top-level source directory is missing or empty is skipped, so a wholly vanished or unmounted source cannot let `--delete` wipe the matching remote tree. The guard probes the job's `local` dir only; for sources composed of nested bind mounts, ensure every nested mount is present before a `--delete` pass (or omit `delete: true` for such jobs)
 - Built-in interval scheduler, or hand scheduling to an external scheduler (cron, Ofelia, etc.) via the `sync` subcommand
 - File-marker healthcheck — unhealthy when any job fails, recovers on the next clean pass
 - Logs only: no Prometheus exporter, no HTTP server, no listening socket
@@ -51,7 +51,7 @@ services:
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ./id_ed25519:/keys/id_ed25519:ro
-      - /srv/containers/caddy:/sources/caddy:ro
+      - /srv/source/certs:/sources/certs:ro
 ```
 
 ## Scheduling modes
@@ -91,7 +91,7 @@ services:
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ./id_ed25519:/keys/id_ed25519:ro
-      - /srv/containers/caddy:/sources/caddy:ro
+      - /srv/source/certs:/sources/certs:ro
 ```
 
 Overlapping passes are prevented in both modes by an advisory file lock (`flock`) on `/tmp/.docker-rsync-scheduler.lock`, so a manual `docker exec` pass that races a scheduled one (or the built-in ticker) will skip rather than run a second concurrent pass. Ofelia's `no-overlap` is still recommended to avoid queuing redundant triggers.
@@ -113,10 +113,10 @@ A ready-to-edit [`config.example.yaml`](config.example.yaml) ships in the repo �
 
 ```yaml
 jobs:
-  - name: caddy                          # required, unique, used as a log key
-    local: /sources/caddy                # required, absolute path inside the container
-    remote_host: root@192.168.1.87       # required, [user@]host
-    remote_path: /srv/containers/caddy   # required, absolute path on the remote
+  - name: certs                          # required, unique, used as a log key
+    local: /sources/certs                # required, absolute path inside the container
+    remote_host: root@192.0.2.10         # required, [user@]host
+    remote_path: /srv/certs              # required, absolute path on the remote
     remote_uid: 1000                     # optional; with remote_gid -> rsync --chown=uid:gid
     remote_gid: 1000                     # optional
     ssh_key: /keys/id_ed25519            # required, private key path inside the container
@@ -139,6 +139,8 @@ Every job also receives a fixed set of global excludes: `.stfolder`, `.stversion
 
 The built-in healthcheck (`docker-rsync-scheduler health`) checks for a marker file that is set after each sync pass: healthy when the most recent pass had zero failed jobs, unhealthy when any job failed. Empty-source skips count as success. The container recovers automatically on the next clean pass — no restart required. In built-in mode it begins unhealthy, runs one pass at startup, and transitions accordingly, so size `healthcheck.start_period` for the time the initial pass may take. In external mode the container starts healthy (idle, nothing has failed) and each triggered `sync` updates the marker.
 
+> Because an empty source is skipped as a success, a job whose source silently becomes empty (for example a read-only bind mount that failed to mount and Docker materialised as an empty directory) keeps the container healthy and never logs at `level=error` — it is invisible to both the error-level and heartbeat-absence alerts. Each skip emits a `level=warn msg="skip empty source"` line and the `sync cycle complete` heartbeat carries a `skipped` count; add a Loki alert on a persistently non-zero `skipped` (or `skipped == jobs`) across several consecutive passes, or on the recurring `skip empty source` warning, to catch a vanished source before the remote mirror goes stale.
+
 ```dockerfile
 HEALTHCHECK --interval=60s --timeout=5s --retries=3 --start-period=30s \
     CMD ["/usr/local/bin/docker-rsync-scheduler", "health"]
@@ -157,7 +159,7 @@ For stricter security, mount a read-only `known_hosts` file at `/config/known_ho
 Generate it from your remote:
 
 ```bash
-ssh-keyscan -t ed25519 192.168.1.87 > known_hosts
+ssh-keyscan -t ed25519 192.0.2.10 > known_hosts
 ```
 
 Then mount it into the container:

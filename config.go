@@ -79,7 +79,7 @@ const (
 // remoteHostRE accepts an optional [user@] prefix followed by a host that
 // may contain IPv6-style colons, but rejects shell metacharacters and
 // whitespace by construction.
-var remoteHostRE = regexp.MustCompile(`^([A-Za-z0-9._-]+@)?[A-Za-z0-9._:-]+$`)
+var remoteHostRE = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9._:-]*$`)
 
 // shellMetaChars are characters that enable command injection or argument
 // splitting in a shell. Jobs are executed with an explicit argument slice
@@ -240,6 +240,15 @@ func (c config) validate() error {
 			}
 		}
 
+		// ssh_key is embedded in the word-split `-e "ssh -i <key> ..."` string
+		// (sshCommand); a space would split it into separate argv elements and
+		// break the job. hasShellMeta deliberately allows spaces for path
+		// fields, so the key path needs this stricter check of its own.
+		if strings.ContainsRune(j.SSHKey, ' ') {
+			return fmt.Errorf("job %q: ssh_key %q must not contain spaces",
+				j.Name, j.SSHKey)
+		}
+
 		if err := checkReadable(j.SSHKey); err != nil {
 			return fmt.Errorf("job %q: ssh_key %q not readable: %w", j.Name, j.SSHKey, err)
 		}
@@ -261,13 +270,18 @@ func checkReadable(path string) error {
 // defaultSyncTimeout on unset or unparseable values, logging a warning
 // rather than refusing to start.
 func loadSyncTimeout() time.Duration {
-	raw := os.Getenv("SYNC_TIMEOUT")
+	raw := strings.TrimSpace(os.Getenv("SYNC_TIMEOUT"))
 	if raw == "" {
 		return defaultSyncTimeout
 	}
 	d, err := time.ParseDuration(raw)
-	if err != nil || d <= 0 {
+	switch {
+	case err != nil:
 		slog.Warn("cannot parse SYNC_TIMEOUT, using default",
+			"value", raw, "default", defaultSyncTimeout)
+		return defaultSyncTimeout
+	case d <= 0:
+		slog.Warn("SYNC_TIMEOUT must be positive, using default",
 			"value", raw, "default", defaultSyncTimeout)
 		return defaultSyncTimeout
 	}
@@ -302,9 +316,14 @@ func loadInterval() (interval time.Duration, scheduleEnabled bool) {
 				"value", raw, "default", defaultInterval)
 		case d > 0:
 			interval = d
-		default:
+		case d == 0:
 			// Zero duration ("0", "0s") disables built-in scheduling.
 			scheduleEnabled = false
+		default:
+			// A negative duration is not a valid interval and not a
+			// documented disable sentinel; warn and fall back to default.
+			slog.Warn("SYNC_INTERVAL is negative, using default",
+				"value", raw, "default", defaultInterval)
 		}
 	}
 	return interval, scheduleEnabled

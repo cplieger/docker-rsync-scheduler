@@ -10,24 +10,28 @@ services:
     environment:
       LOG_LEVEL: "info"        # debug | info | warn | error
       CONFIG_PATH: "/config/config.yaml"
-      SYNC_INTERVAL: "1h"      # built-in cadence (Go duration); "off" -> external
+      SYNC_INTERVAL: "6h"      # built-in cadence (Go duration); "off" -> external
       SYNC_TIMEOUT: "10m"      # per-job rsync timeout (Go duration)
 
-    # External scheduling variant: disable the built-in loop and let a
-    # central scheduler drive each pass by exec'ing the `sync` subcommand.
-    # The advisory lock on /tmp/.docker-rsync-scheduler.lock prevents
-    # overlapping passes across the exec and the (now-idle) daemon.
-    #   environment:
-    #     SYNC_INTERVAL: "off"   # disabled | 0 also disable the built-in scheduler
-    #   labels:                  # e.g. an Ofelia sibling on the same host
+    # External scheduling variant: change SYNC_INTERVAL above to "off"
+    # (aliases: disabled, 0) to disable the built-in loop, then let a central
+    # scheduler drive each pass by exec'ing the `sync` subcommand. The advisory
+    # lock on /tmp/.docker-rsync-scheduler.lock prevents overlapping passes
+    # across the exec and the (now-idle) daemon. Add an Ofelia sibling via
+    # labels on this service:
+    #   labels:
     #     ofelia.enabled: "true"
-    #     ofelia.job-exec.rsync-sync.schedule: "@every 1h"
+    #     ofelia.job-exec.rsync-sync.schedule: "@every 6h"
     #     ofelia.job-exec.rsync-sync.command: "docker-rsync-scheduler sync"
     #     ofelia.job-exec.rsync-sync.no-overlap: "true"
 
     volumes:
       - ./config.yaml:/config/config.yaml:ro
+      # Optional: pin the remote SSH host key instead of trusting it on first
+      # contact. Mounting this file switches StrictHostKeyChecking from
+      # accept-new (TOFU) to yes. See README "SSH host-key verification".
+      # - ./known_hosts:/config/known_hosts:ro
       - ./id_ed25519:/keys/id_ed25519:ro   # dedicated SSH key, host file mode 0600
       # Source directories referenced by the jobs in config.yaml:
-      - /srv/containers/caddy:/sources/caddy:ro
-      - /srv/containers/vaultwarden:/sources/vaultwarden:ro
+      - /srv/source/certs:/sources/certs:ro
+      - /srv/source/appconfig:/sources/appconfig:ro
