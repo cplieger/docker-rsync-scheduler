@@ -65,15 +65,16 @@ type syncStats struct {
 // jobResult captures the outcome of a single job for logging and health
 // aggregation. Fields are ordered largest-first for fieldalignment.
 type jobResult struct {
-	err        error
-	name       string
-	stderrTail string
-	files      int64
-	bytes      int64
-	duration   time.Duration
-	exitCode   int
-	skipped    bool
-	success    bool
+	err         error
+	name        string
+	stderrTail  string
+	files       int64
+	bytes       int64
+	duration    time.Duration
+	exitCode    int
+	skipped     bool
+	success     bool
+	interrupted bool
 }
 
 // knownHostsPath is the conventional location for a user-supplied
@@ -89,6 +90,17 @@ const knownHostsPath = "/config/known_hosts"
 var knownHostsExists = func() bool {
 	_, err := os.Stat(knownHostsPath)
 	return err == nil
+}
+
+// sshHostKeyMode reports the active SSH host-key verification posture for
+// startup logging: "strict" when a known_hosts file is present, "accept-new"
+// (TOFU) otherwise. Lets an operator confirm pinning is active and catch a
+// mis-mounted known_hosts that silently fell back to TOFU.
+func sshHostKeyMode() string {
+	if knownHostsExists() {
+		return "strict"
+	}
+	return "accept-new"
 }
 
 // sshCommand builds the single -e argument string. rsync splits it
@@ -286,6 +298,7 @@ func runJob(ctx context.Context, j *job, timeout time.Duration, newCmd commandRu
 		// in-flight rsync -- not a real failure; real timeouts cancel only
 		// jobCtx (not ctx) so they still reach the error branch below.
 		if ctx.Err() != nil {
+			res.interrupted = true
 			slog.Info("sync interrupted by shutdown",
 				"job", j.Name,
 				"duration_ms", res.duration.Milliseconds())
@@ -358,11 +371,14 @@ func (r *passResult) healthSignal() (set, healthy bool) {
 			return false, false // interrupted-clean: no job failed; don't downgrade the marker
 		}
 		return true, r.failed == 0
+	case passDeferred:
+		return false, false // the running holder owns health
 	case passLockErr:
 		return true, false
-	default: // passDeferred
-		return false, false
 	}
+	// An unhandled disposition is a programming error; fail safe by writing
+	// unhealthy rather than silently leaving the marker stale.
+	return true, false
 }
 
 // exitStatus is the process exit code for the `sync` subcommand: 1 on any job
@@ -420,6 +436,13 @@ func runPass(ctx context.Context, cfg config, timeout time.Duration, trigger str
 	res.disposition = passRan
 	start := time.Now()
 	for i := range cfg.Jobs {
+		if ctx.Err() != nil {
+			// Graceful shutdown landed mid-pass: do not start the remaining jobs
+			// under an already-cancelled context (they would fail-fast and
+			// inflate the failure count). res.interrupted is recorded after the
+			// loop so healthSignal/reportPass see the drain.
+			break
+		}
 		jr := runJob(ctx, &cfg.Jobs[i], timeout, newCmd)
 		switch {
 		case jr.skipped:
@@ -427,6 +450,12 @@ func runPass(ctx context.Context, cfg config, timeout time.Duration, trigger str
 			res.ok++
 		case jr.success:
 			res.ok++
+		case jr.interrupted:
+			// SIGTERM'd mid-transfer by graceful shutdown. runJob classifies this
+			// as "not a real failure"; do NOT count it as failed, so an otherwise
+			// clean pass keeps failed==0 and healthSignal's interrupted-clean
+			// carve-out can fire (no false-unhealthy marker, exit 0). A genuine
+			// rsync failure still lands in the default arm and sets failed>0.
 		default:
 			res.failed++
 		}
@@ -473,6 +502,13 @@ func reportPass(r *passResult) {
 		// trips the documented error alert; the marker goes unhealthy too.
 		slog.Error("cannot acquire sync lock",
 			"trigger", r.trigger, "path", lockFilePath, "error", r.err)
+	default:
+		// An unhandled disposition is a programming error. Emit a line anyway so
+		// the "exactly one structured line per pass" invariant -- and any
+		// absence-based alert that depends on it -- survives a future disposition
+		// whose case was forgotten here. Mirrors exitStatus's fail-safe arm.
+		slog.Error("sync pass completed with unknown disposition",
+			"trigger", r.trigger, "disposition", int(r.disposition))
 	}
 }
 

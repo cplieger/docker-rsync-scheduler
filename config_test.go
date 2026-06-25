@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -595,5 +596,56 @@ func TestGetEnv(t *testing.T) {
 	t.Setenv("TEST_RSYNC_ENV", "")
 	if got := getEnv("TEST_RSYNC_ENV", "fallback"); got != "fallback" {
 		t.Errorf("getEnv = %q, want fallback", got)
+	}
+}
+
+func TestSetupLogger_levelMapping(t *testing.T) {
+	orig := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	tests := []struct {
+		name string
+		env  string
+		want slog.Level
+	}{
+		{"debug", "debug", slog.LevelDebug},
+		{"info", "info", slog.LevelInfo},
+		{"warn", "warn", slog.LevelWarn},
+		{"warning alias", "warning", slog.LevelWarn},
+		{"error", "error", slog.LevelError},
+		{"uppercase is lowercased", "DEBUG", slog.LevelDebug},
+		{"surrounding whitespace trimmed", "  warn  ", slog.LevelWarn},
+		{"unset defaults to info", "", slog.LevelInfo},
+		{"unrecognized defaults to info", "bogus", slog.LevelInfo},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("LOG_LEVEL", tt.env)
+
+			setupLogger()
+
+			if !slog.Default().Enabled(t.Context(), tt.want) {
+				t.Errorf("setupLogger() LOG_LEVEL=%q: level %v not enabled, want enabled", tt.env, tt.want)
+			}
+			if slog.Default().Enabled(t.Context(), tt.want-1) {
+				t.Errorf("setupLogger() LOG_LEVEL=%q: level %v enabled, want disabled", tt.env, tt.want-1)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_readErrorWhenPathIsDir(t *testing.T) {
+	dir := t.TempDir() // a directory: os.Stat succeeds, os.ReadFile fails
+
+	t.Setenv("CONFIG_PATH", dir)
+
+	_, err := loadConfig()
+
+	if err == nil {
+		t.Fatalf("loadConfig() with CONFIG_PATH=%q (a directory) = nil, want a read error", dir)
+	}
+	if !strings.Contains(err.Error(), "read config") {
+		t.Errorf("loadConfig() dir error = %q, want to contain 'read config'", err)
 	}
 }
