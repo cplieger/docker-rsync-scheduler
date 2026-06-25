@@ -33,6 +33,16 @@ const (
 // never be mirrored to a remote.
 var globalExcludes = []string{".stfolder", ".stversions", ".DS_Store", "Thumbs.db"}
 
+// globalExcludeSet is globalExcludes as a set for O(1) membership tests in
+// sourceIsEmpty. Derived from globalExcludes so the two cannot drift.
+var globalExcludeSet = func() map[string]bool {
+	m := make(map[string]bool, len(globalExcludes))
+	for _, e := range globalExcludes {
+		m[e] = true
+	}
+	return m
+}()
+
 // commandRunner constructs a configured *exec.Cmd. It decouples
 // orchestration from subprocess construction so tests can inject a fake.
 type commandRunner func(ctx context.Context, name string, args ...string) *exec.Cmd
@@ -126,10 +136,21 @@ func buildRsyncArgs(j *job) []string {
 	return args
 }
 
-// sourceIsEmpty reports whether the local source directory is missing or
-// has no entries. An empty source skips the job so that a vanished or
-// unmounted directory cannot cause --delete to wipe the remote. Any read
-// error is treated as empty for the same safety reason.
+// sourceIsEmpty reports whether the local source directory has nothing worth
+// mirroring: it is missing, unreadable, truly empty, or contains ONLY
+// globally-excluded entries (.stfolder, .DS_Store, …). Such a source skips the
+// job so that a vanished, unmounted, or junk-only directory cannot cause
+// --delete to wipe the remote: an excludes-only source would otherwise pass a
+// naive "any entry present" check yet transfer nothing, and --delete would then
+// delete every non-excluded file on the receiver. Any read error is treated as
+// empty for the same safety reason.
+//
+// Only globalExcludes are considered here, not per-job excludes. The globals
+// are exact filenames, so membership is exact and cheap; per-job excludes are
+// rsync glob patterns whose matching semantics are not safely replicated with a
+// simple name comparison (a wrong guess would falsely skip a real source). A
+// source reduced to only per-job-excluded content is therefore still mirrored;
+// bound that residual case with an rsync --max-delete backstop if needed.
 func sourceIsEmpty(path string) bool {
 	f, err := os.Open(path) // #nosec G304 -- operator-mounted source path
 	if err != nil {
@@ -143,15 +164,32 @@ func sourceIsEmpty(path string) bool {
 		return true
 	}
 	defer func() { _ = f.Close() }()
-	// io.EOF is the normal empty-directory signal; any other read error
-	// (I/O failure, not-a-directory) is a broken source -- skip for safety
-	// but surface it rather than treating it as benign-empty.
-	names, err := f.Readdirnames(1)
-	if err != nil && !errors.Is(err, io.EOF) {
-		slog.Warn("source unreadable, skipping to protect remote", "path", path, "error", err)
-		return true
+
+	// Scan all top-level entries in batches, short-circuiting on the first
+	// entry rsync would actually mirror (i.e. not in globalExcludeSet). io.EOF
+	// is the normal end-of-directory signal; any other read error (I/O failure,
+	// not-a-directory) is a broken source -- skip for safety but surface it.
+	for {
+		names, rerr := f.Readdirnames(256)
+		for _, n := range names {
+			if !globalExcludeSet[n] {
+				return false // a mirrorable entry exists
+			}
+		}
+		if errors.Is(rerr, io.EOF) {
+			return true // only globally-excluded entries (or none)
+		}
+		if rerr != nil {
+			slog.Warn("source unreadable, skipping to protect remote", "path", path, "error", rerr)
+			return true
+		}
+		if len(names) == 0 {
+			// Defensive: no error and no names cannot normally occur with a
+			// positive count, but guard against an unexpected zero-progress read
+			// rather than spin forever.
+			return true
+		}
 	}
-	return len(names) == 0
 }
 
 // statsRegexes match the relevant lines of rsync --stats output. Numbers
@@ -302,13 +340,24 @@ type passResult struct {
 }
 
 // healthSignal reports whether this result should write the health marker
-// (set) and to what value (healthy). Only a pass that actually ran carries a
-// health value; a lock error is unhealthy; a deferred pass carries no signal
-// of its own (set is false) because the holder that is running owns health.
+// (set) and to what value (healthy). A lock error is unhealthy; a deferred pass
+// carries no signal of its own (set is false) because the running holder owns
+// health; a pass that ran writes its health value — EXCEPT an interrupted-clean
+// pass (every job succeeded, failed==0, but a shutdown signal coincided with
+// pass-end), which also carries no signal: it leaves the marker at its last
+// real value rather than writing a false-unhealthy. A pass with a real job
+// failure still writes unhealthy even when interrupted, and built-in shutdown
+// marks unhealthy via beginDrain (the drain watcher), not through this path —
+// so the interrupted-clean no-write only matters in external mode, where
+// nothing else resets a false-unhealthy until the next sync (up to a full
+// interval away).
 func (r *passResult) healthSignal() (set, healthy bool) {
 	switch r.disposition {
 	case passRan:
-		return true, r.failed == 0 && !r.interrupted
+		if r.interrupted && r.failed == 0 {
+			return false, false // interrupted-clean: no job failed; don't downgrade the marker
+		}
+		return true, r.failed == 0
 	case passLockErr:
 		return true, false
 	default: // passDeferred
@@ -319,6 +368,13 @@ func (r *passResult) healthSignal() (set, healthy bool) {
 // exitStatus is the process exit code for the `sync` subcommand: 1 on any job
 // failure or a lock error, 0 when the pass ran clean or deferred to an
 // in-flight holder (the holder, not this invocation, owns that outcome).
+//
+// An interrupted-clean pass (every job succeeded but graceful shutdown cut the
+// pass short) exits 0, since no configured job failed. healthSignal treats the
+// same case as no signal (it declines to write the marker), so the two agree:
+// a gracefully-interrupted clean `sync` exits 0 AND leaves no false-unhealthy
+// marker behind. Both answer "did a configured job fail?" — an interrupted pass
+// with a real failure still exits 1 and writes unhealthy.
 func (r *passResult) exitStatus() int {
 	switch r.disposition {
 	case passRan:
@@ -326,11 +382,15 @@ func (r *passResult) exitStatus() int {
 			return 1
 		}
 		return 0
+	case passDeferred:
+		return 0
 	case passLockErr:
 		return 1
-	default: // passDeferred
-		return 0
 	}
+	// An unhandled disposition is a programming error; fail safe
+	// (non-zero) rather than reporting success for an outcome no
+	// branch understood.
+	return 1
 }
 
 // runPass runs every job once under the advisory overlap lock and returns a

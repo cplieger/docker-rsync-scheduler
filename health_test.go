@@ -46,13 +46,29 @@ func TestHealthController_applyRanFailedIsUnhealthy(t *testing.T) {
 	}
 }
 
-func TestHealthController_applyInterruptedIsUnhealthy(t *testing.T) {
+func TestHealthController_applyInterruptedCleanDoesNotDowngrade(t *testing.T) {
 	t.Parallel()
 	m := &fakeMarker{}
-	// A pass that finished all jobs clean but was cut by shutdown is unhealthy.
-	newHealthController(m).apply(&passResult{disposition: passRan, failed: 0, interrupted: true})
-	if v, _ := m.state(); v {
-		t.Error("after interrupted pass: value=true, want false")
+	hc := newHealthController(m)
+	hc.markInitial(true) // last real state: healthy (the only expected write)
+	// A pass where every job succeeded but a shutdown signal coincided
+	// (interrupted, failed==0) must NOT write the marker: it leaves the last
+	// real value in place rather than a false-unhealthy that, in external mode,
+	// would outlive the interruption until the next sync.
+	hc.apply(&passResult{disposition: passRan, failed: 0, interrupted: true})
+	if v, w := m.state(); !v || w != 1 {
+		t.Errorf("after interrupted-clean pass: value=%v writes=%d, want true 1 (no downgrade; markInitial only)", v, w)
+	}
+}
+
+func TestHealthController_applyInterruptedWithFailureIsUnhealthy(t *testing.T) {
+	t.Parallel()
+	m := &fakeMarker{}
+	// An interrupted pass that ALSO had a real job failure still writes
+	// unhealthy: only the zero-failure interrupted case is spared the downgrade.
+	newHealthController(m).apply(&passResult{disposition: passRan, failed: 1, interrupted: true})
+	if v, w := m.state(); v || w != 1 {
+		t.Errorf("after interrupted-with-failure pass: value=%v writes=%d, want false 1", v, w)
 	}
 }
 
