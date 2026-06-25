@@ -336,6 +336,43 @@ func TestSourceIsEmpty(t *testing.T) {
 	})
 }
 
+// TestSourceIsEmpty_onlyGloballyExcludedEntriesIsEmpty pins the h-f1 fix: a
+// source whose top-level holds ONLY globally-excluded entries (e.g. a Syncthing
+// folder reduced to just .stfolder, or a macOS dir holding only .DS_Store) must
+// report empty, so a delete:true job skips it instead of letting rsync --delete
+// wipe the remote after the post-exclude sender list comes up empty. A real
+// file alongside an excluded entry must still mirror.
+func TestSourceIsEmpty_onlyGloballyExcludedEntriesIsEmpty(t *testing.T) {
+	t.Parallel()
+
+	t.Run("only globally-excluded entries is empty", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		for _, name := range globalExcludes {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+				t.Fatalf("setup: %v", err)
+			}
+		}
+		if !sourceIsEmpty(dir) {
+			t.Error("sourceIsEmpty on an excludes-only dir = false, want true (must skip to protect the remote)")
+		}
+	})
+
+	t.Run("an excluded entry plus a real file is not empty", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, ".stfolder"), []byte("x"), 0o600); err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "real.conf"), []byte("x"), 0o600); err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+		if sourceIsEmpty(dir) {
+			t.Error("sourceIsEmpty on a dir with a real file = true, want false (must mirror)")
+		}
+	})
+}
+
 // TestSourceIsEmpty_unreadableDirSurfacesWarnAndSkips covers the cycle-2
 // error-surfacing arm where os.Open succeeds but Readdirnames returns a
 // non-EOF error: a source path that is a regular file (not a directory).
@@ -344,10 +381,7 @@ func TestSourceIsEmpty(t *testing.T) {
 // masked as a benign empty source. Asserting the WARN is what distinguishes
 // this arm from the silent missing-dir case.
 func TestSourceIsEmpty_unreadableDirSurfacesWarnAndSkips(t *testing.T) {
-	var buf bytes.Buffer
-	orig := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
-	t.Cleanup(func() { slog.SetDefault(orig) })
+	buf := captureLogs(t, slog.LevelWarn)
 
 	path := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
@@ -371,10 +405,7 @@ func TestSourceIsEmpty_unreadableDirSurfacesWarnAndSkips(t *testing.T) {
 // dir). The expected missing-dir (ENOENT) case stays silent; this asserts the
 // non-silent arm so the two are not collapsed.
 func TestSourceIsEmpty_openErrorSurfacesWarnAndSkips(t *testing.T) {
-	var buf bytes.Buffer
-	orig := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
-	t.Cleanup(func() { slog.SetDefault(orig) })
+	buf := captureLogs(t, slog.LevelWarn)
 
 	parent := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(parent, []byte("x"), 0o600); err != nil {
@@ -712,10 +743,7 @@ func TestRunPass_aggregatesFailures(t *testing.T) {
 // identical jobResult values, so only the emitted log distinguishes them; this
 // protects the no-false-page contract (Loki alerts on level=error).
 func TestRunJob_parentCancellationLogsShutdownNotFailure(t *testing.T) {
-	var buf bytes.Buffer
-	orig := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
-	t.Cleanup(func() { slog.SetDefault(orig) })
+	buf := captureLogs(t, slog.LevelInfo)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -847,5 +875,66 @@ func TestReportPass_lockErrorEmitsError(t *testing.T) {
 	}
 	if !strings.Contains(logs, "cannot acquire sync lock") {
 		t.Errorf("log = %q, want 'cannot acquire sync lock'", logs)
+	}
+}
+
+// TestPassResult_exitStatus pins the process exit code each disposition maps to:
+// a clean pass and a deferred pass exit 0, a pass with job failures and a lock
+// error exit 1. The clean-passRan and passLockErr arms are otherwise unexercised
+// by the runPass-level tests, so this is the direct guard on exitStatus.
+func TestPassResult_exitStatus(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		res  passResult
+		want int
+	}{
+		{"ran clean is zero", passResult{disposition: passRan, failed: 0}, 0},
+		{"ran with failures is one", passResult{disposition: passRan, failed: 2}, 1},
+		{"lock error is one", passResult{disposition: passLockErr, err: errors.New("flock boom")}, 1},
+		{"deferred is zero", passResult{disposition: passDeferred, holderAge: time.Second}, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			r := tt.res
+			if got := r.exitStatus(); got != tt.want {
+				t.Errorf("passResult{disposition:%d, failed:%d}.exitStatus() = %d, want %d",
+					tt.res.disposition, tt.res.failed, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDefaultCommandRunner_structural pins the graceful-shutdown construction
+// of the real commandRunner that every runJob/runPass test bypasses via a fake:
+// a 5s WaitDelay before SIGKILL, a non-nil SIGTERM Cancel closure, and the
+// verbatim arg slice. Mutating WaitDelay (e.g. 5s -> 9s) fails this test.
+func TestDefaultCommandRunner_structural(t *testing.T) {
+	cmd := defaultCommandRunner(context.Background(), "echo", "hi", "there")
+	if cmd.WaitDelay != 5*time.Second {
+		t.Errorf("WaitDelay = %v, want 5s", cmd.WaitDelay)
+	}
+	if cmd.Cancel == nil {
+		t.Error("Cancel = nil, want a SIGTERM closure")
+	}
+	if want := []string{"echo", "hi", "there"}; !slices.Equal(cmd.Args, want) {
+		t.Errorf("Args = %v, want %v", cmd.Args, want)
+	}
+}
+
+// TestDefaultCommandRunner_cancelSignalsProcess exercises the Cancel closure
+// body at sync.go:44: a real subprocess is started, its context cancelled, and
+// Wait must return a termination error proving the SIGTERM closure ran (the
+// closure is otherwise invisible to the fake-injecting unit tests).
+func TestDefaultCommandRunner_cancelSignalsProcess(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := defaultCommandRunner(ctx, "sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	cancel()
+	if err := cmd.Wait(); err == nil {
+		t.Errorf("Wait() = nil, want a termination error from the cancelled process")
 	}
 }

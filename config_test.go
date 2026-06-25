@@ -216,6 +216,25 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+func TestValidate_sshKeyWithSpaceRejected(t *testing.T) {
+	cfg := config{Jobs: []job{{
+		Name:       "spaced",
+		Local:      "/sources/spaced",
+		RemoteHost: "root@192.168.1.87",
+		RemotePath: "/srv/spaced",
+		SSHKey:     "/keys/id ed25519",
+	}}}
+
+	err := cfg.validate()
+
+	if err == nil {
+		t.Fatalf("validate() with spaced ssh_key = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "must not contain spaces") {
+		t.Errorf("validate() error = %q, want to contain 'must not contain spaces'", err)
+	}
+}
+
 func TestHasShellMeta(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -393,6 +412,38 @@ func TestLoadInterval_negativeDurationFallsBackToDefaultEnabled(t *testing.T) {
 	}
 	if interval != defaultInterval {
 		t.Errorf("loadInterval() with -30m interval = %v, want default %v", interval, defaultInterval)
+	}
+}
+
+func TestLoadConfig_parseErrorMsg(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("jobs: [unterminated"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv("CONFIG_PATH", cfgPath)
+	_, err := loadConfig()
+	if err == nil {
+		t.Fatal("loadConfig with malformed YAML = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "parse config") {
+		t.Errorf("loadConfig error = %q, want to contain 'parse config'", err)
+	}
+}
+
+func TestLoadConfig_validateErrorMsg(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("jobs:\n  - name: x\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv("CONFIG_PATH", cfgPath)
+	_, err := loadConfig()
+	if err == nil {
+		t.Fatal("loadConfig with invalid config = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "local is required") {
+		t.Errorf("loadConfig error = %q, want to contain 'local is required'", err)
 	}
 }
 

@@ -107,6 +107,7 @@ func hasShellMeta(s string) bool {
 func setupLogger() {
 	levelStr := strings.ToLower(strings.TrimSpace(getEnv("LOG_LEVEL", "info")))
 	level := slog.LevelInfo
+	unknown := false
 	switch levelStr {
 	case "debug":
 		level = slog.LevelDebug
@@ -116,10 +117,15 @@ func setupLogger() {
 		level = slog.LevelWarn
 	case "error":
 		level = slog.LevelError
+	default:
+		unknown = true
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: level,
 	})))
+	if unknown {
+		slog.Warn("unrecognized LOG_LEVEL, using info", "value", levelStr)
+	}
 }
 
 // configPath returns the active config path, honouring CONFIG_PATH.
@@ -180,9 +186,8 @@ func parseConfig(data []byte) (config, error) {
 	return cfg, nil
 }
 
-// validate enforces the config contract: a non-empty job list, required
-// fields present, unique names, absolute paths, a sane remote host, no
-// injection characters anywhere, and a readable ssh key.
+// validate enforces the config contract: a non-empty job list with unique
+// names, delegating each job's per-field contract to (job).validate.
 func (c config) validate() error {
 	if len(c.Jobs) == 0 {
 		return errors.New("config: jobs list is empty")
@@ -190,7 +195,7 @@ func (c config) validate() error {
 
 	seen := make(map[string]bool, len(c.Jobs))
 	for i := range c.Jobs {
-		j := c.Jobs[i]
+		j := &c.Jobs[i]
 
 		if j.Name == "" {
 			return fmt.Errorf("job %d: name is required", i)
@@ -200,58 +205,70 @@ func (c config) validate() error {
 		}
 		seen[j.Name] = true
 
-		if j.Local == "" {
-			return fmt.Errorf("job %q: local is required", j.Name)
+		if err := j.validate(); err != nil {
+			return err
 		}
-		if j.RemoteHost == "" {
-			return fmt.Errorf("job %q: remote_host is required", j.Name)
-		}
-		if j.RemotePath == "" {
-			return fmt.Errorf("job %q: remote_path is required", j.Name)
-		}
-		if j.SSHKey == "" {
-			return fmt.Errorf("job %q: ssh_key is required", j.Name)
-		}
+	}
 
-		if !filepath.IsAbs(j.Local) {
-			return fmt.Errorf("job %q: local %q must be absolute", j.Name, j.Local)
-		}
-		if !filepath.IsAbs(j.RemotePath) {
-			return fmt.Errorf("job %q: remote_path %q must be absolute", j.Name, j.RemotePath)
-		}
-		if !remoteHostRE.MatchString(j.RemoteHost) {
-			return fmt.Errorf("job %q: remote_host %q is invalid", j.Name, j.RemoteHost)
-		}
+	return nil
+}
 
-		for _, f := range []struct{ key, val string }{
-			{"name", j.Name},
-			{"local", j.Local},
-			{"remote_host", j.RemoteHost},
-			{"remote_path", j.RemotePath},
-			{"ssh_key", j.SSHKey},
-		} {
-			if hasShellMeta(f.val) {
-				return fmt.Errorf("job %q: %s contains forbidden characters", j.Name, f.key)
-			}
-		}
-		for _, e := range j.Excludes {
-			if hasShellMeta(e) {
-				return fmt.Errorf("job %q: exclude %q contains forbidden characters", j.Name, e)
-			}
-		}
+// validate enforces one job's field contract: required fields present,
+// absolute local/remote paths, a sane remote host, no injection characters
+// anywhere, and a readable ssh key. Name presence and cross-job uniqueness
+// are enforced by (config).validate.
+func (j *job) validate() error {
+	if j.Local == "" {
+		return fmt.Errorf("job %q: local is required", j.Name)
+	}
+	if j.RemoteHost == "" {
+		return fmt.Errorf("job %q: remote_host is required", j.Name)
+	}
+	if j.RemotePath == "" {
+		return fmt.Errorf("job %q: remote_path is required", j.Name)
+	}
+	if j.SSHKey == "" {
+		return fmt.Errorf("job %q: ssh_key is required", j.Name)
+	}
 
-		// ssh_key is embedded in the word-split `-e "ssh -i <key> ..."` string
-		// (sshCommand); a space would split it into separate argv elements and
-		// break the job. hasShellMeta deliberately allows spaces for path
-		// fields, so the key path needs this stricter check of its own.
-		if strings.ContainsRune(j.SSHKey, ' ') {
-			return fmt.Errorf("job %q: ssh_key %q must not contain spaces",
-				j.Name, j.SSHKey)
-		}
+	if !filepath.IsAbs(j.Local) {
+		return fmt.Errorf("job %q: local %q must be absolute", j.Name, j.Local)
+	}
+	if !filepath.IsAbs(j.RemotePath) {
+		return fmt.Errorf("job %q: remote_path %q must be absolute", j.Name, j.RemotePath)
+	}
+	if !remoteHostRE.MatchString(j.RemoteHost) {
+		return fmt.Errorf("job %q: remote_host %q is invalid", j.Name, j.RemoteHost)
+	}
 
-		if err := checkReadable(j.SSHKey); err != nil {
-			return fmt.Errorf("job %q: ssh_key %q not readable: %w", j.Name, j.SSHKey, err)
+	for _, f := range []struct{ key, val string }{
+		{"name", j.Name},
+		{"local", j.Local},
+		{"remote_host", j.RemoteHost},
+		{"remote_path", j.RemotePath},
+		{"ssh_key", j.SSHKey},
+	} {
+		if hasShellMeta(f.val) {
+			return fmt.Errorf("job %q: %s contains forbidden characters", j.Name, f.key)
 		}
+	}
+	for _, e := range j.Excludes {
+		if hasShellMeta(e) {
+			return fmt.Errorf("job %q: exclude %q contains forbidden characters", j.Name, e)
+		}
+	}
+
+	// ssh_key is embedded in the word-split `-e "ssh -i <key> ..."` string
+	// (sshCommand); a space would split it into separate argv elements and
+	// break the job. hasShellMeta deliberately allows spaces for path
+	// fields, so the key path needs this stricter check of its own.
+	if strings.ContainsRune(j.SSHKey, ' ') {
+		return fmt.Errorf("job %q: ssh_key %q must not contain spaces",
+			j.Name, j.SSHKey)
+	}
+
+	if err := checkReadable(j.SSHKey); err != nil {
+		return fmt.Errorf("job %q: ssh_key %q not readable: %w", j.Name, j.SSHKey, err)
 	}
 
 	return nil

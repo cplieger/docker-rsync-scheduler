@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -68,12 +69,90 @@ func TestTryLock_reportsHolderAge(t *testing.T) {
 	}
 }
 
-// TestReadHolder_unparseableIsUnknown verifies that holder metadata that is
-// absent or malformed degrades to a zero (unknown) age rather than failing.
-func TestReadHolder_unparseableIsUnknown(t *testing.T) {
+// TestLockHolder_zeroValueAgeIsZero verifies that a zero-value lockHolder
+// (the value readHolder returns when the acquisition timestamp is absent or
+// unparseable) reports an unknown age of 0 rather than a bogus duration.
+func TestLockHolder_zeroValueAgeIsZero(t *testing.T) {
 	t.Parallel()
-
 	if got := (lockHolder{}).age(); got != 0 {
 		t.Errorf("zero lockHolder age = %v, want 0", got)
+	}
+}
+
+// TestReadHolder_parsesValidAndRejectsMalformed exercises readHolder's
+// parse-failure arm (a torn/absent/pre-format timestamp line -> zero holder),
+// which the named-but-unrelated TestLockHolder_zeroValueAgeIsZero never
+// reached. The round-trip subtest pins the writeHolder->readHolder pair.
+func TestReadHolder_parsesValidAndRejectsMalformed(t *testing.T) {
+	t.Parallel()
+	t.Run("round-trips a timestamp written by writeHolder", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "sync.lock")
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer func() { _ = f.Close() }()
+		before := time.Now().UTC()
+		writeHolder(f)
+		holder := readHolder(f)
+		if holder.since.IsZero() {
+			t.Fatalf("readHolder after writeHolder = zero")
+		}
+		if holder.since.Before(before.Add(-time.Second)) || holder.since.After(time.Now().Add(time.Second)) {
+			t.Errorf("readHolder since = %v, want within ~1s of %v", holder.since, before)
+		}
+	})
+	t.Run("malformed line is unknown", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "sync.lock")
+		if err := os.WriteFile(path, []byte("not-a-timestamp\n"), 0o600); err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer func() { _ = f.Close() }()
+		if got := readHolder(f); !got.since.IsZero() {
+			t.Errorf("readHolder(malformed) since = %v, want zero", got.since)
+		}
+	})
+	t.Run("empty file is unknown", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "sync.lock")
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer func() { _ = f.Close() }()
+		if got := readHolder(f); !got.since.IsZero() {
+			t.Errorf("readHolder(empty) since = %v, want zero", got.since)
+		}
+	})
+}
+
+// TestTryLock_openErrorIsReturned exercises tryLock's os.OpenFile-error arm: a
+// lock path whose parent directory does not exist makes OpenFile fail with
+// ENOENT (O_CREATE creates the file, not parent dirs), so acquisition must
+// surface a non-nil error rather than a silent ok=false.
+func TestTryLock_openErrorIsReturned(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "nonexistent-subdir", "sync.lock")
+	l, ok, holder, err := tryLock(path)
+	if err == nil {
+		t.Fatalf("tryLock(%q) err = nil, want a non-nil open error", path)
+	}
+	if ok {
+		t.Errorf("tryLock(%q) ok = true, want false on open error", path)
+	}
+	if l != nil {
+		t.Errorf("tryLock(%q) lock = %v, want nil on open error", path, l)
+	}
+	if !holder.since.IsZero() {
+		t.Errorf("tryLock(%q) holder = %+v, want zero on open error", path, holder)
 	}
 }
