@@ -21,6 +21,7 @@ jobs:
     remote_gid: 1000                     # optional
     ssh_key: /keys/id_ed25519            # required, private key path inside the container (host file mode 0600)
     delete: true                         # optional (default false) -> rsync --delete when true
+    max_delete: 100                      # optional; with delete -> rsync --max-delete=N (abort if a pass would delete > N). Unset -> uncapped
     excludes:                            # optional, per-job exclude patterns (plus the built-in globals)
       - "**/*.lock"
       - "logs"

@@ -18,6 +18,9 @@ FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6ee
 # apk upgrade is load-bearing: it floats forward base packages the pinned base
 # pre-installs at an older, CVE-affected revision (libcrypto3/libssl3, etc.) —
 # plain `apk add` leaves already-satisfied base packages unpatched.
+# The floated package set is intentionally not version-pinned or asserted in-image;
+# build-time package currency is verified by the advisory CI image scan (trivy/grype
+# on the built image), not a build-time gate.
 RUN apk upgrade --no-cache \
     && apk add --no-cache \
         rsync \
@@ -28,7 +31,10 @@ COPY --chmod=755 --from=go-builder /docker-rsync-scheduler /usr/local/bin/docker
 # Runs as root by design: the app must read host-owned source files (e.g.
 # uid 568) across multiple bind mounts and write ssh known_hosts on first
 # contact (StrictHostKeyChecking=accept-new). A fixed USER would break both.
-HEALTHCHECK --interval=60s --timeout=5s --retries=3 --start-period=30s \
+# start-period absorbs the first built-in pass (the container is unhealthy until
+# it completes). Size it to your slowest expected initial sync; override
+# per-deploy via compose healthcheck.start_period. See README "Healthcheck".
+HEALTHCHECK --interval=60s --timeout=5s --retries=3 --start-period=120s \
     CMD ["/usr/local/bin/docker-rsync-scheduler", "health"]
 ENTRYPOINT ["/usr/local/bin/docker-rsync-scheduler"]
 CMD ["daemon"]

@@ -217,6 +217,99 @@ func TestBuildRsyncArgs_KnownHostsPresent(t *testing.T) {
 	}
 }
 
+// TestBuildRsyncArgs_maxDelete pins the cycle-1 max_delete feature: the
+// --max-delete=N append is nested inside the `if j.Delete` block, so it must
+// surface only when BOTH delete and max_delete are set, be omitted when
+// max_delete is unset, and be a no-op when max_delete is set without delete
+// (--max-delete is meaningless without --delete).
+func TestBuildRsyncArgs_maxDelete(t *testing.T) {
+	// Not parallel: overrides the shared package-level knownHostsExists var,
+	// matching the other buildRsyncArgs tests.
+	orig := knownHostsExists
+	knownHostsExists = func() bool { return false }
+	t.Cleanup(func() { knownHostsExists = orig })
+
+	t.Run("delete with max_delete emits the flag", func(t *testing.T) {
+		j := argJob(true, nil, nil, nil)
+		j.MaxDelete = new(100)
+		got := buildRsyncArgs(j)
+		if !slices.Contains(got, "--max-delete=100") {
+			t.Errorf("--max-delete=100 absent in %v", got)
+		}
+	})
+
+	t.Run("delete without max_delete omits the flag", func(t *testing.T) {
+		got := buildRsyncArgs(argJob(true, nil, nil, nil))
+		if slices.ContainsFunc(got, func(a string) bool { return strings.HasPrefix(a, "--max-delete=") }) {
+			t.Errorf("--max-delete present with max_delete unset in %v", got)
+		}
+	})
+
+	t.Run("max_delete without delete is a no-op", func(t *testing.T) {
+		j := argJob(false, nil, nil, nil)
+		j.MaxDelete = new(100)
+		got := buildRsyncArgs(j)
+		if slices.ContainsFunc(got, func(a string) bool { return strings.HasPrefix(a, "--max-delete=") }) {
+			t.Errorf("--max-delete present without delete in %v", got)
+		}
+		if slices.Contains(got, "--delete") {
+			t.Errorf("--delete present with delete=false in %v", got)
+		}
+	})
+}
+
+// TestRemoteDest pins rsync's destination construction, especially the IPv6
+// bracketing: an IPv6-literal host must be wrapped in [brackets] so rsync reads
+// the address colons as the host, not the daemon-mode "::" separator. IPv4 and
+// hostnames are left unbracketed, and an already-bracketed IPv6 input is
+// normalized to a single bracket pair.
+func TestRemoteDest(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name, host, path, want string
+	}{
+		{"ipv4 with user", "root@192.168.1.87", "/srv/x", "root@192.168.1.87:/srv/x/"},
+		{"hostname no user", "example.com", "/srv/x", "example.com:/srv/x/"},
+		{"bare ipv6 gets brackets", "2001:db8::1", "/srv/x", "[2001:db8::1]:/srv/x/"},
+		{"ipv6 with user gets brackets", "user@2001:db8::1", "/srv/x", "user@[2001:db8::1]:/srv/x/"},
+		{"already-bracketed ipv6 normalized", "user@[2001:db8::1]", "/srv/x", "user@[2001:db8::1]:/srv/x/"},
+		{"ipv6 loopback", "::1", "/srv/x", "[::1]:/srv/x/"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			j := &job{RemoteHost: tt.host, RemotePath: tt.path}
+			if got := remoteDest(j); got != tt.want {
+				t.Errorf("remoteDest(host=%q, path=%q) = %q, want %q", tt.host, tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRemoteDest_ipv4MappedIPv6Bracketed pins the cycle-1 h-f1 colon-presence
+// fix for the IPv4-mapped IPv6 literal ::ffff:192.0.2.1. The old
+// net.ParseIP(host).To4()!=nil predicate classified it as IPv4 and left it
+// unbracketed, so rsync misread the leading "::" as the daemon-mode separator;
+// the colon-presence predicate brackets it. validateRemoteHost accepts the
+// host, so this is a reachable, accepted case the existing TestRemoteDest table
+// omits.
+func TestRemoteDest_ipv4MappedIPv6Bracketed(t *testing.T) {
+	t.Parallel()
+	tests := []struct{ name, host, want string }{
+		{"ipv4-mapped ipv6 bare gets brackets", "::ffff:192.0.2.1", "[::ffff:192.0.2.1]:/srv/x/"},
+		{"ipv4-mapped ipv6 with user gets brackets", "user@::ffff:192.0.2.1", "user@[::ffff:192.0.2.1]:/srv/x/"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			j := &job{RemoteHost: tt.host, RemotePath: "/srv/x"}
+			if got := remoteDest(j); got != tt.want {
+				t.Errorf("remoteDest(host=%q) = %q, want %q", tt.host, got, tt.want)
+			}
+		})
+	}
+}
+
 func hasChown(args []string) bool {
 	return slices.ContainsFunc(args, func(a string) bool {
 		return strings.HasPrefix(a, "--chown=")
@@ -1046,5 +1139,84 @@ func TestPassResult_exitStatus_unknownDispositionFailsSafe(t *testing.T) {
 	r := passResult{disposition: passDisposition(99)}
 	if got := r.exitStatus(); got != 1 {
 		t.Errorf("exitStatus() for an unhandled disposition = %d, want 1 (fail safe non-zero)", got)
+	}
+}
+
+// TestRunPass_realFailureDuringShutdownStillUnhealthy pins the failed>0 half of
+// healthSignal's interrupted carve-out at the runPass integration level.
+func TestRunPass_realFailureDuringShutdownStillUnhealthy(t *testing.T) {
+	// Not parallel: contends on the real lockFilePath.
+	ctx, cancel := context.WithCancel(context.Background())
+	var calls int
+	newCmd := func(cmdCtx context.Context, _ string, _ ...string) *exec.Cmd {
+		calls++
+		if calls == 1 {
+			return exec.CommandContext(cmdCtx, "sh", "-c", "exit 1")
+		}
+		cancel()
+		return exec.CommandContext(cmdCtx, "sleep", "30")
+	}
+	src := newRunJobSource(t)
+	cfg := config{Jobs: []job{*runJobJob(src), *runJobJob(src)}}
+	r := runPass(ctx, cfg, time.Minute, "test", newCmd)
+	if r.disposition != passRan {
+		t.Fatalf("disposition = %v, want passRan (%v)", r.disposition, passRan)
+	}
+	if r.failed != 1 {
+		t.Errorf("failed = %d, want 1", r.failed)
+	}
+	if !r.interrupted {
+		t.Error("interrupted = false, want true")
+	}
+	set, healthy := r.healthSignal()
+	if !set || healthy {
+		t.Errorf("healthSignal() = (set=%v, healthy=%v), want (true, false)", set, healthy)
+	}
+	if got := r.exitStatus(); got != 1 {
+		t.Errorf("exitStatus() = %d, want 1", got)
+	}
+}
+
+// TestReportPass_unknownDispositionEmitsError pins reportPass's fail-safe
+// default arm: a passResult carrying a disposition no case handles must still
+// emit exactly one structured line, at ERROR level.
+func TestReportPass_unknownDispositionEmitsError(t *testing.T) {
+	buf := captureLogs(t, slog.LevelInfo)
+	reportPass(&passResult{disposition: passDisposition(99), trigger: "interval"})
+	logs := buf.String()
+	if !strings.Contains(logs, "level=ERROR") {
+		t.Errorf("log = %q, want level=ERROR for an unknown disposition", logs)
+	}
+	if !strings.Contains(logs, "sync pass completed with unknown disposition") {
+		t.Errorf("log = %q, want the unknown-disposition fail-safe line", logs)
+	}
+}
+
+// TestPassResult_healthSignal_unknownDispositionFailsSafe pins healthSignal's
+// fail-safe default arm: an unhandled disposition must report (set=true, healthy=false)
+// so the marker is written unhealthy rather than silently left stale.
+func TestPassResult_healthSignal_unknownDispositionFailsSafe(t *testing.T) {
+	t.Parallel()
+	r := passResult{disposition: passDisposition(99)}
+	set, healthy := r.healthSignal()
+	if !set || healthy {
+		t.Errorf("healthSignal() for an unhandled disposition = (set=%v, healthy=%v), want (true, false)", set, healthy)
+	}
+}
+
+func TestRemoteDest_bracketedIPv4Normalized(t *testing.T) {
+	t.Parallel()
+	tests := []struct{ name, host, want string }{
+		{"bracketed ipv4 normalized to bare", "[192.0.2.10]", "192.0.2.10:/srv/x/"},
+		{"user on bracketed ipv4 normalized", "user@[192.0.2.10]", "user@192.0.2.10:/srv/x/"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			j := &job{RemoteHost: tt.host, RemotePath: "/srv/x"}
+			if got := remoteDest(j); got != tt.want {
+				t.Errorf("remoteDest(host=%q) = %q, want %q", tt.host, got, tt.want)
+			}
+		})
 	}
 }

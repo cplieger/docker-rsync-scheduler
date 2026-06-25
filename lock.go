@@ -40,6 +40,12 @@ func (h lockHolder) age() time.Duration {
 	return time.Since(h.since)
 }
 
+// known reports whether the holder's acquisition time was readable. It
+// disambiguates age()'s 0 return: known()==false means the timestamp could not
+// be read (unknown), whereas known()==true with a ~0 age is a just-acquired
+// holder.
+func (h lockHolder) known() bool { return !h.since.IsZero() }
+
 // tryLock attempts a non-blocking exclusive flock on path. On success it
 // records the acquisition time in the file (for a later failed acquirer to
 // read) and returns ok=true; the caller must release with unlock. When another

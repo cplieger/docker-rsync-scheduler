@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -41,6 +42,7 @@ type config struct {
 type job struct {
 	RemoteUID  *int     `yaml:"remote_uid"`
 	RemoteGID  *int     `yaml:"remote_gid"`
+	MaxDelete  *int     `yaml:"max_delete"`
 	Name       string   `yaml:"name"`
 	Local      string   `yaml:"local"`
 	RemoteHost string   `yaml:"remote_host"`
@@ -76,10 +78,14 @@ const (
 	lockFilePath = "/tmp/.docker-rsync-scheduler.lock"
 )
 
-// remoteHostRE accepts an optional [user@] prefix followed by a host that
-// may contain IPv6-style colons, but rejects shell metacharacters and
-// whitespace by construction.
-var remoteHostRE = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9._:-]*$`)
+// userRE matches the optional login name before '@' in a remote_host.
+var userRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// hostnameRE matches a DNS hostname (alphanumerics, dots, underscores, and
+// hyphens). IPv4/IPv6 literals are validated separately via net.ParseIP, so a
+// colon is deliberately absent here: a colon in a non-literal host is the
+// daemon-mode "::" hazard that rsync's host:path parser would misread.
+var hostnameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 // shellMetaChars are characters that enable command injection or argument
 // splitting in a shell. Jobs are executed with an explicit argument slice
@@ -237,8 +243,8 @@ func (j *job) validate() error {
 	if !filepath.IsAbs(j.RemotePath) {
 		return fmt.Errorf("job %q: remote_path %q must be absolute", j.Name, j.RemotePath)
 	}
-	if !remoteHostRE.MatchString(j.RemoteHost) {
-		return fmt.Errorf("job %q: remote_host %q is invalid", j.Name, j.RemoteHost)
+	if err := validateRemoteHost(j); err != nil {
+		return err
 	}
 
 	for _, f := range []struct{ key, val string }{
@@ -258,6 +264,15 @@ func (j *job) validate() error {
 		}
 	}
 
+	// remote_path is sent to the remote host as an rsync argument that the
+	// remote login shell word-splits (rsync runs without --secluded-args/-s).
+	// A space splits one path into several remote args -- the dest is then
+	// wrong, and under --delete that can target the wrong remote tree.
+	if strings.ContainsRune(j.RemotePath, ' ') {
+		return fmt.Errorf("job %q: remote_path %q must not contain spaces",
+			j.Name, j.RemotePath)
+	}
+
 	// ssh_key is embedded in the word-split `-e "ssh -i <key> ..."` string
 	// (sshCommand); a space would split it into separate argv elements and
 	// break the job. hasShellMeta deliberately allows spaces for path
@@ -271,7 +286,103 @@ func (j *job) validate() error {
 		return fmt.Errorf("job %q: ssh_key %q not readable: %w", j.Name, j.SSHKey, err)
 	}
 
+	// max_delete, when set, caps how many deletions a single --delete pass may
+	// perform (rsync --max-delete); a negative cap is meaningless. Unset leaves
+	// the pass uncapped, preserving the prior behavior.
+	if j.MaxDelete != nil && *j.MaxDelete < 0 {
+		return fmt.Errorf("job %q: max_delete must be >= 0", j.Name)
+	}
+
+	j.warnInertSettings()
+
 	return nil
+}
+
+// warnInertSettings logs advisory warnings for job fields that are accepted
+// but silently inert in the current configuration: a max_delete cap without
+// delete:true, or a lone remote_uid/remote_gid. Neither is an error -- the job
+// still runs -- so these stay out of validate's error path (and keep validate
+// under the gocyclo complexity threshold).
+func (j *job) warnInertSettings() {
+	// max_delete only takes effect with delete:true -- buildRsyncArgs emits
+	// --max-delete inside the --delete branch, so a cap set without delete is
+	// silently inert. Warn so the operator notices, mirroring the
+	// remote_uid/remote_gid pairing warning below.
+	if j.MaxDelete != nil && !j.Delete {
+		slog.Warn("max_delete set without delete:true; the cap will be ignored",
+			"job", j.Name)
+	}
+
+	// buildRsyncArgs emits --chown only when BOTH remote_uid and remote_gid
+	// are set, so a lone uid or gid is silently dropped and the remote keeps
+	// the ssh user's ownership. Warn so the operator notices.
+	if (j.RemoteUID == nil) != (j.RemoteGID == nil) {
+		slog.Warn("remote_uid/remote_gid set without its pair; --chown will be skipped",
+			"job", j.Name,
+			"remote_uid_set", j.RemoteUID != nil,
+			"remote_gid_set", j.RemoteGID != nil)
+	}
+}
+
+// splitRemoteHost separates an optional "user@" prefix from the host and
+// strips the surrounding brackets from an IPv6 literal written in rsync's
+// [addr] form. It performs no validation; user is "" when no prefix is
+// present. Brackets are stripped only when the inner text is a valid IP, so a
+// stray "[name]" is left intact for validateRemoteHost to reject.
+func splitRemoteHost(raw string) (user, host string) {
+	host = raw
+	if u, h, found := strings.Cut(raw, "@"); found {
+		user, host = u, h
+	}
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		if inner := host[1 : len(host)-1]; net.ParseIP(inner) != nil {
+			host = inner
+		}
+	}
+	return user, host
+}
+
+// validateRemoteHost enforces the remote_host contract: an optional "user@"
+// prefix followed by either an IPv4/IPv6 literal or a DNS hostname. IPv6
+// literals are accepted bare ("2001:db8::1") or bracketed ("[2001:db8::1]");
+// the brackets rsync's host:path syntax needs are added automatically when the
+// destination is built (see remoteDest). A bare host that merely contains a
+// colon but is not a valid IP (e.g. "host:" or the incomplete "2001:db8") is
+// rejected, because that colon would otherwise be misread by rsync as the
+// daemon-mode "::" separator. Link-local IPv6 with a zone id ("fe80::1%eth0")
+// is not supported; use a global/ULA address or an ssh_config Host alias.
+func validateRemoteHost(j *job) error {
+	user, host := splitRemoteHost(j.RemoteHost)
+	if strings.Contains(j.RemoteHost, "@") && !userRE.MatchString(user) {
+		return fmt.Errorf("job %q: remote_host %q has an invalid login prefix", j.Name, j.RemoteHost)
+	}
+	if net.ParseIP(host) != nil {
+		return nil // a valid IPv4 or IPv6 literal
+	}
+	if !hostnameRE.MatchString(host) {
+		return fmt.Errorf("job %q: remote_host %q is not a valid hostname or IP address "+
+			"(for an IPv6 literal use the bare address, e.g. 2001:db8::1)", j.Name, j.RemoteHost)
+	}
+	return nil
+}
+
+// remoteDest builds rsync's destination argument for a job:
+// "[user@]host:/remote/path/". An IPv6-literal host is wrapped in brackets so
+// rsync's host:path parser reads the address colons as part of the host rather
+// than the daemon-mode "::" separator.
+func remoteDest(j *job) string {
+	user, host := splitRemoteHost(j.RemoteHost)
+	// A colon in a validated host can only come from an IPv6 literal
+	// (hostnameRE and IPv4 dotted-quads never contain one), including the
+	// IPv4-mapped form ::ffff:192.0.2.1 that net.IP.To4 reports as IPv4.
+	// Bracket on the colon so the validated host and the emitted dest agree.
+	if strings.ContainsRune(host, ':') {
+		host = "[" + host + "]"
+	}
+	if user != "" {
+		host = user + "@" + host
+	}
+	return host + ":" + j.RemotePath + "/"
 }
 
 // checkReadable confirms a file exists and can be opened for reading.

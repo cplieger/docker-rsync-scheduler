@@ -88,3 +88,32 @@ func TestProperty_HasShellMetaTotal(t *testing.T) {
 		}
 	})
 }
+
+func TestProperty_AcceptedRemoteHostNeverLeaksUnbracketedColon(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		host := rapid.SampledFrom([]string{
+			"192.0.2.10", "10.0.0.1", "example.com", "host-1.example.com",
+			"2001:db8::1", "::1", "fe80::1", "[2001:db8::1]", "[192.0.2.10]",
+			"host:", "2001:db8", "fe80::1%eth0", "[name]", "-bad",
+		}).Draw(rt, "host")
+		raw := host
+		if rapid.Bool().Draw(rt, "withUser") {
+			raw = "u@" + host
+		}
+		j := &job{Name: "p", RemoteHost: raw, RemotePath: "/srv/x"}
+		if validateRemoteHost(j) != nil {
+			return // only an accepted host has a meaningful destination
+		}
+		dest := remoteDest(j)
+		hostSeg := strings.TrimSuffix(dest, ":"+j.RemotePath+"/")
+		stripped := hostSeg
+		if i := strings.IndexByte(stripped, '['); i >= 0 {
+			if k := strings.IndexByte(stripped, ']'); k > i {
+				stripped = stripped[:i] + stripped[k+1:]
+			}
+		}
+		if strings.Contains(stripped, ":") {
+			rt.Fatalf("accepted remote_host %q -> remoteDest %q has an unbracketed colon", raw, dest)
+		}
+	})
+}

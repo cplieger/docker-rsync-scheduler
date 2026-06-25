@@ -18,7 +18,7 @@ Reads a YAML config defining _N_ sync jobs. For each job it runs `rsync` over `s
 
 - One-way mirror of each configured local directory to a `[user@]host:/path`
 - Per-job `--delete`, `--chown=uid:gid`, and exclude patterns
-- Empty-source guard: a job whose top-level source directory is missing or empty is skipped, so a wholly vanished or unmounted source cannot let `--delete` wipe the matching remote tree. The guard probes the job's `local` dir only; for sources composed of nested bind mounts, ensure every nested mount is present before a `--delete` pass (or omit `delete: true` for such jobs)
+- Empty-source guard: a job whose top-level source directory is missing or empty is skipped, so a wholly vanished or unmounted source cannot let `--delete` wipe the matching remote tree. The guard probes the job's `local` dir only; for sources composed of nested bind mounts, ensure every nested mount is present before a `--delete` pass (or omit `delete: true` for such jobs). The guard consults only the built-in global excludes, never per-job `excludes`: a `delete: true` job whose source holds only entries matched by its own `excludes` still runs with an empty post-exclude file list, so `--delete` then clears the remote. Avoid `delete: true` on a job whose `excludes` can match every top-level entry of its source, or set `max_delete` on that job as a backstop so a runaway pass aborts (rsync `--max-delete=N`) rather than clearing the remote.
 - Built-in interval scheduler, or hand scheduling to an external scheduler (cron, Ofelia, etc.) via the `sync` subcommand
 - File-marker healthcheck — unhealthy when any job fails, recovers on the next clean pass
 - Logs only: no Prometheus exporter, no HTTP server, no listening socket
@@ -115,14 +115,17 @@ A ready-to-edit [`config.example.yaml`](config.example.yaml) ships in the repo �
 jobs:
   - name: certs                          # required, unique, used as a log key
     local: /sources/certs                # required, absolute path inside the container
-    remote_host: root@192.0.2.10         # required, [user@]host
+    remote_host: root@192.0.2.10         # required, [user@]host (DNS, IPv4, or IPv6 literal)
     remote_path: /srv/certs              # required, absolute path on the remote
     remote_uid: 1000                     # optional; with remote_gid -> rsync --chown=uid:gid
     remote_gid: 1000                     # optional
     ssh_key: /keys/id_ed25519            # required, private key path inside the container
     delete: true                         # optional, default false -> rsync --delete when true
+    max_delete: 100                      # optional; with delete -> rsync --max-delete=N (abort if a pass would delete > N files)
     excludes: ["**/locks", "**/*.lock", "logs"]  # optional, per-job exclude patterns
 ```
+
+The `remote_host` field is `[user@]host`, where `host` is a DNS hostname, an IPv4 address, or an IPv6 literal. Write IPv6 literals as the bare address (`2001:db8::1` or `user@2001:db8::1`) — the brackets rsync's `host:path` syntax needs are added for you. A host containing a colon that is not a valid IP (a trailing colon, or an incomplete address) is rejected at startup so it can't be misread as rsync's daemon-mode `::` separator. Link-local IPv6 with a zone id (`fe80::1%eth0`) is not supported; use a global or ULA address, or define an `ssh_config` `Host` alias and reference the alias name.
 
 Every job also receives a fixed set of global excludes: `.stfolder`, `.stversions`, `.DS_Store`, `Thumbs.db`. Each job is pushed with `rsync -rlptD` (archive minus owner/group/ACL/xattr) plus `--stats`, the per-job and global excludes, and the `-e "ssh -i <key> -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10"` transport.
 
@@ -142,7 +145,7 @@ The built-in healthcheck (`docker-rsync-scheduler health`) checks for a marker f
 > Because an empty source is skipped as a success, a job whose source silently becomes empty (for example a read-only bind mount that failed to mount and Docker materialised as an empty directory) keeps the container healthy and never logs at `level=error` — it is invisible to both the error-level and heartbeat-absence alerts. Each skip emits a `level=warn msg="skip empty source"` line and the `sync cycle complete` heartbeat carries a `skipped` count; add a Loki alert on a persistently non-zero `skipped` (or `skipped == jobs`) across several consecutive passes, or on the recurring `skip empty source` warning, to catch a vanished source before the remote mirror goes stale.
 
 ```dockerfile
-HEALTHCHECK --interval=60s --timeout=5s --retries=3 --start-period=30s \
+HEALTHCHECK --interval=60s --timeout=5s --retries=3 --start-period=120s \
     CMD ["/usr/local/bin/docker-rsync-scheduler", "health"]
 ```
 

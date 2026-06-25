@@ -70,6 +70,36 @@ func TestValidate(t *testing.T) {
 			}}},
 		},
 		{
+			name: "valid bare ipv6 host",
+			cfg: config{Jobs: []job{{
+				Name:       "v6bare",
+				Local:      "/sources/v6bare",
+				RemoteHost: "2001:db8::1",
+				RemotePath: "/srv/v6",
+				SSHKey:     key,
+			}}},
+		},
+		{
+			name: "valid bracketed ipv6 host",
+			cfg: config{Jobs: []job{{
+				Name:       "v6br",
+				Local:      "/sources/v6br",
+				RemoteHost: "user@[2001:db8::1]",
+				RemotePath: "/srv/v6",
+				SSHKey:     key,
+			}}},
+		},
+		{
+			name: "valid bare ipv4 host",
+			cfg: config{Jobs: []job{{
+				Name:       "v4",
+				Local:      "/sources/v4",
+				RemoteHost: "192.0.2.10",
+				RemotePath: "/srv/v4",
+				SSHKey:     key,
+			}}},
+		},
+		{
 			name:    "empty jobs",
 			cfg:     config{Jobs: nil},
 			wantErr: "jobs list is empty",
@@ -143,6 +173,30 @@ func TestValidate(t *testing.T) {
 			name: "remote_host with leading dash",
 			cfg: config{Jobs: []job{{
 				Name: "j", Local: "/a", RemoteHost: "-eevil",
+				RemotePath: "/b", SSHKey: key,
+			}}},
+			wantErr: "remote_host",
+		},
+		{
+			name: "remote_host trailing colon rejected",
+			cfg: config{Jobs: []job{{
+				Name: "j", Local: "/a", RemoteHost: "host:",
+				RemotePath: "/b", SSHKey: key,
+			}}},
+			wantErr: "remote_host",
+		},
+		{
+			name: "remote_host incomplete ipv6 rejected",
+			cfg: config{Jobs: []job{{
+				Name: "j", Local: "/a", RemoteHost: "2001:db8",
+				RemotePath: "/b", SSHKey: key,
+			}}},
+			wantErr: "remote_host",
+		},
+		{
+			name: "remote_host ipv6 zone id rejected",
+			cfg: config{Jobs: []job{{
+				Name: "j", Local: "/a", RemoteHost: "fe80::1%eth0",
 				RemotePath: "/b", SSHKey: key,
 			}}},
 			wantErr: "remote_host",
@@ -233,6 +287,27 @@ func TestValidate_sshKeyWithSpaceRejected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "must not contain spaces") {
 		t.Errorf("validate() error = %q, want to contain 'must not contain spaces'", err)
+	}
+}
+
+func TestSplitRemoteHost_direct(t *testing.T) {
+	t.Parallel()
+	tests := []struct{ raw, wantUser, wantHost string }{
+		{"host", "", "host"},
+		{"user@host", "user", "host"},
+		{"2001:db8::1", "", "2001:db8::1"},
+		{"[2001:db8::1]", "", "2001:db8::1"},
+		{"user@[2001:db8::1]", "user", "2001:db8::1"},
+		{"[192.0.2.10]", "", "192.0.2.10"},
+		{"[name]", "", "[name]"},
+		{"[]", "", "[]"},
+	}
+	for _, tt := range tests {
+		u, h := splitRemoteHost(tt.raw)
+		if u != tt.wantUser || h != tt.wantHost {
+			t.Errorf("splitRemoteHost(%q) = (%q,%q), want (%q,%q)",
+				tt.raw, u, h, tt.wantUser, tt.wantHost)
+		}
 	}
 }
 
@@ -647,5 +722,76 @@ func TestLoadConfig_readErrorWhenPathIsDir(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "read config") {
 		t.Errorf("loadConfig() dir error = %q, want to contain 'read config'", err)
+	}
+}
+
+func TestValidateRemoteHost(t *testing.T) {
+	t.Parallel()
+	tests := []struct{ name, host, wantErr string }{
+		{"plain hostname accepted", "host", ""},
+		{"user on hostname accepted", "root@host", ""},
+		{"bare ipv4 accepted", "192.0.2.10", ""},
+		{"bare ipv6 accepted", "2001:db8::1", ""},
+		{"bracketed ipv6 accepted", "user@[2001:db8::1]", ""},
+		{"bracketed ipv4 accepted", "[192.0.2.10]", ""},
+		{"user on bracketed ipv4 accepted", "user@[192.0.2.10]", ""},
+		{"invalid login prefix rejected", "-bad@host", "invalid login prefix"},
+		{"empty login prefix rejected", "@host", "invalid login prefix"},
+		{"malformed bracket name rejected", "[name]", "not a valid hostname or IP"},
+		{"malformed bracket incomplete ipv6", "[2001:db8]", "not a valid hostname or IP"},
+		{"trailing colon rejected", "host:", "not a valid hostname or IP"},
+		{"zone id rejected", "fe80::1%eth0", "not a valid hostname or IP"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := validateRemoteHost(&job{Name: "j", RemoteHost: tt.host})
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Errorf("validateRemoteHost(%q) = %v, want nil", tt.host, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validateRemoteHost(%q) = nil, want error containing %q", tt.host, tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("validateRemoteHost(%q) error = %q, want to contain %q", tt.host, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidate_maxDelete(t *testing.T) {
+	key := writeKey(t)
+	tests := []struct {
+		name      string
+		maxDelete *int
+		wantErr   string
+	}{
+		{"unset is accepted", nil, ""},
+		{"zero is accepted", new(0), ""},
+		{"positive is accepted", new(100), ""},
+		{"negative is rejected", new(-1), "max_delete must be >= 0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			j := validJob("caddy", key)
+			j.Delete = true
+			j.MaxDelete = tt.maxDelete
+			err := config{Jobs: []job{j}}.validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validate() with max_delete=%v = %v, want nil", tt.maxDelete, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validate() with max_delete=%v = nil, want error containing %q", tt.maxDelete, tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("validate() error = %q, want to contain %q", err, tt.wantErr)
+			}
+		})
 	}
 }
