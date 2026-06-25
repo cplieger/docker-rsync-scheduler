@@ -79,6 +79,21 @@ func TestLockHolder_zeroValueAgeIsZero(t *testing.T) {
 	}
 }
 
+// TestLockHolder_known pins lockHolder.known() (lock.go:47, !h.since.IsZero()),
+// the disambiguator behind the operator-facing holder_age_known log field: a
+// zero holder (unreadable acquisition time) reports false, while a holder with
+// a set timestamp reports true. Its sibling age() is pinned by
+// TestLockHolder_zeroValueAgeIsZero; this closes the known() leaf gap.
+func TestLockHolder_known(t *testing.T) {
+	t.Parallel()
+	if (lockHolder{}).known() {
+		t.Error("zero lockHolder known() = true, want false (acquisition time unreadable)")
+	}
+	if !(lockHolder{since: time.Now()}).known() {
+		t.Error("lockHolder with a set timestamp known() = false, want true")
+	}
+}
+
 // TestReadHolder_parsesValidAndRejectsMalformed exercises readHolder's
 // parse-failure arm (a torn/absent/pre-format timestamp line -> zero holder),
 // which the named-but-unrelated TestLockHolder_zeroValueAgeIsZero never

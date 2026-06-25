@@ -19,9 +19,10 @@ import (
 // --- rsync engine ---
 
 const (
-	// stderrCapBytes bounds captured rsync stderr so a chatty or
-	// misbehaving subprocess cannot OOM the container.
-	stderrCapBytes = 1 << 20 // 1 MB
+	// outputCapBytes bounds each captured rsync output stream (stdout for
+	// --stats parsing, stderr for the failure tail) so a chatty or misbehaving
+	// subprocess cannot OOM the container.
+	outputCapBytes = 1 << 20 // 1 MB
 
 	// logStderrTailBytes bounds the stderr tail attached to a failure log
 	// line so a single failure cannot flood Loki.
@@ -131,6 +132,12 @@ func buildRsyncArgs(j *job) []string {
 	args := []string{"-rlptD"}
 	if j.Delete {
 		args = append(args, "--delete")
+		// --max-delete (when configured) caps the deletions a single pass may
+		// perform: the documented backstop for a delete:true job whose per-job
+		// excludes can match every top-level source entry. Unset -> uncapped.
+		if j.MaxDelete != nil {
+			args = append(args, fmt.Sprintf("--max-delete=%d", *j.MaxDelete))
+		}
 	}
 	if j.RemoteUID != nil && j.RemoteGID != nil {
 		args = append(args, fmt.Sprintf("--chown=%d:%d", *j.RemoteUID, *j.RemoteGID))
@@ -144,7 +151,7 @@ func buildRsyncArgs(j *job) []string {
 		args = append(args, "--exclude="+e)
 	}
 
-	args = append(args, j.Local+"/", j.RemoteHost+":"+j.RemotePath+"/")
+	args = append(args, j.Local+"/", remoteDest(j))
 	return args
 }
 
@@ -277,8 +284,8 @@ func runJob(ctx context.Context, j *job, timeout time.Duration, newCmd commandRu
 	jobCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	outBuf := &cappedBuffer{max: stderrCapBytes}
-	errBuf := &cappedBuffer{max: stderrCapBytes}
+	outBuf := &cappedBuffer{max: outputCapBytes}
+	errBuf := &cappedBuffer{max: outputCapBytes}
 	cmd := newCmd(jobCtx, "rsync", buildRsyncArgs(j)...)
 	cmd.Stdout = outBuf
 	cmd.Stderr = errBuf
@@ -307,6 +314,7 @@ func runJob(ctx context.Context, j *job, timeout time.Duration, newCmd commandRu
 		slog.Error("sync failed",
 			"job", j.Name,
 			"duration_ms", res.duration.Milliseconds(),
+			"timed_out", errors.Is(jobCtx.Err(), context.DeadlineExceeded),
 			"error", runErr,
 			"rsync_exit", res.exitCode,
 			"stderr", res.stderrTail)
@@ -340,16 +348,17 @@ const (
 // by a caller reading a bare int. Fields are ordered largest-first for
 // fieldalignment.
 type passResult struct {
-	err          error           // non-nil only for passLockErr
-	trigger      string          // startup | interval | external
-	disposition  passDisposition // what the pass did
-	total        int             // jobs configured
-	ok           int             // jobs that succeeded (includes emptySkipped)
-	emptySkipped int             // jobs skipped because their source was missing/empty
-	failed       int             // jobs that failed
-	duration     time.Duration   // wall-clock of a pass that ran
-	holderAge    time.Duration   // how long the current holder has run (passDeferred)
-	interrupted  bool            // ctx cancelled mid-pass (graceful shutdown drain)
+	err            error           // non-nil only for passLockErr
+	trigger        string          // startup | interval | external
+	disposition    passDisposition // what the pass did
+	total          int             // jobs configured
+	ok             int             // jobs that succeeded (includes emptySkipped)
+	emptySkipped   int             // jobs skipped because their source was missing/empty
+	failed         int             // jobs that failed
+	duration       time.Duration   // wall-clock of a pass that ran
+	holderAge      time.Duration   // how long the current holder has run (passDeferred)
+	interrupted    bool            // ctx cancelled mid-pass (graceful shutdown drain)
+	holderAgeKnown bool            // holder's acquisition time was readable (passDeferred)
 }
 
 // healthSignal reports whether this result should write the health marker
@@ -429,6 +438,7 @@ func runPass(ctx context.Context, cfg config, timeout time.Duration, trigger str
 	case !ok:
 		res.disposition = passDeferred
 		res.holderAge = holder.age()
+		res.holderAgeKnown = holder.known()
 		return res
 	}
 	defer lock.unlock()
@@ -496,7 +506,8 @@ func reportPass(r *passResult) {
 		// holder must still trip the absence alert); holder_age_ms lets an
 		// operator alert on a holder that has run too long.
 		slog.Info("sync deferred, prior pass still running",
-			"trigger", r.trigger, "holder_age_ms", r.holderAge.Milliseconds())
+			"trigger", r.trigger, "holder_age_ms", r.holderAge.Milliseconds(),
+			"holder_age_known", r.holderAgeKnown)
 	case passLockErr:
 		// A real environment failure (cannot even acquire the lock). level=error
 		// trips the documented error alert; the marker goes unhealthy too.

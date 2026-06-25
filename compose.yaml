@@ -25,6 +25,13 @@ services:
     #     ofelia.job-exec.rsync-sync.command: "docker-rsync-scheduler sync"
     #     ofelia.job-exec.rsync-sync.no-overlap: "true"
 
+    # Built-in mode boots unhealthy until the first pass finishes. If your
+    # initial sync is large/slow, raise the start period to keep the container
+    # from reporting unhealthy mid-first-pass (overrides the image default).
+    # See README "Healthcheck".
+    # healthcheck:
+    #   start_period: 5m
+
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       # Optional: pin the remote SSH host key instead of trusting it on first
