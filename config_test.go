@@ -139,6 +139,14 @@ func TestValidate(t *testing.T) {
 			wantErr: "remote_host",
 		},
 		{
+			name: "remote_host with leading dash",
+			cfg: config{Jobs: []job{{
+				Name: "j", Local: "/a", RemoteHost: "-eevil",
+				RemotePath: "/b", SSHKey: key,
+			}}},
+			wantErr: "remote_host",
+		},
+		{
 			name: "dangerous char in local",
 			cfg: config{Jobs: []job{{
 				Name: "j", Local: "/a;rm", RemoteHost: "host",
@@ -366,6 +374,25 @@ func TestLoadInterval(t *testing.T) {
 				t.Errorf("loadInterval() interval = %v, want %v", interval, tt.wantInterval)
 			}
 		})
+	}
+}
+
+// TestLoadInterval_negativeDurationFallsBackToDefaultEnabled pins the
+// negative-duration arm of loadInterval's inner switch: a parseable but
+// negative SYNC_INTERVAL ("-30m") is neither a disable sentinel nor a valid
+// cadence, so the built-in scheduler stays ENABLED at the default interval.
+// This is a distinct path from the unparseable case and guards against a
+// `d == 0` -> `d <= 0` regression that would wrongly disable scheduling.
+func TestLoadInterval_negativeDurationFallsBackToDefaultEnabled(t *testing.T) {
+	t.Setenv("SYNC_INTERVAL", "-30m")
+
+	interval, enabled := loadInterval()
+
+	if !enabled {
+		t.Errorf("loadInterval() with -30m enabled = false, want true (negative is not a disable sentinel)")
+	}
+	if interval != defaultInterval {
+		t.Errorf("loadInterval() with -30m interval = %v, want default %v", interval, defaultInterval)
 	}
 }
 

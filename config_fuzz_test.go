@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"pgregory.net/rapid"
@@ -20,16 +21,32 @@ func FuzzParseConfig(f *testing.F) {
 	})
 }
 
-// FuzzHasShellMeta asserts the metacharacter check never panics and is
-// total over arbitrary input.
+// FuzzHasShellMeta asserts that hasShellMeta agrees with an independent
+// oracle over coverage-guided input: a string is unsafe iff it contains a
+// control character (< 0x20 or 0x7f) or any shell metacharacter. This
+// strengthens the previous crash-only target so the security gate's
+// detection invariant accumulates a persistent corpus, complementing the
+// every-PR rapid property test.
 func FuzzHasShellMeta(f *testing.F) {
 	f.Add("/sources/caddy")
 	f.Add("root@host")
 	f.Add("a;b")
 	f.Add("**/*.lock")
 	f.Add("")
-	f.Fuzz(func(_ *testing.T, s string) {
-		_ = hasShellMeta(s)
+	f.Add("a\x1fb")
+	f.Add("a\x7fb")
+	f.Fuzz(func(t *testing.T, s string) {
+		got := hasShellMeta(s)
+		want := false
+		for _, r := range s {
+			if r < 0x20 || r == 0x7f || strings.ContainsRune(shellMetaChars, r) {
+				want = true
+				break
+			}
+		}
+		if got != want {
+			t.Fatalf("hasShellMeta(%q) = %v, want %v", s, got, want)
+		}
 	})
 }
 

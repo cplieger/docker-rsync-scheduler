@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"pgregory.net/rapid"
 )
@@ -332,6 +336,62 @@ func TestSourceIsEmpty(t *testing.T) {
 	})
 }
 
+// TestSourceIsEmpty_unreadableDirSurfacesWarnAndSkips covers the cycle-2
+// error-surfacing arm where os.Open succeeds but Readdirnames returns a
+// non-EOF error: a source path that is a regular file (not a directory).
+// sourceIsEmpty must still report empty (true) so a broken source cannot let
+// --delete wipe the remote, AND it must emit a WARN so the breakage is not
+// masked as a benign empty source. Asserting the WARN is what distinguishes
+// this arm from the silent missing-dir case.
+func TestSourceIsEmpty_unreadableDirSurfacesWarnAndSkips(t *testing.T) {
+	var buf bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	path := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	got := sourceIsEmpty(path)
+
+	if !got {
+		t.Errorf("sourceIsEmpty(regular file) = false, want true (skip to protect remote)")
+	}
+	if !strings.Contains(buf.String(), "source unreadable") {
+		t.Errorf("sourceIsEmpty(regular file) log = %q, want a 'source unreadable' WARN", buf.String())
+	}
+}
+
+// TestSourceIsEmpty_openErrorSurfacesWarnAndSkips covers the other cycle-2
+// arm: os.Open itself fails with a non-ErrNotExist error. A path whose parent
+// component is a regular file yields ENOTDIR (not ENOENT), independent of uid
+// (so it is reliable under the root-by-design container, unlike a chmod-0
+// dir). The expected missing-dir (ENOENT) case stays silent; this asserts the
+// non-silent arm so the two are not collapsed.
+func TestSourceIsEmpty_openErrorSurfacesWarnAndSkips(t *testing.T) {
+	var buf bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	parent := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(parent, []byte("x"), 0o600); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	path := filepath.Join(parent, "child")
+
+	got := sourceIsEmpty(path)
+
+	if !got {
+		t.Errorf("sourceIsEmpty(path under a file) = false, want true (skip to protect remote)")
+	}
+	if !strings.Contains(buf.String(), "source unreadable") {
+		t.Errorf("sourceIsEmpty(path under a file) log = %q, want a 'source unreadable' WARN", buf.String())
+	}
+}
+
 func TestExitCode(t *testing.T) {
 	t.Parallel()
 	if got := exitCode(nil); got != 0 {
@@ -509,4 +569,283 @@ func TestProperty_CappedBufferNeverExceedsMax(t *testing.T) {
 			rt.Fatalf("buffer = %q, want %q (first %d bytes of input)", got, want, wantLen)
 		}
 	})
+}
+
+// newRunJobSource creates a non-empty temp source dir so runJob does not
+// take the empty-source skip path.
+func newRunJobSource(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("setup source: %v", err)
+	}
+	return dir
+}
+
+// runJobJob returns a minimal job rooted at local.
+func runJobJob(local string) *job {
+	return &job{
+		Name:       "caddy",
+		Local:      local,
+		RemoteHost: "root@192.168.1.87",
+		RemotePath: "/srv/containers/caddy",
+		SSHKey:     "/keys/id_ed25519",
+	}
+}
+
+func TestRunJob_successParsesStatsAndMarksSuccess(t *testing.T) {
+	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c",
+			"printf 'Number of regular files transferred: 5\\nTotal transferred file size: 2048 bytes\\n'; exit 0")
+	}
+	res := runJob(context.Background(), runJobJob(newRunJobSource(t)), time.Minute, newCmd)
+	if !res.success {
+		t.Errorf("success = false, want true")
+	}
+	if res.skipped {
+		t.Errorf("skipped = true, want false")
+	}
+	if res.exitCode != 0 {
+		t.Errorf("exitCode = %d, want 0", res.exitCode)
+	}
+	if res.files != 5 {
+		t.Errorf("files = %d, want 5", res.files)
+	}
+	if res.bytes != 2048 {
+		t.Errorf("bytes = %d, want 2048", res.bytes)
+	}
+}
+
+func TestRunJob_failureCapturesExitCodeAndStderr(t *testing.T) {
+	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c",
+			"printf 'rsync error: link_stat failed\\n' >&2; exit 23")
+	}
+	res := runJob(context.Background(), runJobJob(newRunJobSource(t)), time.Minute, newCmd)
+	if res.success {
+		t.Errorf("success = true, want false")
+	}
+	if res.exitCode != 23 {
+		t.Errorf("exitCode = %d, want 23", res.exitCode)
+	}
+	if !strings.Contains(res.stderrTail, "rsync error") {
+		t.Errorf("stderrTail missing rsync error")
+	}
+}
+
+func TestRunJob_emptySourceSkipsWithoutRunning(t *testing.T) {
+	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		t.Error("runner invoked for empty source; want skip")
+		return exec.CommandContext(ctx, "true")
+	}
+	res := runJob(context.Background(), runJobJob(t.TempDir()), time.Minute, newCmd)
+	if !res.skipped {
+		t.Errorf("skipped = false, want true")
+	}
+	if !res.success {
+		t.Errorf("success = false, want true (skip counts as success)")
+	}
+}
+
+func TestRunPass_deferredWhenLockHeld(t *testing.T) {
+	// Not parallel: contends on the real lockFilePath.
+	held, ok, _, err := tryLock(lockFilePath)
+	if err != nil || !ok {
+		t.Fatalf("could not acquire lock: ok=%v err=%v", ok, err)
+	}
+	defer held.unlock()
+	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		t.Error("runner invoked with held lock; want deferred")
+		return exec.CommandContext(ctx, "true")
+	}
+	cfg := config{Jobs: []job{*runJobJob(newRunJobSource(t))}}
+	r := runPass(context.Background(), cfg, time.Minute, "test", newCmd)
+	if r.disposition != passDeferred {
+		t.Errorf("disposition = %v, want passDeferred (%v)", r.disposition, passDeferred)
+	}
+	if r.exitStatus() != 0 {
+		t.Errorf("exitStatus = %d, want 0 (deferred is success)", r.exitStatus())
+	}
+	if set, _ := r.healthSignal(); set {
+		t.Error("deferred pass wrote a health signal; want none (the running holder owns health)")
+	}
+}
+
+func TestRunPass_aggregatesFailures(t *testing.T) {
+	// Not parallel: contends on the real lockFilePath.
+	var calls int
+	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		calls++
+		if calls == 1 {
+			return exec.CommandContext(ctx, "sh", "-c", "exit 0")
+		}
+		return exec.CommandContext(ctx, "sh", "-c", "exit 1")
+	}
+	src := newRunJobSource(t)
+	cfg := config{Jobs: []job{*runJobJob(src), *runJobJob(src)}}
+	r := runPass(context.Background(), cfg, time.Minute, "test", newCmd)
+	if r.disposition != passRan {
+		t.Fatalf("disposition = %v, want passRan (%v)", r.disposition, passRan)
+	}
+	if r.failed != 1 {
+		t.Errorf("failed = %d, want 1", r.failed)
+	}
+	if r.ok != 1 {
+		t.Errorf("ok = %d, want 1", r.ok)
+	}
+	if calls != 2 {
+		t.Errorf("calls = %d, want 2", calls)
+	}
+	if _, healthy := r.healthSignal(); healthy {
+		t.Error("healthy = true, want false (a job failed)")
+	}
+	if r.exitStatus() != 1 {
+		t.Errorf("exitStatus = %d, want 1 (a job failed)", r.exitStatus())
+	}
+}
+
+// TestRunJob_parentCancellationLogsShutdownNotFailure verifies the
+// graceful-shutdown arm of runJob (the `if ctx.Err() != nil` branch): when the
+// PARENT context is cancelled (container shutdown SIGTERM'd the in-flight
+// rsync), the interrupted job must log at INFO ("sync interrupted by shutdown")
+// and never at ERROR ("sync failed"). The shutdown and failure arms return
+// identical jobResult values, so only the emitted log distinguishes them; this
+// protects the no-false-page contract (Loki alerts on level=error).
+func TestRunJob_parentCancellationLogsShutdownNotFailure(t *testing.T) {
+	var buf bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", "exit 1")
+	}
+	res := runJob(ctx, runJobJob(newRunJobSource(t)), time.Minute, newCmd)
+
+	if res.success {
+		t.Errorf("runJob success = true, want false when parent context cancelled")
+	}
+	logs := buf.String()
+	if !strings.Contains(logs, "sync interrupted by shutdown") {
+		t.Errorf("runJob log = %q, want to contain 'sync interrupted by shutdown'", logs)
+	}
+	if strings.Contains(logs, "level=ERROR") {
+		t.Errorf("runJob log = %q, want no ERROR-level line on graceful shutdown", logs)
+	}
+}
+
+// TestRunPass_emptySourceSkippedNotCountedAsFailure verifies the
+// `case jr.skipped` arm of runPass's tally: an empty-source job is skipped
+// (its runner is never invoked) and counts toward ok+emptySkipped, never
+// failed, so the pass is healthy. (The heartbeat wording is asserted
+// separately in TestReportPass_ranEmitsHeartbeat.)
+func TestRunPass_emptySourceSkippedNotCountedAsFailure(t *testing.T) {
+	// Not parallel: contends on the real lockFilePath.
+	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		t.Error("runner invoked for empty-source job; want skip, not exec")
+		return exec.CommandContext(ctx, "true")
+	}
+	cfg := config{Jobs: []job{*runJobJob(t.TempDir())}}
+
+	r := runPass(context.Background(), cfg, time.Minute, "test", newCmd)
+
+	if r.disposition != passRan {
+		t.Fatalf("disposition = %v, want passRan (%v)", r.disposition, passRan)
+	}
+	if r.failed != 0 {
+		t.Errorf("failed = %d, want 0 (an empty-source skip is not a failure)", r.failed)
+	}
+	if r.emptySkipped != 1 {
+		t.Errorf("emptySkipped = %d, want 1", r.emptySkipped)
+	}
+	if r.ok != 1 {
+		t.Errorf("ok = %d, want 1 (a skip counts toward ok)", r.ok)
+	}
+	if _, healthy := r.healthSignal(); !healthy {
+		t.Error("healthy = false, want true (an all-skip pass is healthy)")
+	}
+}
+
+// captureLogs installs a text slog handler over a buffer for the duration of
+// the test and returns the buffer. The caller must NOT be parallel: it mutates
+// the global slog default.
+func captureLogs(t *testing.T, level slog.Level) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: level})))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+	return &buf
+}
+
+// TestReportPass_ranEmitsHeartbeat verifies the staleness heartbeat carries the
+// job tally that Loki absence/skip alerts parse.
+func TestReportPass_ranEmitsHeartbeat(t *testing.T) {
+	buf := captureLogs(t, slog.LevelInfo)
+	reportPass(&passResult{
+		disposition: passRan, trigger: "interval",
+		total: 2, ok: 2, emptySkipped: 1, failed: 0, duration: 5 * time.Millisecond,
+	})
+	logs := buf.String()
+	for _, want := range []string{"sync cycle complete", "trigger=interval", "ok=2", "skipped=1", "failed=0"} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("heartbeat log = %q, want substring %q", logs, want)
+		}
+	}
+}
+
+// TestReportPass_interruptedDoesNotEmitHeartbeat verifies a shutdown-interrupted
+// pass logs a distinct warn line and NOT the "sync cycle complete" heartbeat
+// (so a drain never registers as a healthy completion) and never at error.
+func TestReportPass_interruptedDoesNotEmitHeartbeat(t *testing.T) {
+	buf := captureLogs(t, slog.LevelInfo)
+	reportPass(&passResult{
+		disposition: passRan, trigger: "interval", interrupted: true,
+		total: 1, ok: 0, failed: 1,
+	})
+	logs := buf.String()
+	if !strings.Contains(logs, "sync cycle interrupted by shutdown") {
+		t.Errorf("log = %q, want 'sync cycle interrupted by shutdown'", logs)
+	}
+	if strings.Contains(logs, "sync cycle complete") {
+		t.Errorf("log = %q, want NO 'sync cycle complete' heartbeat on an interrupted pass", logs)
+	}
+	if strings.Contains(logs, "level=ERROR") {
+		t.Errorf("log = %q, want no ERROR on a shutdown interruption", logs)
+	}
+}
+
+// TestReportPass_deferredEmitsLivenessNotHeartbeat verifies an overlap defer
+// logs a liveness line with holder_age_ms and NOT the heartbeat (a stuck
+// holder must still trip the absence alert).
+func TestReportPass_deferredEmitsLivenessNotHeartbeat(t *testing.T) {
+	buf := captureLogs(t, slog.LevelInfo)
+	reportPass(&passResult{disposition: passDeferred, trigger: "interval", holderAge: 90 * time.Second})
+	logs := buf.String()
+	if !strings.Contains(logs, "sync deferred, prior pass still running") {
+		t.Errorf("log = %q, want the deferred liveness line", logs)
+	}
+	if !strings.Contains(logs, "holder_age_ms=90000") {
+		t.Errorf("log = %q, want holder_age_ms=90000", logs)
+	}
+	if strings.Contains(logs, "sync cycle complete") {
+		t.Errorf("log = %q, want NO heartbeat for a deferred pass", logs)
+	}
+}
+
+// TestReportPass_lockErrorEmitsError verifies a lock-acquisition failure logs
+// at error level so it trips the documented error alert.
+func TestReportPass_lockErrorEmitsError(t *testing.T) {
+	buf := captureLogs(t, slog.LevelInfo)
+	reportPass(&passResult{disposition: passLockErr, trigger: "interval", err: errors.New("flock boom")})
+	logs := buf.String()
+	if !strings.Contains(logs, "level=ERROR") {
+		t.Errorf("log = %q, want level=ERROR for a lock error", logs)
+	}
+	if !strings.Contains(logs, "cannot acquire sync lock") {
+		t.Errorf("log = %q, want 'cannot acquire sync lock'", logs)
+	}
 }
