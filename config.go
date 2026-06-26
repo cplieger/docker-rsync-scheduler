@@ -222,19 +222,12 @@ func (c config) validate() error {
 // validate enforces one job's field contract: required fields present,
 // absolute local/remote paths, a sane remote host, no injection characters
 // anywhere, and a readable ssh key. Name presence and cross-job uniqueness
-// are enforced by (config).validate.
+// are enforced by (config).validate. The per-concern checks live in helpers
+// (checkRequiredFields, checkNoForbiddenChars) so this stays readable and
+// under the complexity threshold.
 func (j *job) validate() error {
-	if j.Local == "" {
-		return fmt.Errorf("job %q: local is required", j.Name)
-	}
-	if j.RemoteHost == "" {
-		return fmt.Errorf("job %q: remote_host is required", j.Name)
-	}
-	if j.RemotePath == "" {
-		return fmt.Errorf("job %q: remote_path is required", j.Name)
-	}
-	if j.SSHKey == "" {
-		return fmt.Errorf("job %q: ssh_key is required", j.Name)
+	if err := j.checkRequiredFields(); err != nil {
+		return err
 	}
 
 	if !filepath.IsAbs(j.Local) {
@@ -247,6 +240,51 @@ func (j *job) validate() error {
 		return err
 	}
 
+	if err := j.checkNoForbiddenChars(); err != nil {
+		return err
+	}
+
+	if err := checkReadable(j.SSHKey); err != nil {
+		return fmt.Errorf("job %q: ssh_key %q not readable: %w", j.Name, j.SSHKey, err)
+	}
+
+	// max_delete, when set, caps how many deletions a single --delete pass may
+	// perform (rsync --max-delete); a negative cap is meaningless. Unset leaves
+	// the pass uncapped, preserving the prior behavior.
+	if j.MaxDelete != nil && *j.MaxDelete < 0 {
+		return fmt.Errorf("job %q: max_delete must be >= 0", j.Name)
+	}
+
+	j.warnInertSettings()
+
+	return nil
+}
+
+// checkRequiredFields confirms the four always-required string fields are
+// present. (Name presence is enforced by (config).validate, which holds the
+// job index needed for its error message.)
+func (j *job) checkRequiredFields() error {
+	if j.Local == "" {
+		return fmt.Errorf("job %q: local is required", j.Name)
+	}
+	if j.RemoteHost == "" {
+		return fmt.Errorf("job %q: remote_host is required", j.Name)
+	}
+	if j.RemotePath == "" {
+		return fmt.Errorf("job %q: remote_path is required", j.Name)
+	}
+	if j.SSHKey == "" {
+		return fmt.Errorf("job %q: ssh_key is required", j.Name)
+	}
+	return nil
+}
+
+// checkNoForbiddenChars rejects shell metacharacters and control characters in
+// every job string field and exclude pattern (defense-in-depth: jobs run with
+// an explicit argument slice and no shell, so these can never be interpreted),
+// then applies the stricter no-space rule to the two fields that are word-split
+// downstream.
+func (j *job) checkNoForbiddenChars() error {
 	for _, f := range []struct{ key, val string }{
 		{"name", j.Name},
 		{"local", j.Local},
@@ -281,20 +319,6 @@ func (j *job) validate() error {
 		return fmt.Errorf("job %q: ssh_key %q must not contain spaces",
 			j.Name, j.SSHKey)
 	}
-
-	if err := checkReadable(j.SSHKey); err != nil {
-		return fmt.Errorf("job %q: ssh_key %q not readable: %w", j.Name, j.SSHKey, err)
-	}
-
-	// max_delete, when set, caps how many deletions a single --delete pass may
-	// perform (rsync --max-delete); a negative cap is meaningless. Unset leaves
-	// the pass uncapped, preserving the prior behavior.
-	if j.MaxDelete != nil && *j.MaxDelete < 0 {
-		return fmt.Errorf("job %q: max_delete must be >= 0", j.Name)
-	}
-
-	j.warnInertSettings()
-
 	return nil
 }
 

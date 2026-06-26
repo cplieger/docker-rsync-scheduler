@@ -1220,3 +1220,135 @@ func TestRemoteDest_bracketedIPv4Normalized(t *testing.T) {
 		})
 	}
 }
+
+// assertCappedWrite performs a single cappedBuffer.Write into a fresh buffer
+// and asserts both the reported count (Write always reports len(in), even when
+// it discards overflow) and the retained content.
+func assertCappedWrite(t *testing.T, max int, in, wantBuf string, wantN int) {
+	t.Helper()
+	b := &cappedBuffer{max: max}
+	n, err := b.Write([]byte(in))
+	if err != nil {
+		t.Fatalf("Write(%q) err = %v, want nil", in, err)
+	}
+	if n != wantN {
+		t.Errorf("Write(%q) n = %d, want %d", in, n, wantN)
+	}
+	if got := b.String(); got != wantBuf {
+		t.Errorf("cappedBuffer{max:%d}.Write(%q) = %q, want %q", max, in, got, wantBuf)
+	}
+}
+
+// TestCappedBuffer_writeBoundaries pins the two cap boundaries the other
+// cappedBuffer tests skip: an exact fit (len(p) == remaining room) and a write
+// into an already-full buffer (remaining == 0). Together they lock the
+// min()-clamp form of cappedBuffer.Write.
+//
+// These same boundaries are why two CONDITIONALS_BOUNDARY mutants on the clamp
+// are equivalent (unkillable): at an exact fit, writing all of p and writing
+// p[:remaining] are identical (p[:remaining] == p when remaining == len(p)); at
+// an already-full buffer, the remaining>0 guard and its >=0 mutant both write
+// nothing. The min() rewrite removed the first comparison outright; the second
+// is documented here and deliberately left in place.
+func TestCappedBuffer_writeBoundaries(t *testing.T) {
+	t.Parallel()
+
+	// len(p) == remaining: exact fit, whole input retained (not truncated).
+	assertCappedWrite(t, 4, "abcd", "abcd", 4)
+	// len(p) > remaining: truncated to the cap, full length still reported.
+	assertCappedWrite(t, 4, "abcde", "abcd", 5)
+	// len(p) < remaining: room to spare, whole input retained.
+	assertCappedWrite(t, 4, "ab", "ab", 2)
+
+	// remaining == 0: a write into an already-full buffer adds nothing but
+	// still reports the consumed length.
+	b := &cappedBuffer{max: 3}
+	if _, _ = b.Write([]byte("xyz")); b.String() != "xyz" {
+		t.Fatalf("setup write left buffer = %q, want xyz", b.String())
+	}
+	n, err := b.Write([]byte("more"))
+	if err != nil {
+		t.Fatalf("full-buffer Write err = %v, want nil", err)
+	}
+	if n != 4 {
+		t.Errorf("full-buffer Write n = %d, want 4", n)
+	}
+	if got := b.String(); got != "xyz" {
+		t.Errorf("full-buffer Write left buffer = %q, want xyz (unchanged)", got)
+	}
+}
+
+// knownHostsFileExists reports whether knownHostsPath currently exists on disk.
+// It detects the test precondition (which branch to assert); the asserted
+// expectations are hardcoded boolean literals, never derived from it, so there
+// is no tautology. The mutation under test lives in the production
+// knownHostsExists closure (sync.go), not in this helper.
+func knownHostsFileExists(t *testing.T) bool {
+	t.Helper()
+	_, err := os.Stat(knownHostsPath)
+	return err == nil
+}
+
+// snapshotKnownHosts captures the current state of knownHostsPath (existence +
+// bytes) and registers a t.Cleanup that restores exactly that state, so the
+// test never leaves /config/known_hosts altered.
+func snapshotKnownHosts(t *testing.T) {
+	t.Helper()
+	_, statErr := os.Stat(knownHostsPath)
+	existed := statErr == nil
+	data, readErr := os.ReadFile(knownHostsPath)
+	t.Cleanup(func() {
+		switch {
+		case existed && readErr == nil:
+			_ = os.WriteFile(knownHostsPath, data, 0o600)
+		case !existed:
+			_ = os.Remove(knownHostsPath)
+		default:
+			// Existed but was unreadable: leave whatever is on disk untouched.
+		}
+	})
+}
+
+// TestKnownHostsExists_defaultClosureStatsRealPath exercises the default
+// knownHostsExists closure (sync.go), whose body `return err == nil` every
+// sibling test bypasses by OVERRIDING the package-level knownHostsExists var.
+// It is deliberately NON-parallel so it runs in the serial phase, before any
+// parallel sibling resumes and reassigns the var: knownHostsExists() here
+// invokes the pristine default closure that stats knownHostsPath.
+//
+// Asserting the closure's boolean against the file's true presence flips with a
+// CONDITIONALS_NEGATION (err == nil -> err != nil) in both directions, so
+// either branch is a real kill:
+//   - known_hosts absent  -> default returns false ; mutant returns true
+//   - known_hosts present -> default returns true  ; mutant returns false
+func TestKnownHostsExists_defaultClosureStatsRealPath(t *testing.T) {
+	// No t.Parallel(): must observe the default closure during the serial phase.
+	snapshotKnownHosts(t)
+
+	asserted := false
+
+	// Branch 1: known_hosts ABSENT -> default closure must report false.
+	if knownHostsFileExists(t) {
+		_ = os.Remove(knownHostsPath)
+	}
+	if !knownHostsFileExists(t) {
+		asserted = true
+		if got := knownHostsExists(); got != false {
+			t.Errorf("knownHostsExists() with %s absent = %v, want false", knownHostsPath, got)
+		}
+	}
+
+	// Branch 2: known_hosts PRESENT -> default closure must report true.
+	if err := os.WriteFile(knownHostsPath, []byte("placeholder\n"), 0o600); err == nil {
+		asserted = true
+		if got := knownHostsExists(); got != true {
+			t.Errorf("knownHostsExists() with %s present = %v, want true", knownHostsPath, got)
+		}
+	} else {
+		t.Logf("present-case skipped: cannot create %s: %v", knownHostsPath, err)
+	}
+
+	if !asserted {
+		t.Fatalf("could not establish a controllable %s state; mutant not exercised", knownHostsPath)
+	}
+}
