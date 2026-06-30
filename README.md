@@ -1,6 +1,6 @@
 # docker-rsync-scheduler
 
-[![Image Size](https://ghcr-badge.egpl.dev/cplieger/docker-rsync-scheduler/size)](https://github.com/cplieger/docker-rsync-scheduler/pkgs/container/docker-rsync-scheduler)
+[![Image Size](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/docker-rsync-scheduler/badges/size.json)](https://github.com/cplieger/docker-rsync-scheduler/pkgs/container/docker-rsync-scheduler)
 ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)
 ![base: Alpine](https://img.shields.io/badge/base-Alpine-0D597F?logo=alpinelinux)
 [![Go Report Card](https://goreportcard.com/badge/github.com/cplieger/docker-rsync-scheduler)](https://goreportcard.com/report/github.com/cplieger/docker-rsync-scheduler)
