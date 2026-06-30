@@ -1,44 +1,18 @@
+# Example compose for docker-rsync-scheduler. See the README for all configuration options and hardening.
 services:
   rsync:
     image: ghcr.io/cplieger/docker-rsync-scheduler:latest
     container_name: rsync
     restart: unless-stopped
 
-    # Built-in scheduling (default): the container runs one full sync pass
-    # at startup for immediate freshness, then every SYNC_INTERVAL. No
-    # external scheduler is required.
     environment:
-      LOG_LEVEL: "info"        # debug | info | warn | error
-      CONFIG_PATH: "/config/config.yaml"
-      SYNC_INTERVAL: "6h"      # built-in cadence (Go duration); "off" -> external
-      SYNC_TIMEOUT: "10m"      # per-job rsync timeout (Go duration)
-
-    # External scheduling variant: change SYNC_INTERVAL above to "off"
-    # (aliases: disabled, 0) to disable the built-in loop, then let a central
-    # scheduler drive each pass by exec'ing the `sync` subcommand. The advisory
-    # lock on /tmp/.docker-rsync-scheduler.lock prevents overlapping passes
-    # across the exec and the (now-idle) daemon. Add an Ofelia sibling via
-    # labels on this service:
-    #   labels:
-    #     ofelia.enabled: "true"
-    #     ofelia.job-exec.rsync-sync.schedule: "@every 6h"
-    #     ofelia.job-exec.rsync-sync.command: "docker-rsync-scheduler sync"
-    #     ofelia.job-exec.rsync-sync.no-overlap: "true"
-
-    # Built-in mode boots unhealthy until the first pass finishes. If your
-    # initial sync is large/slow, raise the start period to keep the container
-    # from reporting unhealthy mid-first-pass (overrides the image default).
-    # See README "Healthcheck".
-    # healthcheck:
-    #   start_period: 5m
+      TZ: "Europe/Paris"
+      SYNC_INTERVAL: "6h"  # built-in cadence (Go duration); "off" = external trigger; see README "Scheduling modes"
+      SYNC_TIMEOUT: "10m"  # per-job rsync timeout (Go duration)
 
     volumes:
-      - ./config.yaml:/config/config.yaml:ro
-      # Optional: pin the remote SSH host key instead of trusting it on first
-      # contact. Mounting this file switches StrictHostKeyChecking from
-      # accept-new (TOFU) to yes. See README "SSH host-key verification".
-      # - ./known_hosts:/config/known_hosts:ro
-      - ./id_ed25519:/keys/id_ed25519:ro   # dedicated SSH key, host file mode 0600
-      # Source directories referenced by the jobs in config.yaml:
-      - /srv/source/certs:/sources/certs:ro
-      - /srv/source/appconfig:/sources/appconfig:ro
+      - "./config.yaml:/config/config.yaml:ro"
+      - "./id_ed25519:/keys/id_ed25519:ro"  # dedicated SSH key, host file mode 0600
+      # source directories referenced by the jobs in config.yaml:
+      - "/srv/source/certs:/sources/certs:ro"
+      - "/srv/source/appconfig:/sources/appconfig:ro"
