@@ -15,7 +15,7 @@ func argJob(delete bool, uid, gid *int, excludes []string) *job {
 	return &job{
 		Name:       "caddy",
 		Local:      "/sources/caddy",
-		RemoteHost: "root@192.168.1.87",
+		RemoteHost: "root@192.0.2.87",
 		RemotePath: "/srv/containers/caddy",
 		SSHKey:     "/keys/id_ed25519",
 		RemoteUID:  uid,
@@ -62,8 +62,8 @@ func TestBuildRsyncArgs(t *testing.T) {
 		if got[len(got)-2] != "/sources/caddy/" {
 			t.Errorf("source = %q, want /sources/caddy/", got[len(got)-2])
 		}
-		if got[len(got)-1] != "root@192.168.1.87:/srv/containers/caddy/" {
-			t.Errorf("dest = %q, want root@192.168.1.87:/srv/containers/caddy/", got[len(got)-1])
+		if got[len(got)-1] != "root@192.0.2.87:/srv/containers/caddy/" {
+			t.Errorf("dest = %q, want root@192.0.2.87:/srv/containers/caddy/", got[len(got)-1])
 		}
 	})
 
@@ -123,7 +123,7 @@ func TestBuildRsyncArgs(t *testing.T) {
 			"--exclude=.stfolder", "--exclude=.stversions",
 			"--exclude=.DS_Store", "--exclude=Thumbs.db",
 			"--exclude=logs",
-			"/sources/caddy/", "root@192.168.1.87:/srv/containers/caddy/",
+			"/sources/caddy/", "root@192.0.2.87:/srv/containers/caddy/",
 		}
 		if !slices.Equal(got, want) {
 			t.Errorf("buildRsyncArgs =\n  %v\nwant\n  %v", got, want)
@@ -261,7 +261,7 @@ func TestRemoteDest(t *testing.T) {
 	tests := []struct {
 		name, host, path, want string
 	}{
-		{"ipv4 with user", "root@192.168.1.87", "/srv/x", "root@192.168.1.87:/srv/x/"},
+		{"ipv4 with user", "root@192.0.2.87", "/srv/x", "root@192.0.2.87:/srv/x/"},
 		{"hostname no user", "example.com", "/srv/x", "example.com:/srv/x/"},
 		{"bare ipv6 gets brackets", "2001:db8::1", "/srv/x", "[2001:db8::1]:/srv/x/"},
 		{"ipv6 with user gets brackets", "user@2001:db8::1", "/srv/x", "user@[2001:db8::1]:/srv/x/"},

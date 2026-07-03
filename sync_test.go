@@ -29,7 +29,7 @@ func runJobJob(local string) *job {
 	return &job{
 		Name:       "caddy",
 		Local:      local,
-		RemoteHost: "root@192.168.1.87",
+		RemoteHost: "root@192.0.2.87",
 		RemotePath: "/srv/containers/caddy",
 		SSHKey:     "/keys/id_ed25519",
 	}

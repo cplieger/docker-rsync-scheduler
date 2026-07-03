@@ -27,7 +27,7 @@ func validJob(name, key string) job {
 	return job{
 		Name:       name,
 		Local:      "/sources/" + name,
-		RemoteHost: "root@192.168.1.87",
+		RemoteHost: "root@192.0.2.87",
 		RemotePath: "/srv/containers/" + name,
 		SSHKey:     key,
 	}
@@ -50,7 +50,7 @@ func TestValidate(t *testing.T) {
 			cfg: config{Jobs: []job{{
 				Name:       "caddy",
 				Local:      "/sources/caddy",
-				RemoteHost: "root@192.168.1.87",
+				RemoteHost: "root@192.0.2.87",
 				RemotePath: "/srv/containers/caddy",
 				SSHKey:     key,
 				RemoteUID:  new(1000),
@@ -275,7 +275,7 @@ func TestValidate_sshKeyWithSpaceRejected(t *testing.T) {
 	cfg := config{Jobs: []job{{
 		Name:       "spaced",
 		Local:      "/sources/spaced",
-		RemoteHost: "root@192.168.1.87",
+		RemoteHost: "root@192.0.2.87",
 		RemotePath: "/srv/spaced",
 		SSHKey:     "/keys/id ed25519",
 	}}}
@@ -319,7 +319,7 @@ func TestHasShellMeta(t *testing.T) {
 		want bool
 	}{
 		{"plain path", "/sources/caddy", false},
-		{"user at host", "root@192.168.1.87", false},
+		{"user at host", "root@192.0.2.87", false},
 		{"glob exclude", "**/*.lock", false},
 		{"ipv6 host", "2001:db8::1", false},
 		{"dash and dot", "host-1.example.com", false},
@@ -362,7 +362,7 @@ func TestParseConfig(t *testing.T) {
 jobs:
   - name: caddy
     local: /sources/caddy
-    remote_host: root@192.168.1.87
+    remote_host: root@192.0.2.87
     remote_path: /srv/containers/caddy
     remote_uid: 1000
     remote_gid: 1000
