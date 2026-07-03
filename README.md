@@ -3,7 +3,6 @@
 [![Image Size](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/docker-rsync-scheduler/badges/size.json)](https://github.com/cplieger/docker-rsync-scheduler/pkgs/container/docker-rsync-scheduler)
 ![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-blue)
 ![base: Alpine](https://img.shields.io/badge/base-Alpine-0D597F?logo=alpinelinux)
-[![Go Report Card](https://goreportcard.com/badge/github.com/cplieger/docker-rsync-scheduler)](https://goreportcard.com/report/github.com/cplieger/docker-rsync-scheduler)
 [![Test coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/docker-rsync-scheduler/badges/coverage.json)](https://github.com/cplieger/docker-rsync-scheduler/actions/workflows/coverage.yml)
 [![Mutation](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/cplieger/docker-rsync-scheduler/badges/mutation.json)](https://github.com/cplieger/docker-rsync-scheduler/issues?q=label%3Agremlins-tracker)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13209/badge)](https://www.bestpractices.dev/projects/13209)
@@ -18,18 +17,17 @@ Reads a YAML config defining _N_ sync jobs. For each job it runs `rsync` over `s
 
 - One-way mirror of each configured local directory to a `[user@]host:/path`
 - Per-job `--delete`, `--chown=uid:gid`, and exclude patterns
-- Empty-source guard: a job whose top-level source directory is missing or empty is skipped, so a wholly vanished or unmounted source cannot let `--delete` wipe the matching remote tree. The guard probes the job's `local` dir only; for sources composed of nested bind mounts, ensure every nested mount is present before a `--delete` pass (or omit `delete: true` for such jobs). The guard consults only the built-in global excludes, never per-job `excludes`: a `delete: true` job whose source holds only entries matched by its own `excludes` still runs with an empty post-exclude file list, so `--delete` then clears the remote. Avoid `delete: true` on a job whose `excludes` can match every top-level entry of its source, or set `max_delete` on that job as a backstop so a runaway pass aborts (rsync `--max-delete=N`) rather than clearing the remote.
+- Empty-source guard: a job whose top-level source directory is missing or empty is skipped, so a wholly vanished or unmounted source cannot let `--delete` wipe the matching remote tree. The guard probes the `local` dir against the built-in global excludes only (not per-job `excludes`), so on a `delete: true` job whose own `excludes` could match every entry, set `max_delete` (rsync `--max-delete=N`) as a backstop.
 - Built-in interval scheduler, or hand scheduling to an external scheduler (cron, Ofelia, etc.) via the `sync` subcommand
 - File-marker healthcheck — unhealthy when any job fails, recovers on the next clean pass
 - Logs only: no Prometheus exporter, no HTTP server, no listening socket
 
 ## Architecture
 
-- _Scheduler your way._ Ships with a self-contained Go interval scheduler so you don't need external cron, systemd timers, or orchestrator-level scheduling. Set `SYNC_INTERVAL` to a Go duration and the container runs one pass at startup (immediate freshness on deploy) then every interval. If you already run a central scheduler (Ofelia, cron), set `SYNC_INTERVAL=off` and trigger passes with `docker exec rsync docker-rsync-scheduler sync` instead. See [Scheduling modes](#scheduling-modes).
-- _Overlap lock._ A single advisory file lock (`flock` on `/tmp/.docker-rsync-scheduler.lock`) serialises every sync pass — the built-in ticker racing the startup pass in-process, and an external `sync` exec racing the ticker cross-process — so two passes never run at once.
+- _Scheduler your way._ Ships with a self-contained Go interval scheduler (no external cron, systemd timers, or orchestrator scheduling needed), or hands the cadence to an external scheduler via the `sync` subcommand. See [Scheduling modes](#scheduling-modes).
+- _Overlap lock._ A single advisory `flock` serialises every sync pass so the built-in ticker and an external `sync` exec never run two passes at once. See [Scheduling modes](#scheduling-modes).
 - _Subcommands._ `daemon` (PID 1, the default command; dispatches built-in vs external based on `SYNC_INTERVAL`), `sync` (one pass, exit 0 if all jobs succeed, 1 if any fail), and `health` (the Docker probe). The built-in startup pass, the interval pass, and the `sync` subcommand share one sync-pass function.
-- _No shell._ Each job is executed via `exec.CommandContext` with an explicit argument slice. The `-e "ssh ..."` value is a single argument that rsync splits internally — nothing is ever interpreted by a shell.
-- _Injection guardrails._ Config is validated at startup: required fields present, names unique, `local`/`remote_path` absolute, `remote_host` matched against a strict pattern, and every field rejected if it contains shell metacharacters or control characters as defense-in-depth. The ssh key must exist and be readable.
+- _No shell, validated config._ Each job runs via `exec.CommandContext` with an explicit argument slice, and every config field is validated at startup. See [Security](#security).
 - _Bounded resources._ Per-job timeout via context (default 10m, override with `SYNC_TIMEOUT`); captured rsync stderr is bounded to 1 MB so a chatty subprocess cannot OOM the container.
 - _Health._ File-marker pattern via [`github.com/cplieger/health`](https://github.com/cplieger/health) — the marker is set after each pass and probed by the `health` subcommand.
 
@@ -151,7 +149,7 @@ HEALTHCHECK --interval=60s --timeout=5s --retries=3 --start-period=120s \
 
 ## Security
 
-No network listener, no HTTP server, no exposed ports. The image ships `openssh-client` only — no `sshd`. Each job is executed with an explicit argument slice via `exec.CommandContext`; nothing is passed through a shell. Config fields are validated and rejected if they contain shell metacharacters or control characters, even though the arg-list exec already prevents interpretation.
+No network listener, no HTTP server, no exposed ports. The image ships `openssh-client` only — no `sshd`. Each job is executed with an explicit argument slice via `exec.CommandContext`; the `-e "ssh ..."` value is a single argument that rsync splits internally, so nothing is passed through a shell. Config is validated at startup: required fields present, names unique, `local`/`remote_path` absolute, `remote_host` matched against a strict pattern, the ssh key readable, and every field rejected if it contains shell metacharacters or control characters (defense-in-depth, since the arg-list exec already prevents interpretation).
 
 ### SSH host-key verification
 
@@ -180,7 +178,7 @@ volumes:
 | [gitleaks](https://github.com/gitleaks/gitleaks)                    | No secrets detected                 |
 | [hadolint](https://github.com/hadolint/hadolint)                    | Clean                               |
 
-_Why it runs as root._ The container runs as root by design: it must read host-owned source files (e.g. uid 568) across multiple bind mounts. A fixed non-root `USER` would break this. Mount sources read-only and use a dedicated, least-privilege SSH key on the remote.
+_Why it runs as root._ The container runs as root by design: it must read host-owned source files (e.g. a host UID like 1000) across multiple bind mounts. A fixed non-root `USER` would break this. Mount sources read-only and use a dedicated, least-privilege SSH key on the remote.
 
 ## Dependencies
 
@@ -205,7 +203,7 @@ Issues and pull requests are welcome. Please open an issue first for larger chan
 
 ## Disclaimer
 
-This image is built with care and follows security best practices, but it is intended for **homelab use**. No guarantees of fitness for production environments. Use at your own risk.
+This project is built with care and follows security best practices, but it is intended for personal / self-hosted use. No guarantees of fitness for production environments. Use at your own risk.
 
 This project was built with AI-assisted tooling using [Claude Opus](https://www.anthropic.com/claude) and [Kiro](https://kiro.dev). The human maintainer defines architecture, supervises implementation, and makes all final decisions.
 
