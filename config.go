@@ -2,6 +2,7 @@
 package main
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -112,18 +113,17 @@ func hasShellMeta(s string) bool {
 // (`time=... level=... msg=... k=v`) to stderr for Loki/Alloy collection.
 func setupLogger() {
 	levelStr := strings.ToLower(strings.TrimSpace(getEnv("LOG_LEVEL", "info")))
+	// slog.Level.UnmarshalText parses debug/info/warn/error case-insensitively
+	// (and offset syntax such as "warn+1") but lacks the long-form "warning"
+	// alias, so map it before parsing. An unrecognized value keeps Info and warns.
+	name := levelStr
+	if name == "warning" {
+		name = "warn"
+	}
 	level := slog.LevelInfo
 	unknown := false
-	switch levelStr {
-	case "debug":
-		level = slog.LevelDebug
-	case "info":
+	if err := level.UnmarshalText([]byte(name)); err != nil {
 		level = slog.LevelInfo
-	case "warn", "warning":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
-	default:
 		unknown = true
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
@@ -484,8 +484,5 @@ func loadInterval() (interval time.Duration, scheduleEnabled bool) {
 // getEnv returns the environment value for key, or fallback when unset
 // or empty.
 func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
+	return cmp.Or(os.Getenv(key), fallback)
 }
