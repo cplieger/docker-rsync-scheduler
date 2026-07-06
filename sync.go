@@ -66,8 +66,6 @@ type syncStats struct {
 // jobResult captures the outcome of a single job for logging and health
 // aggregation. Fields are ordered largest-first for fieldalignment.
 type jobResult struct {
-	err         error
-	name        string
 	stderrTail  string
 	files       int64
 	bytes       int64
@@ -151,7 +149,9 @@ func buildRsyncArgs(j *job) []string {
 		args = append(args, "--exclude="+e)
 	}
 
-	args = append(args, j.Local+"/", remoteDest(j))
+	// "--" terminates option parsing so the positional path args can never be
+	// reinterpreted as rsync options, even if config validation is later relaxed.
+	args = append(args, "--", j.Local+"/", remoteDest(j))
 	return args
 }
 
@@ -271,7 +271,7 @@ func tail(s string, n int) string {
 // exiting 0.
 func runJob(ctx context.Context, j *job, timeout time.Duration, newCmd commandRunner) jobResult {
 	start := time.Now()
-	res := jobResult{name: j.Name}
+	res := jobResult{}
 
 	if sourceIsEmpty(j.Local) {
 		slog.Warn("skip empty source", "job", j.Name, "path", j.Local)
@@ -299,7 +299,6 @@ func runJob(ctx context.Context, j *job, timeout time.Duration, newCmd commandRu
 	res.bytes = stats.bytes
 
 	if runErr != nil {
-		res.err = runErr
 		res.stderrTail = tail(errBuf.String(), logStderrTailBytes)
 		// A cancelled parent context means graceful shutdown SIGTERM'd this
 		// in-flight rsync -- not a real failure; real timeouts cancel only

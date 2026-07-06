@@ -123,7 +123,7 @@ func TestBuildRsyncArgs(t *testing.T) {
 			"--exclude=.stfolder", "--exclude=.stversions",
 			"--exclude=.DS_Store", "--exclude=Thumbs.db",
 			"--exclude=logs",
-			"/sources/caddy/", "root@192.0.2.87:/srv/containers/caddy/",
+			"--", "/sources/caddy/", "root@192.0.2.87:/srv/containers/caddy/",
 		}
 		if !slices.Equal(got, want) {
 			t.Errorf("buildRsyncArgs =\n  %v\nwant\n  %v", got, want)
