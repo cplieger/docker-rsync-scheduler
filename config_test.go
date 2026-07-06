@@ -884,3 +884,31 @@ func TestValidate_warnsLoneRemoteOwnership(t *testing.T) {
 		})
 	}
 }
+
+// TestValidate_remotePathWithSpaceRejected pins the remote_path space guard
+// in checkNoForbiddenChars: a space is not a shell metacharacter (hasShellMeta
+// deliberately permits spaces in path fields), so remote_path "/srv/my path"
+// passes the metachar loop yet must still be rejected -- a remote-side login
+// shell word-splits it into several rsync args, mis-targeting the dest (and,
+// under --delete, the wrong remote tree). The sibling ssh_key-space branch is
+// pinned by TestValidate_sshKeyWithSpaceRejected; this closes the untested
+// remote_path arm.
+func TestValidate_remotePathWithSpaceRejected(t *testing.T) {
+	key := writeKey(t)
+	cfg := config{Jobs: []job{{
+		Name:       "spaced",
+		Local:      "/sources/spaced",
+		RemoteHost: "root@192.0.2.87",
+		RemotePath: "/srv/my path",
+		SSHKey:     key,
+	}}}
+
+	err := cfg.validate()
+
+	if err == nil {
+		t.Fatalf("validate() with spaced remote_path = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "must not contain spaces") {
+		t.Errorf("validate() error = %q, want to contain 'must not contain spaces'", err)
+	}
+}

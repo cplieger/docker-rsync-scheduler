@@ -13,7 +13,7 @@ Push local directories to a remote host over rsync-and-ssh on a schedule — str
 
 ## What it does
 
-Reads a YAML config defining _N_ sync jobs. For each job it runs `rsync` over `ssh` to push a local directory one-way to a remote host. Every run emits structured `slog` lines (logfmt) for collection by a log aggregator (Alloy, Promtail) and alerting via Grafana or similar.
+Reads a YAML config defining _N_ sync jobs. For each job it runs `rsync` over `ssh` to push a local directory one-way to a remote host. Every run emits structured `slog` lines (logfmt); in built-in scheduling mode these go to the container's PID-1 stream for collection by a log aggregator (Alloy, Promtail) and alerting via Grafana or similar, whereas an external `sync` pass triggered via `docker exec` emits to the exec caller instead (see the [Scheduling modes](#scheduling-modes) observability caveat).
 
 - One-way mirror of each configured local directory to a `[user@]host:/path`
 - Per-job `--delete`, `--chown=uid:gid`, and exclude patterns
@@ -68,7 +68,11 @@ Set `SYNC_INTERVAL=off` (aliases: `disabled`, `0`). The container stays running 
 docker exec rsync docker-rsync-scheduler sync
 ```
 
-The pass runs once and exits; its exit code is non-zero on failure, and it updates the same health marker the long-running container reports. This lets a central scheduler own the cadence. Example with [Ofelia](https://github.com/mcuadros/ofelia) labels:
+The pass runs once and exits; its exit code is non-zero on failure, and it updates the same health marker the long-running container reports. This lets a central scheduler own the cadence.
+
+> **Observability caveat (external mode).** A `sync` triggered via `docker exec` runs as a child process, not the container's PID 1. Docker's logging driver captures only PID 1's stdout/stderr, so a socket-based log collector (for example Alloy's Docker log discovery) does **not** see the exec child's output — the `sync cycle complete` heartbeat, `sync failed`, `skip empty source`, and per-job lines instead go to the exec caller (for example the Ofelia job result). The Loki-based alerts described under [Healthcheck](#healthcheck) (heartbeat-absence, `skipped` count, `skip empty source`) therefore fire only in built-in scheduling mode. In external mode, read per-run outcomes from the exec scheduler's own job-failure reporting and rely on the container health marker (which the `sync` subcommand does update) as the container-level signal.
+
+Example with [Ofelia](https://github.com/mcuadros/ofelia) labels:
 
 ```yaml
 services:

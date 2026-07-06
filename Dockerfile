@@ -28,9 +28,9 @@ RUN apk upgrade --no-cache \
 
 COPY --chmod=755 --from=go-builder /docker-rsync-scheduler /usr/local/bin/docker-rsync-scheduler
 
-# Runs as root by design: the app must read host-owned source files (e.g.
-# uid 568) across multiple bind mounts and write ssh known_hosts on first
-# contact (StrictHostKeyChecking=accept-new). A fixed USER would break both.
+# Runs as root by design: the app must read host-owned source files (e.g. a
+# host UID like 1000) across multiple bind mounts and write ssh known_hosts on
+# first contact (StrictHostKeyChecking=accept-new). A fixed USER would break both.
 # start-period absorbs the first built-in pass (the container is unhealthy until
 # it completes). Size it to your slowest expected initial sync; override
 # per-deploy via compose healthcheck.start_period. See README "Healthcheck".
