@@ -13,7 +13,7 @@ Push local directories to a remote host over rsync-and-ssh on a schedule — str
 
 ## What it does
 
-Reads a YAML config defining _N_ sync jobs. For each job it runs `rsync` over `ssh` to push a local directory one-way to a remote host. Every run emits structured `slog` lines (logfmt); in built-in scheduling mode these go to the container's PID-1 stream for collection by a log aggregator (Alloy, Promtail) and alerting via Grafana or similar, whereas an external `sync` pass triggered via `docker exec` emits to the exec caller instead (see the [Scheduling modes](#scheduling-modes) observability caveat).
+Reads a YAML config defining _N_ sync jobs. For each job it runs `rsync` over `ssh` to push a local directory one-way to a remote host. Every run emits structured `slog` lines (logfmt, UTC timestamps); in built-in scheduling mode these go to the container's PID-1 stream for collection by a log aggregator (Alloy, Promtail) and alerting via Grafana or similar, whereas an external `sync` pass triggered via `docker exec` emits to the exec caller instead (see the [Scheduling modes](#scheduling-modes) observability caveat).
 
 - One-way mirror of each configured local directory to a `[user@]host:/path`
 - Per-job `--delete`, `--chown=uid:gid`, and exclude patterns
