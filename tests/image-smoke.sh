@@ -1,40 +1,59 @@
 #!/bin/sh
-# Runtime image smoke test for docker-rsync-scheduler. Invoked by the central
-# CI docker job:
-#   sh tests/image-smoke.sh <image-ref>
+# Runtime image smoke-test harness — CANONICAL COPY in cplieger/ci
+# (configs/image-smoke.sh), synced to each serving app's tests/image-smoke.sh
+# by scripts/classify-repos.sh (a repo enrolls by committing a
+# tests/image-smoke.conf; see below). DO NOT edit the synced copy in an app
+# repo — change it here and let the sync land it.
 #
-# docker-rsync-scheduler pushes local dirs to a remote over rsync+ssh, so a
-# sync pass needs a reachable ssh target CI cannot provide. This test instead
-# exercises the healthy-WITHOUT-remote path: EXTERNAL-TRIGGER mode
-# (SYNC_INTERVAL=off) disables the built-in scheduler, so no pass runs, the
-# container idles, and runExternal() writes the health marker healthy on boot
-# (main.go: hc.markInitial(true) -> health.Marker.Set(true) -> creates
-# /tmp/.healthy). That yields a genuine health-gated (Tier 2) assertion with no
-# remote contacted:
-#   - the binary runs in the real Alpine base (rsync + openssh-client present),
-#   - the mounted YAML config parses and passes validation (config.go),
-#   - the referenced ssh_key readability check passes (config.go checkReadable),
-#   - external mode writes /tmp/.healthy on boot, and
-#   - the shipped `health` subcommand HEALTHCHECK stats it and reports healthy.
+# Invoked by the shared CI docker job:  sh tests/image-smoke.sh <image-ref>
 #
-# Not run with --read-only: an unwritable /tmp puts the health lib in degraded
-# mode, where the probe reports healthy without a real marker (a weaker,
-# near-tautological assertion). A writable /tmp keeps the marker write real.
+# It starts the assembled image and waits for the container's own HEALTHCHECK
+# to report "healthy" — proving the binary runs in the final image, loads its
+# config, binds any listener, and its health probe works, catching failures the
+# build cannot see (a broken //go:embed frontend, a missing runtime dependency,
+# a server that never binds, a broken HEALTHCHECK). It fails fast on an early
+# exit (a crash-boot is reported by its exit code, more debuggable than
+# "unhealthy") and dumps the container log tail only on failure.
+#
+# Per-app knobs come from tests/image-smoke.conf beside this script; everything
+# below the config block is identical across apps. The .conf is a POSIX-sh
+# fragment sourced for these variables (all optional):
+#
+#   SMOKE_APP_NAME   label for log lines + container name (default: "image")
+#   SMOKE_TIMEOUT    seconds to wait for "healthy" (default: 120). Size it to
+#                    cover the image's HEALTHCHECK start-period plus a couple of
+#                    intervals; a slow-but-OK cold boot must not be failed early.
+#   SMOKE_RUN_ARGS   extra `docker run` args (env, tmpfs, ...) as a word-split
+#                    string, e.g. "-e FOO=bar --tmpfs /input". Values must not
+#                    contain spaces (these are controlled test configs).
+#
+# The harness also exports $SMOKE_DIR (this script's own absolute directory)
+# before sourcing the .conf, so an app that needs a config/fixture file on disk
+# can bind-mount a committed fixture dir, e.g.:
+#   SMOKE_RUN_ARGS="-e SYNC_INTERVAL=off -v ${SMOKE_DIR}/fixtures:/config:ro"
 set -eu
 
 IMG="${1:?usage: image-smoke.sh <image-ref>}"
-NAME="smoke-docker-rsync-scheduler-$$"
-# HEALTHCHECK is --interval=60s --timeout=5s --retries=3 --start-period=120s;
-# size TIMEOUT to cover the 120s start-period + two 60s intervals. In external
-# mode the marker is written at boot, so the container typically reports healthy
-# at the first 60s interval; TIMEOUT is only the upper bound before we give up.
-TIMEOUT=240
 
-# Minimal operator inputs the container needs to BOOT (not to sync): a valid
-# config and a readable ssh_key. loadConfig() parses and validates both before
-# external mode marks the container healthy, so without them run() exits 1 and
-# the container never reaches the idle, healthy-on-boot state.
-workdir=$(mktemp -d)
+# Absolute directory of this script (also holds image-smoke.conf and any per-app
+# fixtures). Exposed to the .conf as $SMOKE_DIR so a .conf can bind-mount a
+# committed fixture dir with an absolute source path (docker -v requires one).
+SMOKE_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+# Per-app config lives beside this script (repo-local, NOT synced). Pre-set the
+# knobs so `set -u` is safe and a repo with no .conf still runs with defaults.
+SMOKE_APP_NAME=""
+SMOKE_TIMEOUT=""
+SMOKE_RUN_ARGS=""
+CONF="$SMOKE_DIR/image-smoke.conf"
+if [ -f "$CONF" ]; then
+  # shellcheck disable=SC1090  # per-app config path, resolved at runtime
+  . "$CONF"
+fi
+
+APP="${SMOKE_APP_NAME:-image}"
+TIMEOUT="${SMOKE_TIMEOUT:-120}"
+NAME="smoke-${APP}-$$"
 
 # shellcheck disable=SC2317,SC2329  # invoked indirectly via trap
 cleanup() {
@@ -45,51 +64,32 @@ cleanup() {
     docker logs "$NAME" 2>&1 | tail -40 >&2 || true
   fi
   docker rm -f "$NAME" >/dev/null 2>&1 || true
-  rm -rf "$workdir"
 }
 trap cleanup EXIT
 
-# One minimal job that passes validation: absolute local/remote paths, a
-# regex-valid remote_host in the RFC 5737 doc range, and a readable ssh_key.
-# The local dir need not exist (validated as absolute only) and the remote is
-# never contacted in external mode.
-cat >"$workdir/config.yaml" <<'EOF'
-jobs:
-  - name: smoke
-    local: /sources/smoke
-    remote_host: root@192.0.2.10
-    remote_path: /srv/smoke
-    ssh_key: /config/smoke_key
-EOF
-# checkReadable() only opens the key for reading; its contents and mode are
-# irrelevant at boot because ssh never runs in external mode.
-printf '%s\n' "dummy key: never used, external mode runs no sync" >"$workdir/smoke_key"
-
-docker run -d --name "$NAME" \
-  -e SYNC_INTERVAL=off \
-  -v "$workdir:/config:ro" \
-  "$IMG" >/dev/null
+# SMOKE_RUN_ARGS is intentionally word-split (simple test args, no spaces).
+# shellcheck disable=SC2086
+docker run -d --name "$NAME" $SMOKE_RUN_ARGS "$IMG" >/dev/null
 
 i=0
 status=starting
 while [ "$i" -lt "$TIMEOUT" ]; do
   # Fail fast on an early exit: poll .State.Running before the health status so
-  # a crash-boot (e.g. invalid config) is caught by its exit code (more
-  # debuggable than "unhealthy") and the verdict never depends on what health a
-  # stopped container reports.
+  # a crash-boot is caught by its exit code (more debuggable than "unhealthy")
+  # and the verdict never depends on what health a stopped container reports.
   if [ "$(docker inspect --format '{{ .State.Running }}' "$NAME" 2>/dev/null || echo missing)" != "true" ]; then
     ec=$(docker inspect --format '{{ .State.ExitCode }}' "$NAME" 2>/dev/null || echo '?')
-    printf 'FAIL: docker-rsync-scheduler container exited early (exit code %s)\n' "$ec" >&2
+    printf 'FAIL: %s container exited early (exit code %s)\n' "$APP" "$ec" >&2
     exit 1
   fi
   status=$(docker inspect --format '{{ if .State.Health }}{{ .State.Health.Status }}{{ else }}no-healthcheck{{ end }}' "$NAME" 2>/dev/null || echo gone)
   case "$status" in
     healthy)
-      printf 'docker-rsync-scheduler image smoke: ok (healthy after %ss)\n' "$i"
+      printf '%s image smoke: ok (healthy after %ss)\n' "$APP" "$i"
       exit 0
       ;;
     unhealthy)
-      printf 'FAIL: docker-rsync-scheduler reported unhealthy\n' >&2
+      printf 'FAIL: %s reported unhealthy\n' "$APP" >&2
       exit 1
       ;;
     no-healthcheck)
@@ -97,12 +97,12 @@ while [ "$i" -lt "$TIMEOUT" ]; do
       exit 1
       ;;
     gone)
-      printf 'FAIL: docker-rsync-scheduler container is gone\n' >&2
+      printf 'FAIL: %s container is gone\n' "$APP" >&2
       exit 1
       ;;
   esac
   i=$((i + 1))
   sleep 1
 done
-printf 'FAIL: docker-rsync-scheduler did not become healthy within %ss (last status: %s)\n' "$TIMEOUT" "$status" >&2
+printf 'FAIL: %s did not become healthy within %ss (last status: %s)\n' "$APP" "$TIMEOUT" "$status" >&2
 exit 1
