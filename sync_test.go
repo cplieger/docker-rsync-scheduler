@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cplieger/scheduler"
 )
 
 // newRunJobSource creates a non-empty temp source dir so runJob does not
@@ -91,11 +93,11 @@ func TestRunJob_emptySourceSkipsWithoutRunning(t *testing.T) {
 
 func TestRunPass_deferredWhenLockHeld(t *testing.T) {
 	// Not parallel: contends on the real lockFilePath.
-	held, ok, _, err := tryLock(lockFilePath)
+	held, ok, err := scheduler.TryLock(lockFilePath)
 	if err != nil || !ok {
 		t.Fatalf("could not acquire lock: ok=%v err=%v", ok, err)
 	}
-	defer held.unlock()
+	defer held.Unlock()
 	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 		t.Error("runner invoked with held lock; want deferred")
 		return exec.CommandContext(ctx, "true")

@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cplieger/scheduler"
+	"github.com/cplieger/slogx"
 	"gopkg.in/yaml.v3"
 )
 
@@ -112,39 +114,12 @@ func hasShellMeta(s string) bool {
 // setupLogger installs a slog text handler that emits canonical logfmt
 // (`time=... level=... msg=... k=v`) to stderr for Loki/Alloy collection.
 func setupLogger() {
-	levelStr := strings.ToLower(strings.TrimSpace(getEnv("LOG_LEVEL", "info")))
-	// slog.Level.UnmarshalText parses debug/info/warn/error case-insensitively
-	// (and offset syntax such as "warn+1") but lacks the long-form "warning"
-	// alias, so map it before parsing. An unrecognized value keeps Info and warns.
-	name := levelStr
-	if name == "warning" {
-		name = "warn"
-	}
-	level := slog.LevelInfo
-	unknown := false
-	if err := level.UnmarshalText([]byte(name)); err != nil {
-		level = slog.LevelInfo
-		unknown = true
-	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level:       level,
-		ReplaceAttr: utcTimeAttr,
-	})))
-	if unknown {
+	levelStr := strings.TrimSpace(getEnv("LOG_LEVEL", "info"))
+	level, recognized := slogx.ParseLevel(levelStr, slog.LevelInfo)
+	slogx.Setup(slogx.Options{Level: level})
+	if !recognized {
 		slog.Warn("unrecognized LOG_LEVEL, using info", "value", levelStr)
 	}
-}
-
-// utcTimeAttr is a slog ReplaceAttr that renders the record's built-in time
-// key in UTC, so log-line timestamps are zone-stable regardless of the
-// container's TZ (the fleet logs-in-UTC standard). It rewrites only the
-// top-level time attribute; a user attribute that happens to share the "time"
-// key inside a group is left untouched.
-func utcTimeAttr(groups []string, a slog.Attr) slog.Attr {
-	if len(groups) == 0 && a.Key == slog.TimeKey && a.Value.Kind() == slog.KindTime {
-		a.Value = slog.TimeValue(a.Value.Time().UTC())
-	}
-	return a
 }
 
 // configPath returns the active config path, honouring CONFIG_PATH.
@@ -454,44 +429,18 @@ func loadSyncTimeout() time.Duration {
 }
 
 // loadInterval parses SYNC_INTERVAL and reports the built-in scheduler
-// cadence and whether the built-in scheduler runs at all. SYNC_INTERVAL is
-// a Go duration ("1h", "30m") that sets the interval. The sentinels "off"
-// and "disabled" (case-insensitive) or any zero duration ("0", "0s")
-// disable the built-in scheduler: the container idles and syncs are
-// triggered out-of-band via the `sync` subcommand. Unset defaults to
-// defaultInterval with the scheduler enabled. Any other parse failure
-// falls back to defaultInterval and logs a warning rather than refusing to
-// start, keeping the container syncing on a reasonable cadence even with a
-// malformed env block.
+// cadence and whether the built-in scheduler runs at all. It delegates to
+// scheduler.ParseInterval, the fleet-standard *_INTERVAL parser: a Go
+// duration ("1h", "30m") sets the interval; the sentinels "off"/"disabled"
+// (case-insensitive) or a zero duration ("0", "0s") select external mode
+// (the container idles and syncs are triggered out-of-band via the `sync`
+// subcommand); unset, negative, or unparseable falls back to defaultInterval
+// with the scheduler enabled (a warning is logged for the negative and
+// unparseable cases). scheduleEnabled is true only in built-in mode.
 func loadInterval() (interval time.Duration, scheduleEnabled bool) {
-	interval = defaultInterval
-	scheduleEnabled = true
-	raw := strings.TrimSpace(os.Getenv("SYNC_INTERVAL"))
-	if raw == "" {
-		return interval, scheduleEnabled
-	}
-	switch strings.ToLower(raw) {
-	case "off", "disabled":
-		scheduleEnabled = false
-	default:
-		d, perr := time.ParseDuration(raw)
-		switch {
-		case perr != nil:
-			slog.Warn("cannot parse SYNC_INTERVAL, using default",
-				"value", raw, "default", defaultInterval)
-		case d > 0:
-			interval = d
-		case d == 0:
-			// Zero duration ("0", "0s") disables built-in scheduling.
-			scheduleEnabled = false
-		default:
-			// A negative duration is not a valid interval and not a
-			// documented disable sentinel; warn and fall back to default.
-			slog.Warn("SYNC_INTERVAL is negative, using default",
-				"value", raw, "default", defaultInterval)
-		}
-	}
-	return interval, scheduleEnabled
+	s := scheduler.ParseInterval(os.Getenv("SYNC_INTERVAL"), defaultInterval,
+		scheduler.WithName("SYNC_INTERVAL"))
+	return s.Interval, s.Mode == scheduler.ModeBuiltin
 }
 
 // getEnv returns the environment value for key, or fallback when unset

@@ -12,8 +12,9 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/cplieger/scheduler"
 )
 
 // --- rsync engine ---
@@ -44,18 +45,12 @@ var globalExcludeSet = func() map[string]bool {
 	return m
 }()
 
-// commandRunner constructs a configured *exec.Cmd. It decouples
-// orchestration from subprocess construction so tests can inject a fake.
-type commandRunner func(ctx context.Context, name string, args ...string) *exec.Cmd
-
-// defaultCommandRunner returns an exec.Cmd with graceful shutdown:
-// SIGTERM on context cancellation with a 5s grace period before SIGKILL.
-func defaultCommandRunner(ctx context.Context, name string, cmdArgs ...string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, name, cmdArgs...)
-	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
-	cmd.WaitDelay = 5 * time.Second
-	return cmd
-}
+// defaultCommandRunner builds the rsync subprocess commands with graceful
+// shutdown — SIGTERM on context cancellation, then a DefaultGrace (5s) window
+// before os/exec escalates to SIGKILL — via the shared scheduler library
+// (identical to the hand-rolled runner it replaces). The caller wires
+// Stdout/Stderr on the returned command before Run.
+var defaultCommandRunner = scheduler.NewCommandRunner(scheduler.DefaultGrace)
 
 // syncStats holds the figures parsed from rsync --stats output.
 type syncStats struct {
@@ -269,7 +264,7 @@ func tail(s string, n int) string {
 // runJob executes one sync job and returns its result. An empty source is
 // skipped and counts as success. Otherwise success is defined as rsync
 // exiting 0.
-func runJob(ctx context.Context, j *job, timeout time.Duration, newCmd commandRunner) jobResult {
+func runJob(ctx context.Context, j *job, timeout time.Duration, newCmd scheduler.CommandRunner) jobResult {
 	start := time.Now()
 	res := jobResult{}
 
@@ -425,10 +420,10 @@ func (r *passResult) exitStatus() int {
 // early return (an overlap defer, a lock error) from silently omitting a
 // signal. The lock guards a concurrent pass: an external `sync` exec racing
 // the daemon, or a manual docker exec racing a scheduled run.
-func runPass(ctx context.Context, cfg config, timeout time.Duration, trigger string, newCmd commandRunner) passResult {
+func runPass(ctx context.Context, cfg config, timeout time.Duration, trigger string, newCmd scheduler.CommandRunner) passResult {
 	res := passResult{trigger: trigger, total: len(cfg.Jobs)}
 
-	lock, ok, holder, lockErr := tryLock(lockFilePath)
+	lock, ok, lockErr := scheduler.TryLock(lockFilePath)
 	switch {
 	case lockErr != nil:
 		res.disposition = passLockErr
@@ -436,11 +431,17 @@ func runPass(ctx context.Context, cfg config, timeout time.Duration, trigger str
 		return res
 	case !ok:
 		res.disposition = passDeferred
-		res.holderAge = holder.age()
-		res.holderAgeKnown = holder.known()
+		// The holder's acquisition time (recorded by scheduler.TryLock on the
+		// current holder's acquire) drives the deferred-pass log's holder_age.
+		// A fresh read, so it reflects whoever holds the lock now;
+		// observability-only and best-effort (unknown -> zero-value age).
+		if since, known := scheduler.ReadHolder(lockFilePath); known {
+			res.holderAge = time.Since(since)
+			res.holderAgeKnown = true
+		}
 		return res
 	}
-	defer lock.unlock()
+	defer lock.Unlock()
 
 	res.disposition = passRan
 	start := time.Now()

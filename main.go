@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cplieger/health"
+	"github.com/cplieger/scheduler"
 )
 
 // --- Main ---
@@ -127,19 +128,21 @@ func runBuiltin(ctx context.Context, hc *healthController, cfg config, timeout t
 	})
 	defer watcher.Wait()
 
-	runAndReport(ctx, hc, cfg, timeout, "startup")
-
-	ticker := time.NewTicker(cfg.Interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			slog.Info("shutting down", "cause", context.Cause(ctx))
-			return
-		case <-ticker.C:
-			runAndReport(ctx, hc, cfg, timeout, "interval")
+	// scheduler.RunLoop fires the startup pass immediately (FireOnStart), then
+	// one pass per cfg.Interval tick, sequentially — two passes never overlap
+	// in-process (the flock in runPass additionally guards a cross-process
+	// `sync` exec). RunLoop returns once ctx is cancelled and the in-flight pass
+	// drains; the watcher above has already flipped the marker unhealthy so
+	// monitoring sees the shutdown before the drain completes.
+	startupDone := false
+	scheduler.RunLoop(ctx, func(ctx context.Context) {
+		trigger := "interval"
+		if !startupDone {
+			trigger, startupDone = "startup", true
 		}
-	}
+		runAndReport(ctx, hc, cfg, timeout, trigger)
+	}, scheduler.LoopOptions{Interval: cfg.Interval, FireOnStart: true})
+	slog.Info("shutting down", "cause", context.Cause(ctx))
 }
 
 // runExternal idles until shutdown. The built-in scheduler is disabled
