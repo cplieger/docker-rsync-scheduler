@@ -1,0 +1,10 @@
+# Minimal valid config for the image-smoke test, bind-mounted read-only at
+# /config. External mode (SYNC_INTERVAL=off) never contacts the remote;
+# loadConfig only needs absolute local/remote paths, a regex-valid remote_host
+# (RFC 5737 doc range), and a readable ssh_key.
+jobs:
+  - name: smoke
+    local: /sources/smoke
+    remote_host: root@192.0.2.10
+    remote_path: /srv/smoke
+    ssh_key: /config/smoke_key
