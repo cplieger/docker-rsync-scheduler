@@ -144,12 +144,77 @@ Every job also receives a fixed set of global excludes: `.stfolder`, `.stversion
 
 The built-in healthcheck (`docker-rsync-scheduler health`) checks for a marker file that is set after each sync pass: healthy when the most recent pass had zero failed jobs, unhealthy when any job failed. Empty-source skips count as success. The container recovers automatically on the next clean pass — no restart required. In built-in mode it begins unhealthy, runs one pass at startup, and transitions accordingly, so size `healthcheck.start_period` for the time the initial pass may take. In external mode the container starts healthy (idle, nothing has failed) and each triggered `sync` updates the marker.
 
-> Because an empty source is skipped as a success, a job whose source silently becomes empty (for example a read-only bind mount that failed to mount and Docker materialised as an empty directory) keeps the container healthy and never logs at `level=error` — it is invisible to both the error-level and heartbeat-absence alerts. Each skip emits a `level=warn msg="skip empty source"` line and the `sync cycle complete` heartbeat carries a `skipped` count; add a Loki alert on a persistently non-zero `skipped` (or `skipped == jobs`) across several consecutive passes, or on the recurring `skip empty source` warning, to catch a vanished source before the remote mirror goes stale.
+> Because an empty source is skipped as a success, a job whose source silently becomes empty (for example a read-only bind mount that failed to mount and Docker materialised as an empty directory) keeps the container healthy and never logs at `level=ERROR` — it is invisible to both the error-level and heartbeat-absence alerts. Each skip emits a `level=WARN msg="skip empty source"` line and the `sync cycle complete` heartbeat carries a `skipped` count; add a Loki alert on a persistently non-zero `skipped` (or `skipped == jobs`) across several consecutive passes, or on the recurring `skip empty source` warning, to catch a vanished source before the remote mirror goes stale.
 
 ```dockerfile
 HEALTHCHECK --interval=60s --timeout=5s --retries=3 --start-period=120s \
     CMD ["/usr/local/bin/docker-rsync-scheduler", "health"]
 ```
+
+## Alerting
+
+docker-rsync-scheduler has no metrics endpoint; its operational state is in its
+logs (structured slog in logfmt). Ship the container's logs to Loki (Grafana
+Alloy's Docker log discovery does this with no configuration) and evaluate
+these with [Loki's ruler](https://grafana.com/docs/loki/latest/alert/); firing
+alerts deliver through your Alertmanager exactly like Prometheus metric alerts.
+These rules assume the built-in scheduler is running; see the caveat after the
+group for external-trigger deployments.
+
+```yaml
+groups:
+  - name: docker-rsync-scheduler
+    rules:
+      - alert: RsyncSchedulerSyncFailed
+        expr: |
+          sum by (container) (count_over_time(
+            {container="rsync"} |= `sync failed` [15m]
+          )) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "docker-rsync-scheduler failed a sync job"
+          description: >
+            A job logged "sync failed": its rsync exited non-zero (an ssh or
+            transport error, a remote-side failure, or a per-job timeout; the
+            line carries rsync_exit, timed_out, and a bounded stderr tail).
+            That job's remote mirror is now stale. Check the remote host, the
+            ssh key, and connectivity.
+      - alert: RsyncSchedulerStalled
+        expr: |
+          absent_over_time({container="rsync"} |= `sync cycle complete` [8h])
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "docker-rsync-scheduler has not completed a sync pass in 8h"
+          description: >
+            docker-rsync-scheduler logs a "sync cycle complete" line at the end
+            of every pass that runs; the built-in scheduler runs one at startup
+            and then every SYNC_INTERVAL (default 6h). None in 8h while the
+            container is up means the scheduler is wedged or dead, which a
+            fault-only ruleset misses because a stalled scheduler emits no
+            "sync failed" line either. Restart the container.
+```
+
+With the built-in scheduler (`SYNC_INTERVAL` set to a duration) the sync runs
+in the container's PID 1, so its logs reach Loki. In external-trigger mode
+(`SYNC_INTERVAL=off`) each pass runs in a `docker exec` child, not PID 1, so
+its logs never reach the container's log stream and neither rule can see them;
+drive alerting from your external scheduler's own job-failure reporting and the
+container health marker instead (see [Scheduling modes](#scheduling-modes)).
+The "sync cycle complete" line is emitted whether a pass finished clean or with
+failures, so the stall rule is a pure deadman for a scheduler that has stopped
+running, while per-job failures are caught by the fault rule.
+
+Thresholds and the `severity` label are starting points: size the stall window
+to your `SYNC_INTERVAL` (the 8h default assumes the 6h built-in interval),
+adjust the `container` selector (or `job` / `service`, depending on your log
+collector) to your deployment, and route by whatever labels your Alertmanager
+uses. To also catch a source that has silently gone empty (skipped as a
+success, so it never trips the fault rule), see the `skipped` / `skip empty
+source` note under [Healthcheck](#healthcheck).
 
 ## Security
 
@@ -195,7 +260,7 @@ All dependencies are updated automatically via [Renovate](https://github.com/ren
 | rsync          | [Alpine](https://pkgs.alpinelinux.org/packages?name=rsync)          |
 | openssh-client | [Alpine](https://pkgs.alpinelinux.org/packages?name=openssh-client) |
 
-Runtime Go modules: [`github.com/cplieger/health`](https://github.com/cplieger/health) and [`gopkg.in/yaml.v3`](https://gopkg.in/yaml.v3).
+Runtime Go modules: [`github.com/cplieger/health`](https://github.com/cplieger/health), [`github.com/cplieger/scheduler`](https://github.com/cplieger/scheduler), [`github.com/cplieger/slogx`](https://github.com/cplieger/slogx), and [`gopkg.in/yaml.v3`](https://gopkg.in/yaml.v3).
 
 ## Credits
 
