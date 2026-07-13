@@ -7,7 +7,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-require github.com/cplieger/slogx v1.1.0
+require github.com/cplieger/slogx v1.1.1
 
 require github.com/cplieger/scheduler v1.1.0
 
