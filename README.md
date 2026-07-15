@@ -251,14 +251,16 @@ _Why it runs as root._ The container runs as root by design: it must read host-o
 
 ## Dependencies
 
-All dependencies are updated automatically via [Renovate](https://github.com/renovatebot/renovate). Base images and Go modules are pinned by digest/version; the `rsync`/`openssh-client` apk packages are installed unpinned so they track the digest-pinned base.
+All dependencies are updated automatically via [Renovate](https://github.com/renovatebot/renovate). Base images and Go modules are pinned by digest/version. `rsync` is compiled from the pinned upstream release tarball (`RSYNC_VERSION` in the Dockerfile, SHA256-verified fail-closed, Renovate-tracked) with feature parity to the Alpine package it replaced (ACLs, xattrs, xxhash checksums, zstd/lz4 compression), asserted by a build-time smoke test. The `openssh-client` apk package and the base userland (including rsync's runtime libraries) install unpinned so they track the digest-pinned Alpine release; they move only when the image is rebuilt, and the publishing pipeline rebuilds the image on a schedule when its last build grows stale, so that float window stays bounded.
 
-| Dependency     | Source                                                              |
-| -------------- | ------------------------------------------------------------------- |
-| golang         | [Go](https://hub.docker.com/_/golang)                               |
-| alpine         | [Docker Hub](https://hub.docker.com/_/alpine)                       |
-| rsync          | [Alpine](https://pkgs.alpinelinux.org/packages?name=rsync)          |
-| openssh-client | [Alpine](https://pkgs.alpinelinux.org/packages?name=openssh-client) |
+**Major rsync versions:** a major version bump PR does not auto-merge. Review the [upstream release notes](https://rsync.samba.org/) for flag or protocol changes before merging (the rsync wire protocol negotiates with older remote versions, but flag semantics can change across majors).
+
+| Dependency     | Source                                                                        |
+| -------------- | ----------------------------------------------------------------------------- |
+| golang         | [Go](https://hub.docker.com/_/golang)                                         |
+| alpine         | [Docker Hub](https://hub.docker.com/_/alpine)                                 |
+| rsync          | [rsync upstream](https://github.com/RsyncProject/rsync) (pinned source build) |
+| openssh-client | [Alpine](https://pkgs.alpinelinux.org/packages?name=openssh-client)           |
 
 Runtime Go modules: [`github.com/cplieger/health`](https://github.com/cplieger/health), [`github.com/cplieger/scheduler`](https://github.com/cplieger/scheduler), [`github.com/cplieger/slogx`](https://github.com/cplieger/slogx), and [`gopkg.in/yaml.v3`](https://gopkg.in/yaml.v3).
 
