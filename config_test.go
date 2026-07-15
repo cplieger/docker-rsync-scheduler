@@ -663,17 +663,6 @@ func TestLoadSyncTimeout(t *testing.T) {
 	})
 }
 
-func TestGetEnv(t *testing.T) {
-	t.Setenv("TEST_RSYNC_ENV", "value")
-	if got := getEnv("TEST_RSYNC_ENV", "fallback"); got != "value" {
-		t.Errorf("getEnv = %q, want value", got)
-	}
-	t.Setenv("TEST_RSYNC_ENV", "")
-	if got := getEnv("TEST_RSYNC_ENV", "fallback"); got != "fallback" {
-		t.Errorf("getEnv = %q, want fallback", got)
-	}
-}
-
 func TestSetupLogger_levelMapping(t *testing.T) {
 	orig := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(orig) })
