@@ -2,7 +2,6 @@
 package main
 
 import (
-	"cmp"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cplieger/envx"
 	"github.com/cplieger/scheduler"
 	"github.com/cplieger/slogx"
 	"gopkg.in/yaml.v3"
@@ -114,7 +114,7 @@ func hasShellMeta(s string) bool {
 // setupLogger installs a slog text handler that emits canonical logfmt
 // (`time=... level=... msg=... k=v`) to stderr for Loki/Alloy collection.
 func setupLogger() {
-	levelStr := strings.TrimSpace(getEnv("LOG_LEVEL", "info"))
+	levelStr := strings.TrimSpace(envx.String("LOG_LEVEL", "info"))
 	level, recognized := slogx.ParseLevel(levelStr, slog.LevelInfo)
 	slogx.Setup(slogx.Options{Level: level})
 	if !recognized {
@@ -124,7 +124,7 @@ func setupLogger() {
 
 // configPath returns the active config path, honouring CONFIG_PATH.
 func configPath() string {
-	return getEnv("CONFIG_PATH", defaultConfigPath)
+	return envx.String("CONFIG_PATH", defaultConfigPath)
 }
 
 // loadConfig reads, parses, and validates the YAML config. On any
@@ -441,10 +441,4 @@ func loadInterval() (interval time.Duration, scheduleEnabled bool) {
 	s := scheduler.ParseInterval(os.Getenv("SYNC_INTERVAL"), defaultInterval,
 		scheduler.WithName("SYNC_INTERVAL"))
 	return s.Interval, s.Mode == scheduler.ModeBuiltin
-}
-
-// getEnv returns the environment value for key, or fallback when unset
-// or empty.
-func getEnv(key, fallback string) string {
-	return cmp.Or(os.Getenv(key), fallback)
 }
