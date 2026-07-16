@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cplieger/scheduler"
+	"github.com/cplieger/scheduler/v2"
 )
 
 // newRunJobSource creates a non-empty temp source dir so runJob does not
