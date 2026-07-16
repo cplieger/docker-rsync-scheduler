@@ -407,22 +407,15 @@ func checkReadable(path string) error {
 }
 
 // loadSyncTimeout reads SYNC_TIMEOUT (a Go duration) and falls back to
-// defaultSyncTimeout on unset or unparseable values, logging a warning
-// rather than refusing to start.
+// defaultSyncTimeout on unset or unparseable values (envx.Duration warns on
+// malformed input), logging a warning rather than refusing to start. The
+// positive-only rule stays app-side: a zero or negative timeout would break
+// every rsync context.
 func loadSyncTimeout() time.Duration {
-	raw := strings.TrimSpace(os.Getenv("SYNC_TIMEOUT"))
-	if raw == "" {
-		return defaultSyncTimeout
-	}
-	d, err := time.ParseDuration(raw)
-	switch {
-	case err != nil:
-		slog.Warn("cannot parse SYNC_TIMEOUT, using default",
-			"value", raw, "default", defaultSyncTimeout)
-		return defaultSyncTimeout
-	case d <= 0:
+	d := envx.Duration("SYNC_TIMEOUT", defaultSyncTimeout)
+	if d <= 0 {
 		slog.Warn("SYNC_TIMEOUT must be positive, using default",
-			"value", raw, "default", defaultSyncTimeout)
+			"value", d.String(), "default", defaultSyncTimeout)
 		return defaultSyncTimeout
 	}
 	return d
