@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/cplieger/health"
-	"github.com/cplieger/scheduler"
+	"github.com/cplieger/scheduler/v2"
 )
 
 // --- Main ---

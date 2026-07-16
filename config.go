@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/cplieger/envx"
-	"github.com/cplieger/scheduler"
+	"github.com/cplieger/scheduler/v2"
 	"github.com/cplieger/slogx"
 	"gopkg.in/yaml.v3"
 )
