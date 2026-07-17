@@ -3,7 +3,7 @@ module github.com/cplieger/docker-rsync-scheduler
 go 1.26.5
 
 require (
-	github.com/cplieger/health v1.3.0
+	github.com/cplieger/health v1.4.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
