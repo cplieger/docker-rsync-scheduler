@@ -84,7 +84,7 @@ fi
 #    built binary, so a label drift fails the image build instead.
 stats_dir=$(mktemp -d)
 mkdir -p "$stats_dir/src" "$stats_dir/dst"
-printf 'x' > "$stats_dir/src/f"
+printf 'x' >"$stats_dir/src/f"
 if stats_out=$(rsync -rlptD --stats "$stats_dir/src/" "$stats_dir/dst/" 2>&1); then
   for label in "Number of regular files transferred:" "Total transferred file size:"; do
     case "$stats_out" in
