@@ -13,20 +13,20 @@ Push local directories to a remote host over rsync-and-ssh on a schedule — str
 
 ## What it does
 
-Reads a YAML config defining _N_ sync jobs. For each job it runs `rsync` over `ssh` to push a local directory one-way to a remote host. Every run emits structured `slog` lines (logfmt, UTC timestamps); in built-in scheduling mode these go to the container's PID-1 stream for collection by a log aggregator (Alloy, Promtail) and alerting via Grafana or similar, whereas an external `sync` pass triggered via `docker exec` emits to the exec caller instead (see the [Scheduling modes](#scheduling-modes) observability caveat).
+Reads a YAML config defining _N_ sync jobs. For each job it runs `rsync` over `ssh` to push a local directory one-way to a remote host. Every pass executes inside the long-lived daemon (PID 1) regardless of how it was triggered, so its structured `slog` lines (logfmt, UTC timestamps) always land on the container's log stream for collection by a log aggregator (Alloy, Promtail) and alerting via Grafana or similar; an external `sync` trigger is a thin client that submits a request to the daemon and exits with the pass result.
 
 - One-way mirror of each configured local directory to a `[user@]host:/path`
 - Per-job `--delete`, `--chown=uid:gid`, and exclude patterns
 - Empty-source guard: a job whose top-level source directory is missing or empty is skipped, so a wholly vanished or unmounted source cannot let `--delete` wipe the matching remote tree. The guard probes the `local` dir against the built-in global excludes only (not per-job `excludes`), so on a `delete: true` job whose own `excludes` could match every entry, set `max_delete` (rsync `--max-delete=N`) as a backstop.
 - Built-in interval scheduler, or hand scheduling to an external scheduler (cron, Ofelia, etc.) via the `sync` subcommand
 - File-marker healthcheck — unhealthy when any job fails, recovers on the next clean pass
-- Logs only: no Prometheus exporter, no HTTP server, no listening socket
+- Logs only: no Prometheus exporter, no HTTP server, no network listener (triggering uses an in-container unix socket)
 
 ## Architecture
 
 - _Scheduler your way._ Ships with a self-contained Go interval scheduler (no external cron, systemd timers, or orchestrator scheduling needed), or hands the cadence to an external scheduler via the `sync` subcommand. See [Scheduling modes](#scheduling-modes).
-- _Overlap lock._ A single advisory `flock` serialises every sync pass so the built-in ticker and an external `sync` exec never run two passes at once. See [Scheduling modes](#scheduling-modes).
-- _Subcommands._ `daemon` (PID 1, the default command; dispatches built-in vs external based on `SYNC_INTERVAL`), `sync` (one pass, exit 0 if all jobs succeed, 1 if any fail), and `health` (the Docker probe). The built-in startup pass, the interval pass, and the `sync` subcommand share one sync-pass function.
+- _Single-owner daemon._ PID 1 owns every pass: the built-in ticker and each `sync` trigger submit requests to one bounded FIFO queue served by one executor goroutine, so two passes can never overlap and every pass's logs reach the container log stream in both modes. See [Scheduling modes](#scheduling-modes).
+- _Subcommands._ `daemon` (PID 1, the default command; dispatches built-in vs external based on `SYNC_INTERVAL`), `sync` (submits one pass to the daemon over its in-container unix socket and exits with that pass's result: 0 if all jobs succeed, 1 if any fail), and `health` (the Docker probe). Every trigger — startup, interval, external — executes the same pass function inside the daemon.
 - _No shell, validated config._ Each job runs via `exec.CommandContext` with an explicit argument slice, and every config field is validated at startup. See [Security](#security).
 - _Bounded resources._ Per-job timeout via context (default 10m, override with `SYNC_TIMEOUT`); captured rsync stderr is bounded to 1 MB so a chatty subprocess cannot OOM the container.
 - _Health._ File-marker pattern via [`github.com/cplieger/health`](https://github.com/cplieger/health) — the marker is set after each pass and probed by the `health` subcommand.
@@ -68,9 +68,9 @@ Set `SYNC_INTERVAL=off` (aliases: `disabled`, `0`). The container stays running 
 docker exec rsync docker-rsync-scheduler sync
 ```
 
-The pass runs once and exits; its exit code is non-zero on failure, and it updates the same health marker the long-running container reports. This lets a central scheduler own the cadence.
+The `sync` command submits one pass to the daemon and waits: its exit code is non-zero on failure (or when the request is rejected or the daemon is unreachable), and the pass updates the same health marker the long-running container reports. This lets a central scheduler own the cadence.
 
-> **Observability caveat (external mode).** A `sync` triggered via `docker exec` runs as a child process, not the container's PID 1. Docker's logging driver captures only PID 1's stdout/stderr, so a socket-based log collector (for example Alloy's Docker log discovery) does **not** see the exec child's output — the `sync cycle complete` heartbeat, `sync failed`, `skip empty source`, and per-job lines instead go to the exec caller (for example the Ofelia job result). The Loki-based alerts described under [Healthcheck](#healthcheck) (heartbeat-absence, `skipped` count, `skip empty source`) therefore fire only in built-in scheduling mode. In external mode, read per-run outcomes from the exec scheduler's own job-failure reporting and rely on the container health marker (which the `sync` subcommand does update) as the container-level signal.
+> **Observability (external mode).** The pass executes inside the daemon (PID 1), not the exec child, so the `sync cycle complete` heartbeat, `sync failed`, `skip empty source`, and per-job lines all land on the container's log stream in external mode too — every Loki rule under [Alerting](#alerting) works in both scheduling modes. The `sync` client's own output is just its lifecycle (`triggered sync accepted/started/complete` plus the result), which your scheduler's job log (for example the Ofelia job result) captures.
 
 Example with [Ofelia](https://github.com/mcuadros/ofelia) labels:
 
@@ -96,7 +96,7 @@ services:
       - /srv/source/certs:/sources/certs:ro
 ```
 
-Overlapping passes are prevented in both modes by an advisory file lock (`flock`) on `/tmp/.docker-rsync-scheduler.lock`, so a manual `docker exec` pass that races a scheduled one (or the built-in ticker) will skip rather than run a second concurrent pass. Ofelia's `no-overlap` is still recommended to avoid queuing redundant triggers.
+Overlapping passes cannot happen in either mode: every trigger goes through the daemon's single executor, which runs passes strictly in order. A manual `docker exec … sync` that races a scheduled pass queues behind it and then runs as its own pass with its own result (rsync converges, so a back-to-back duplicate is a cheap delta pass); a full queue rejects the trigger immediately with a clear reason instead of queuing unboundedly. Ofelia's `no-overlap` is still recommended to avoid queuing redundant triggers.
 
 ## Configuration reference
 
@@ -142,7 +142,7 @@ Every job also receives a fixed set of global excludes: `.stfolder`, `.stversion
 
 ## Healthcheck
 
-The built-in healthcheck (`docker-rsync-scheduler health`) checks for a marker file that is set after each sync pass: healthy when the most recent pass had zero failed jobs, unhealthy when any job failed. Empty-source skips count as success. The container recovers automatically on the next clean pass — no restart required. In built-in mode it begins unhealthy, runs one pass at startup, and transitions accordingly, so size `healthcheck.start_period` for the time the initial pass may take. In external mode the container starts healthy (idle, nothing has failed) and each triggered `sync` updates the marker.
+The built-in healthcheck (`docker-rsync-scheduler health`) checks for a marker file that is set after each sync pass: healthy when the most recent pass had zero failed jobs, unhealthy when any job failed. Empty-source skips count as success. The container recovers automatically on the next clean pass — no restart required. In built-in mode it begins unhealthy, runs one pass at startup, and transitions accordingly, so size `healthcheck.start_period` for the time the initial pass may take; built-in mode also arms a freshness deadline of `2×SYNC_INTERVAL + jobs×SYNC_TIMEOUT`, so a wedged interval loop (marker present but never refreshed) eventually probes unhealthy and is restarted rather than trusted forever. In external mode the container starts healthy (idle, nothing has failed), each triggered `sync` updates the marker, and no deadline is armed (a marker between sparse triggers must not expire).
 
 > Because an empty source is skipped as a success, a job whose source silently becomes empty (for example a read-only bind mount that failed to mount and Docker materialised as an empty directory) keeps the container healthy and never logs at `level=ERROR` — it is invisible to both the error-level and heartbeat-absence alerts. Each skip emits a `level=WARN msg="skip empty source"` line and the `sync cycle complete` heartbeat carries a `skipped` count; add a Loki alert on a persistently non-zero `skipped` (or `skipped == jobs`) across several consecutive passes, or on the recurring `skip empty source` warning, to catch a vanished source before the remote mirror goes stale.
 
@@ -158,8 +158,8 @@ logs (structured slog in logfmt). Ship the container's logs to Loki (Grafana
 Alloy's Docker log discovery does this with no configuration) and evaluate
 these with [Loki's ruler](https://grafana.com/docs/loki/latest/alert/); firing
 alerts deliver through your Alertmanager exactly like Prometheus metric alerts.
-These rules assume the built-in scheduler is running; see the caveat after the
-group for external-trigger deployments.
+Every pass executes in the daemon (PID 1), so these rules work in both
+scheduling modes.
 
 ```yaml
 groups:
@@ -198,27 +198,26 @@ groups:
             "sync failed" line either. Restart the container.
 ```
 
-With the built-in scheduler (`SYNC_INTERVAL` set to a duration) the sync runs
-in the container's PID 1, so its logs reach Loki. In external-trigger mode
-(`SYNC_INTERVAL=off`) each pass runs in a `docker exec` child, not PID 1, so
-its logs never reach the container's log stream and neither rule can see them;
-drive alerting from your external scheduler's own job-failure reporting and the
-container health marker instead (see [Scheduling modes](#scheduling-modes)).
 The "sync cycle complete" line is emitted whether a pass finished clean or with
 failures, so the stall rule is a pure deadman for a scheduler that has stopped
-running, while per-job failures are caught by the fault rule.
+running (in external mode, one that has stopped being triggered), while per-job
+failures are caught by the fault rule. In external mode, additionally consider
+a deadman on your scheduler's own job log (for example, absence of the Ofelia
+job's completion line), which distinguishes "the trigger stopped firing" from
+"the container died".
 
 Thresholds and the `severity` label are starting points: size the stall window
-to your `SYNC_INTERVAL` (the 8h default assumes the 6h built-in interval),
-adjust the `container` selector (or `job` / `service`, depending on your log
-collector) to your deployment, and route by whatever labels your Alertmanager
-uses. To also catch a source that has silently gone empty (skipped as a
-success, so it never trips the fault rule), see the `skipped` / `skip empty
-source` note under [Healthcheck](#healthcheck).
+to your pass cadence — `SYNC_INTERVAL` in built-in mode, your external
+scheduler's period otherwise (the 8h default assumes 6h) — adjust the
+`container` selector (or `job` / `service`, depending on your log collector) to
+your deployment, and route by whatever labels your Alertmanager uses. To also
+catch a source that has silently gone empty (skipped as a success, so it never
+trips the fault rule), see the `skipped` / `skip empty source` note under
+[Healthcheck](#healthcheck).
 
 ## Security
 
-No network listener, no HTTP server, no exposed ports. The image ships `openssh-client` only — no `sshd`. Each job is executed with an explicit argument slice via `exec.CommandContext`; the `-e "ssh ..."` value is a single argument that rsync splits internally, so nothing is passed through a shell. Config is validated at startup: required fields present, names unique, `local`/`remote_path` absolute, `remote_host` matched against a strict pattern, the ssh key readable, and every field rejected if it contains shell metacharacters or control characters (defense-in-depth, since the arg-list exec already prevents interpretation).
+No network listener, no HTTP server, no exposed ports. Triggering is an in-container unix socket (`/tmp/docker-rsync-scheduler.sock`, owner-only `0600`), so trigger authority is scoped to the container's own user — the same boundary `docker exec` already enforces. The image ships `openssh-client` only — no `sshd`. Each job is executed with an explicit argument slice via `exec.CommandContext`; the `-e "ssh ..."` value is a single argument that rsync splits internally, so nothing is passed through a shell. Config is validated at startup and reloaded per pass: required fields present, names unique, `local`/`remote_path` absolute, `remote_host` matched against a strict pattern, the ssh key readable, and every field rejected if it contains shell metacharacters or control characters (defense-in-depth, since the arg-list exec already prevents interpretation).
 
 ### SSH host-key verification
 

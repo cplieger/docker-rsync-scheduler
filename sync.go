@@ -324,126 +324,65 @@ func runJob(ctx context.Context, j *job, timeout time.Duration, newCmd scheduler
 	return res
 }
 
-// passDisposition is what a whole sync pass did. It distinguishes the three
-// outcomes a bare failure count conflated: a pass that ran its jobs, a pass
-// deferred because another holder owns the overlap lock, and a pass that could
-// not acquire the lock at all.
-type passDisposition int
-
-const (
-	passRan      passDisposition = iota // jobs executed; see failed for clean vs failed
-	passDeferred                        // overlap: another holder owns the lock; no jobs ran
-	passLockErr                         // could not acquire the lock (environment failure)
-)
-
 // passResult is the structured outcome of one sync pass. The health
-// controller, the reporter, and the sync exit code each derive their action
-// from this single value, so the three dispositions can never be re-conflated
-// by a caller reading a bare int. Fields are ordered largest-first for
+// controller, the reporter, and the pass exit status each derive their action
+// from this single value, so the outcomes can never be re-conflated by a
+// caller reading a bare int. Fields are ordered largest-first for
 // fieldalignment.
 type passResult struct {
-	err            error           // non-nil only for passLockErr
-	trigger        string          // startup | interval | external
-	disposition    passDisposition // what the pass did
-	total          int             // jobs configured
-	ok             int             // jobs that succeeded (includes emptySkipped)
-	emptySkipped   int             // jobs skipped because their source was missing/empty
-	failed         int             // jobs that failed
-	duration       time.Duration   // wall-clock of a pass that ran
-	holderAge      time.Duration   // how long the current holder has run (passDeferred)
-	interrupted    bool            // ctx cancelled mid-pass (graceful shutdown drain)
-	holderAgeKnown bool            // holder's acquisition time was readable (passDeferred)
+	trigger      string        // startup | interval | external
+	total        int           // jobs configured
+	ok           int           // jobs that succeeded (includes emptySkipped)
+	emptySkipped int           // jobs skipped because their source was missing/empty
+	failed       int           // jobs that failed
+	duration     time.Duration // wall-clock of the pass
+	interrupted  bool          // ctx cancelled mid-pass (graceful shutdown drain)
 }
 
 // healthSignal reports whether this result should write the health marker
-// (set) and to what value (healthy). A lock error is unhealthy; a deferred pass
-// carries no signal of its own (set is false) because the running holder owns
-// health; a pass that ran writes its health value — EXCEPT an interrupted-clean
-// pass (every job succeeded, failed==0, but a shutdown signal coincided with
-// pass-end), which also carries no signal: it leaves the marker at its last
-// real value rather than writing a false-unhealthy. A pass with a real job
-// failure still writes unhealthy even when interrupted, and built-in shutdown
-// marks unhealthy via beginDrain (the drain watcher), not through this path —
-// so the interrupted-clean no-write only matters in external mode, where
-// nothing else resets a false-unhealthy until the next sync (up to a full
-// interval away).
+// (set) and to what value (healthy). A pass writes its health value — EXCEPT
+// an interrupted-clean pass (every job succeeded, failed==0, but a shutdown
+// signal coincided with pass-end), which carries no signal: it leaves the
+// marker at its last real value rather than writing a false-unhealthy. A pass
+// with a real job failure still writes unhealthy even when interrupted, and
+// daemon shutdown marks unhealthy via beginDrain, not through this path — so
+// the interrupted-clean no-write is what keeps a graceful drain from stamping
+// a false-unhealthy marker that would outlive the interruption.
 func (r *passResult) healthSignal() (set, healthy bool) {
-	switch r.disposition {
-	case passRan:
-		if r.interrupted && r.failed == 0 {
-			return false, false // interrupted-clean: no job failed; don't downgrade the marker
-		}
-		return true, r.failed == 0
-	case passDeferred:
-		return false, false // the running holder owns health
-	case passLockErr:
-		return true, false
+	if r.interrupted && r.failed == 0 {
+		return false, false // interrupted-clean: no job failed; don't downgrade the marker
 	}
-	// An unhandled disposition is a programming error; fail safe by writing
-	// unhealthy rather than silently leaving the marker stale.
-	return true, false
+	return true, r.failed == 0
 }
 
-// exitStatus is the process exit code for the `sync` subcommand: 1 on any job
-// failure or a lock error, 0 when the pass ran clean or deferred to an
-// in-flight holder (the holder, not this invocation, owns that outcome).
+// exitStatus is the pass's process-level status, delivered to a triggering
+// `sync` client as its exit code: 1 on any job failure, 0 on a clean pass.
 //
 // An interrupted-clean pass (every job succeeded but graceful shutdown cut the
 // pass short) exits 0, since no configured job failed. healthSignal treats the
 // same case as no signal (it declines to write the marker), so the two agree:
-// a gracefully-interrupted clean `sync` exits 0 AND leaves no false-unhealthy
-// marker behind. Both answer "did a configured job fail?" — an interrupted pass
-// with a real failure still exits 1 and writes unhealthy.
+// a gracefully-interrupted clean pass exits 0 AND leaves no false-unhealthy
+// marker behind. Both answer "did a configured job fail?" — an interrupted
+// pass with a real failure still exits 1 and writes unhealthy.
 func (r *passResult) exitStatus() int {
-	switch r.disposition {
-	case passRan:
-		if r.failed > 0 {
-			return 1
-		}
-		return 0
-	case passDeferred:
-		return 0
-	case passLockErr:
+	if r.failed > 0 {
 		return 1
 	}
-	// An unhandled disposition is a programming error; fail safe
-	// (non-zero) rather than reporting success for an outcome no
-	// branch understood.
-	return 1
+	return 0
 }
 
-// runPass runs every job once under the advisory overlap lock and returns a
-// structured result. It performs NO pass-level logging and never touches the
-// health marker: reportPass owns the pass-level log line and the health
-// controller owns the marker, each deriving its action from the returned
-// result. Keeping execution separate from interpretation is what prevents an
-// early return (an overlap defer, a lock error) from silently omitting a
-// signal. The lock guards a concurrent pass: an external `sync` exec racing
-// the daemon, or a manual docker exec racing a scheduled run.
+// runPass runs every job once and returns a structured result. It performs NO
+// pass-level logging and never touches the health marker: reportPass owns the
+// pass-level log line and the health controller owns the marker, each
+// deriving its action from the returned result. Keeping execution separate
+// from interpretation is what prevents an early return from silently omitting
+// a signal. Concurrency control is not this function's job: the daemon's
+// single executor goroutine is the only caller, and the queue in front of it
+// serializes every trigger source (ticker, socket clients) — the flock that
+// used to guard a cross-process `sync` exec is gone because there is no
+// second executing process anymore.
 func runPass(ctx context.Context, cfg config, timeout time.Duration, trigger string, newCmd scheduler.CommandRunner) passResult {
 	res := passResult{trigger: trigger, total: len(cfg.Jobs)}
-
-	lock, ok, lockErr := scheduler.TryLock(lockFilePath)
-	switch {
-	case lockErr != nil:
-		res.disposition = passLockErr
-		res.err = lockErr
-		return res
-	case !ok:
-		res.disposition = passDeferred
-		// The holder's acquisition time (recorded by scheduler.TryLock on the
-		// current holder's acquire) drives the deferred-pass log's holder_age.
-		// A fresh read, so it reflects whoever holds the lock now;
-		// observability-only and best-effort (unknown -> zero-value age).
-		if since, known := scheduler.ReadHolder(lockFilePath); known {
-			res.holderAge = time.Since(since)
-			res.holderAgeKnown = true
-		}
-		return res
-	}
-	defer lock.Unlock()
-
-	res.disposition = passRan
 	start := time.Now()
 	for i := range cfg.Jobs {
 		if ctx.Err() != nil {
@@ -475,52 +414,30 @@ func runPass(ctx context.Context, cfg config, timeout time.Duration, trigger str
 	return res
 }
 
-// reportPass emits the single pass-level log line for a pass. Every
-// disposition produces exactly one structured line, so no path can return
-// from a pass without a signal — the gap that previously let an overlap defer
-// emit no heartbeat.
+// reportPass emits the single pass-level log line for a pass. Every pass
+// produces exactly one structured line, so no path can return from a pass
+// without a signal.
 func reportPass(r *passResult) {
-	switch r.disposition {
-	case passRan:
-		if r.interrupted {
-			// A real pass began but was cut short by graceful shutdown. Logged at
-			// warn (the drain is expected, not a failure) and deliberately NOT the
-			// "sync cycle complete" heartbeat, so it never registers as a healthy
-			// completion for absence-based staleness alerting.
-			slog.Warn("sync cycle interrupted by shutdown",
-				"trigger", r.trigger, "jobs", r.total,
-				"ok", r.ok, "skipped", r.emptySkipped, "failed", r.failed,
-				"duration_ms", r.duration.Milliseconds())
-			return
-		}
-		// The staleness heartbeat: emitted once per pass that actually ran
-		// (clean or with failures). A Loki absence alert on this line catches a
-		// scheduler that has stopped triggering.
-		slog.Info("sync cycle complete",
+	if r.interrupted {
+		// A real pass began but was cut short by graceful shutdown. Logged at
+		// warn (the drain is expected, not a failure) and deliberately NOT the
+		// "sync cycle complete" heartbeat, so it never registers as a healthy
+		// completion for absence-based staleness alerting.
+		slog.Warn("sync cycle interrupted by shutdown",
 			"trigger", r.trigger, "jobs", r.total,
 			"ok", r.ok, "skipped", r.emptySkipped, "failed", r.failed,
 			"duration_ms", r.duration.Milliseconds())
-	case passDeferred:
-		// Liveness without a completion: the scheduler is alive and tried, but a
-		// prior pass still holds the lock. Deliberately NOT the heartbeat (a stuck
-		// holder must still trip the absence alert); holder_age_ms lets an
-		// operator alert on a holder that has run too long.
-		slog.Info("sync deferred, prior pass still running",
-			"trigger", r.trigger, "holder_age_ms", r.holderAge.Milliseconds(),
-			"holder_age_known", r.holderAgeKnown)
-	case passLockErr:
-		// A real environment failure (cannot even acquire the lock). level=error
-		// trips the documented error alert; the marker goes unhealthy too.
-		slog.Error("cannot acquire sync lock",
-			"trigger", r.trigger, "path", lockFilePath, "error", r.err)
-	default:
-		// An unhandled disposition is a programming error. Emit a line anyway so
-		// the "exactly one structured line per pass" invariant -- and any
-		// absence-based alert that depends on it -- survives a future disposition
-		// whose case was forgotten here. Mirrors exitStatus's fail-safe arm.
-		slog.Error("sync pass completed with unknown disposition",
-			"trigger", r.trigger, "disposition", int(r.disposition))
+		return
 	}
+	// The staleness heartbeat: emitted once per pass that actually ran
+	// (clean or with failures). A Loki absence alert on this line catches a
+	// scheduler that has stopped triggering — and since every pass (built-in
+	// or externally triggered) runs in the daemon, the line reaches the
+	// container log stream in both scheduling modes.
+	slog.Info("sync cycle complete",
+		"trigger", r.trigger, "jobs", r.total,
+		"ok", r.ok, "skipped", r.emptySkipped, "failed", r.failed,
+		"duration_ms", r.duration.Milliseconds())
 }
 
 // cappedBuffer is an io.Writer that retains at most max bytes, discarding
