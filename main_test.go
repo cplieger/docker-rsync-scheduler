@@ -5,12 +5,13 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // writeValidCfg writes a minimal valid config (one job whose source is the
 // given local dir) plus a readable dummy ssh key, points CONFIG_PATH at it, and
 // returns the config path. It is the fixture for the composition-root tests
-// below, which drive run/runSync end-to-end with a cancelled context or an
+// below, which drive runDaemon end-to-end with a cancelled context or an
 // empty source so no real rsync ever executes.
 func writeValidCfg(t *testing.T, local string) string {
 	t.Helper()
@@ -26,68 +27,58 @@ func writeValidCfg(t *testing.T, local string) string {
 	if err := os.WriteFile(cfgPath, []byte(doc), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
+	t.Setenv("CONFIG_PATH", cfgPath)
 	return cfgPath
 }
 
-// TestRun_badConfigReturnsError pins run's composition-root error arm: an
+// testSocketPath returns a short unix-socket path (unix socket paths are
+// length-limited, so t.TempDir() alone can be too deep on some runners).
+func testSocketPath(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "s.sock")
+}
+
+// TestRunDaemon_badConfigReturnsError pins the composition-root error arm: an
 // unreadable/missing config must propagate a non-nil error (which main turns
 // into a non-zero exit) rather than starting a daemon on empty config.
-// Not parallel: sets env and writes the real health marker at /tmp/.healthy.
-func TestRun_badConfigReturnsError(t *testing.T) {
+// Not parallel: sets env.
+func TestRunDaemon_badConfigReturnsError(t *testing.T) {
 	t.Setenv("CONFIG_PATH", filepath.Join(t.TempDir(), "absent.yaml"))
-	if err := run(context.Background()); err == nil {
-		t.Fatal("run() with a missing config = nil, want error")
+	err := runDaemon(context.Background(), testSocketPath(t), recordingRunner(t, "true"))
+	if err == nil {
+		t.Fatal("runDaemon() with a missing config = nil, want error")
 	}
 }
 
-// TestRun_externalModeReturnsNilOnShutdown pins the SYNC_INTERVAL=off dispatch:
-// run must select runExternal (idle until ctx.Done), so a pre-cancelled context
-// returns nil cleanly after the drain rather than blocking or erroring.
+// TestRunDaemon_externalModeReturnsNilOnShutdown pins the SYNC_INTERVAL=off
+// dispatch: runDaemon must select external mode (idle until ctx.Done), so a
+// pre-cancelled context returns nil cleanly after the drain rather than
+// blocking or erroring.
 // Not parallel: sets env and writes the real health marker.
-func TestRun_externalModeReturnsNilOnShutdown(t *testing.T) {
-	t.Setenv("CONFIG_PATH", writeValidCfg(t, t.TempDir()))
+func TestRunDaemon_externalModeReturnsNilOnShutdown(t *testing.T) {
+	writeValidCfg(t, t.TempDir())
 	t.Setenv("SYNC_INTERVAL", "off")
+	t.Cleanup(func() { _ = os.Remove(healthMarkerPath) })
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := run(ctx); err != nil {
-		t.Fatalf("run() external-mode cancelled = %v, want nil", err)
+	if err := runDaemon(ctx, testSocketPath(t), recordingRunner(t, "true")); err != nil {
+		t.Fatalf("runDaemon() external-mode cancelled = %v, want nil", err)
 	}
 }
 
-// TestRun_builtinModeReturnsNilOnShutdown pins the built-in-scheduler dispatch:
-// run must select runBuiltin, run its startup pass, and return nil when the
-// context is already cancelled (the startup pass is interrupted before any job
-// starts, the drain watcher fires, and the select loop exits on ctx.Done).
-// Not parallel: contends on the real lockFilePath and writes the marker.
-func TestRun_builtinModeReturnsNilOnShutdown(t *testing.T) {
-	t.Setenv("CONFIG_PATH", writeValidCfg(t, t.TempDir()))
-	t.Setenv("SYNC_INTERVAL", "6h")
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := run(ctx); err != nil {
-		t.Fatalf("run() built-in-mode cancelled = %v, want nil", err)
-	}
-}
-
-// TestRunSync_badConfigReturnsOne pins runSync's error exit: an unreadable
-// config makes the sync subcommand exit 1.
+// TestRunDaemon_builtinModeReturnsNilOnShutdown pins the built-in-scheduler
+// dispatch: runDaemon must select built-in mode and return nil when the
+// context is already cancelled (the ticker submits nothing under a cancelled
+// context, the executor drains, and the shutdown sequence completes).
 // Not parallel: sets env and writes the real health marker.
-func TestRunSync_badConfigReturnsOne(t *testing.T) {
-	t.Setenv("CONFIG_PATH", filepath.Join(t.TempDir(), "absent.yaml"))
-	if got := runSync(context.Background()); got != 1 {
-		t.Fatalf("runSync() with a missing config = %d, want 1", got)
-	}
-}
-
-// TestRunSync_cleanPassReturnsZero pins runSync's success path: a valid config
-// whose single job has an empty source is skipped (a skip counts as success),
-// so the pass runs clean and the sync subcommand exits 0. No real rsync runs --
-// the empty source short-circuits runJob before the command is built.
-// Not parallel: contends on the real lockFilePath and writes the marker.
-func TestRunSync_cleanPassReturnsZero(t *testing.T) {
-	t.Setenv("CONFIG_PATH", writeValidCfg(t, t.TempDir()))
-	if got := runSync(context.Background()); got != 0 {
-		t.Fatalf("runSync() over an empty source = %d, want 0", got)
+func TestRunDaemon_builtinModeReturnsNilOnShutdown(t *testing.T) {
+	writeValidCfg(t, t.TempDir())
+	t.Setenv("SYNC_INTERVAL", "6h")
+	t.Cleanup(func() { _ = os.Remove(healthMarkerPath) })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := runDaemon(ctx, testSocketPath(t), recordingRunner(t, "true")); err != nil {
+		t.Fatalf("runDaemon() built-in-mode cancelled = %v, want nil", err)
 	}
 }
 
@@ -101,5 +92,49 @@ func TestDispatch_unknownSubcommandReturnsTwo(t *testing.T) {
 	os.Args = []string{"docker-rsync-scheduler", "bogus"}
 	if got := dispatch(); got != 2 {
 		t.Fatalf("dispatch(bogus) = %d, want 2", got)
+	}
+}
+
+// TestProbeOptions_builtinArmsMaxAgeFromJobs pins the healthcheck freshness
+// policy: built-in mode arms a deadline of 2*interval + jobs*timeout, so a
+// wedged interval loop (marker present but never refreshed) eventually probes
+// unhealthy. Not parallel: sets env.
+func TestProbeOptions_builtinArmsMaxAgeFromJobs(t *testing.T) {
+	writeValidCfg(t, t.TempDir()) // 1 job
+	t.Setenv("SYNC_INTERVAL", "1h")
+	t.Setenv("SYNC_TIMEOUT", "10m")
+	opts := probeOptions()
+	if len(opts) != 1 {
+		t.Fatalf("probeOptions() built-in = %d options, want 1 (WithMaxAge)", len(opts))
+	}
+}
+
+// TestProbeOptions_externalAndBrokenConfigDisarm pins the two no-deadline
+// arms: external mode never arms a deadline, and an unreadable config in
+// built-in mode disarms it (bare probe) rather than risking a false-unhealthy
+// restart loop. Not parallel: sets env.
+func TestProbeOptions_externalAndBrokenConfigDisarm(t *testing.T) {
+	writeValidCfg(t, t.TempDir())
+	t.Setenv("SYNC_INTERVAL", "off")
+	if opts := probeOptions(); len(opts) != 0 {
+		t.Errorf("probeOptions() external = %d options, want 0", len(opts))
+	}
+
+	t.Setenv("SYNC_INTERVAL", "1h")
+	t.Setenv("CONFIG_PATH", filepath.Join(t.TempDir(), "absent.yaml"))
+	if opts := probeOptions(); len(opts) != 0 {
+		t.Errorf("probeOptions() with unreadable config = %d options, want 0 (disarmed)", len(opts))
+	}
+}
+
+// waitFor polls cond until true or the deadline, failing the test with msg.
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal(msg)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

@@ -73,12 +73,14 @@ const (
 	// mirrors fresh without thrashing a slow remote.
 	defaultInterval = 6 * time.Hour
 
-	// lockFilePath guards against overlapping sync passes. flock(2) on this
-	// file serialises runs both in-process (the built-in ticker racing the
-	// startup pass) and cross-process (an external `sync` invocation racing
-	// the built-in ticker or a manual docker exec). /tmp is writable by the
-	// root-by-design container, same place as the health marker.
-	lockFilePath = "/tmp/.docker-rsync-scheduler.lock"
+	// socketPath is the daemon's trigger socket. The `sync` subcommand dials
+	// it to submit a pass request; the daemon — the single owner of pass
+	// execution — serves requests from its queue in order. /tmp is writable
+	// by the root-by-design container (same place as the health marker), the
+	// socket file is owner-only (0600), and nothing listens on any network
+	// port — trigger authority is scoped to the container's own user, the
+	// same boundary `docker exec` already enforces.
+	socketPath = "/tmp/docker-rsync-scheduler.sock"
 )
 
 // userRE matches the optional login name before '@' in a remote_host.

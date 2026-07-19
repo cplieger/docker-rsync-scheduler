@@ -11,8 +11,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/cplieger/scheduler/v2"
 )
 
 // newRunJobSource creates a non-empty temp source dir so runJob does not
@@ -91,32 +89,8 @@ func TestRunJob_emptySourceSkipsWithoutRunning(t *testing.T) {
 	}
 }
 
-func TestRunPass_deferredWhenLockHeld(t *testing.T) {
-	// Not parallel: contends on the real lockFilePath.
-	held, ok, err := scheduler.TryLock(lockFilePath)
-	if err != nil || !ok {
-		t.Fatalf("could not acquire lock: ok=%v err=%v", ok, err)
-	}
-	defer held.Unlock()
-	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
-		t.Error("runner invoked with held lock; want deferred")
-		return exec.CommandContext(ctx, "true")
-	}
-	cfg := config{Jobs: []job{*runJobJob(newRunJobSource(t))}}
-	r := runPass(context.Background(), cfg, time.Minute, "test", newCmd)
-	if r.disposition != passDeferred {
-		t.Errorf("disposition = %v, want passDeferred (%v)", r.disposition, passDeferred)
-	}
-	if r.exitStatus() != 0 {
-		t.Errorf("exitStatus = %d, want 0 (deferred is success)", r.exitStatus())
-	}
-	if set, _ := r.healthSignal(); set {
-		t.Error("deferred pass wrote a health signal; want none (the running holder owns health)")
-	}
-}
-
 func TestRunPass_aggregatesFailures(t *testing.T) {
-	// Not parallel: contends on the real lockFilePath.
+	t.Parallel()
 	var calls int
 	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 		calls++
@@ -128,9 +102,6 @@ func TestRunPass_aggregatesFailures(t *testing.T) {
 	src := newRunJobSource(t)
 	cfg := config{Jobs: []job{*runJobJob(src), *runJobJob(src)}}
 	r := runPass(context.Background(), cfg, time.Minute, "test", newCmd)
-	if r.disposition != passRan {
-		t.Fatalf("disposition = %v, want passRan (%v)", r.disposition, passRan)
-	}
 	if r.failed != 1 {
 		t.Errorf("failed = %d, want 1", r.failed)
 	}
@@ -184,7 +155,7 @@ func TestRunJob_parentCancellationLogsShutdownNotFailure(t *testing.T) {
 // failed, so the pass is healthy. (The heartbeat wording is asserted
 // separately in TestReportPass_ranEmitsHeartbeat.)
 func TestRunPass_emptySourceSkippedNotCountedAsFailure(t *testing.T) {
-	// Not parallel: contends on the real lockFilePath.
+	t.Parallel()
 	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 		t.Error("runner invoked for empty-source job; want skip, not exec")
 		return exec.CommandContext(ctx, "true")
@@ -193,9 +164,6 @@ func TestRunPass_emptySourceSkippedNotCountedAsFailure(t *testing.T) {
 
 	r := runPass(context.Background(), cfg, time.Minute, "test", newCmd)
 
-	if r.disposition != passRan {
-		t.Fatalf("disposition = %v, want passRan (%v)", r.disposition, passRan)
-	}
 	if r.failed != 0 {
 		t.Errorf("failed = %d, want 0 (an empty-source skip is not a failure)", r.failed)
 	}
@@ -218,7 +186,7 @@ func TestRunPass_emptySourceSkippedNotCountedAsFailure(t *testing.T) {
 // healthSignal's no-write carve-out and exit 0 — so no false-unhealthy marker
 // outlives the drain.
 func TestRunPass_shutdownInterruptedJobIsNotCountedAsFailure(t *testing.T) {
-	// Not parallel: contends on the real lockFilePath.
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 
 	var calls int
@@ -234,9 +202,6 @@ func TestRunPass_shutdownInterruptedJobIsNotCountedAsFailure(t *testing.T) {
 
 	if calls != 1 {
 		t.Errorf("commandRunner calls = %d, want 1 (the second job must be skipped under the cancelled context)", calls)
-	}
-	if r.disposition != passRan {
-		t.Fatalf("disposition = %v, want passRan (%v)", r.disposition, passRan)
 	}
 	if r.failed != 0 {
 		t.Errorf("failed = %d, want 0 (a shutdown-interrupted job is a graceful drain, not a failure)", r.failed)
@@ -300,7 +265,7 @@ func TestDefaultCommandRunner_cancelSignalsProcess(t *testing.T) {
 // TestRunPass_realFailureDuringShutdownStillUnhealthy pins the failed>0 half of
 // healthSignal's interrupted carve-out at the runPass integration level.
 func TestRunPass_realFailureDuringShutdownStillUnhealthy(t *testing.T) {
-	// Not parallel: contends on the real lockFilePath.
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	var calls int
 	newCmd := func(cmdCtx context.Context, _ string, _ ...string) *exec.Cmd {
@@ -314,9 +279,6 @@ func TestRunPass_realFailureDuringShutdownStillUnhealthy(t *testing.T) {
 	src := newRunJobSource(t)
 	cfg := config{Jobs: []job{*runJobJob(src), *runJobJob(src)}}
 	r := runPass(ctx, cfg, time.Minute, "test", newCmd)
-	if r.disposition != passRan {
-		t.Fatalf("disposition = %v, want passRan (%v)", r.disposition, passRan)
-	}
 	if r.failed != 1 {
 		t.Errorf("failed = %d, want 1", r.failed)
 	}

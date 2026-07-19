@@ -9,3 +9,7 @@
 
 # Built binary
 /docker-rsync-scheduler
+
+# Go workspace
+go.work
+go.work.sum
