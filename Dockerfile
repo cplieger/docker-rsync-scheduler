@@ -21,7 +21,7 @@ ARG RSYNC_VERSION=v3.4.4
 # sha256sum "rsync-${V#v}.tar.gz"   # paste the result here only after gpgv passes
 ARG RSYNC_SHA256=bd88cf82fa653da32314fb229136407c5c90f80d1758d8f4b091767877d8fa96
 
-FROM golang:1.26-trixie@sha256:117e07f49461abb984fc8aef661432461ff43d06faa22c3b73af6a49ce325cb9 AS go-builder
+FROM golang:1.26-trixie@sha256:4ee9ffa999b4583ce281939cdff828763083610292f252279a0cee77473bd9a7 AS go-builder
 ENV GOTOOLCHAIN=auto
 
 WORKDIR /src
