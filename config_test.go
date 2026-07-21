@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cplieger/envx/yamlenv"
 )
 
 // writeKey creates a readable dummy private key inside a temp dir and
@@ -397,6 +399,62 @@ func TestParseConfigInvalidYAML(t *testing.T) {
 	_, err := parseConfig([]byte("jobs: [unterminated"))
 	if err == nil {
 		t.Fatal("parseConfig on malformed YAML: want error")
+	}
+	if !strings.Contains(err.Error(), "parse config") {
+		t.Errorf("error = %q, want to contain 'parse config'", err)
+	}
+}
+
+// TestParseConfigUnknownKeyRejected pins the fail-loud unknown-key contract
+// from yamlenv.CheckUnknownKeys: a misspelled optional job key (max_delet
+// for max_delete) is a parse error naming the key, not a silently ignored
+// setting that leaves the intended cap unset.
+func TestParseConfigUnknownKeyRejected(t *testing.T) {
+	t.Parallel()
+	doc := `
+jobs:
+  - name: caddy
+    local: /sources/caddy
+    remote_host: root@192.0.2.87
+    remote_path: /srv/containers/caddy
+    ssh_key: /keys/id_ed25519
+    delete: true
+    max_delet: 100
+`
+	_, err := parseConfig([]byte(doc))
+	if err == nil {
+		t.Fatal("parseConfig with misspelled key 'max_delet' = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "parse config") {
+		t.Errorf("error = %q, want to contain 'parse config'", err)
+	}
+	if !strings.Contains(err.Error(), "max_delet") {
+		t.Errorf("error = %q, want it to name the unknown key 'max_delet'", err)
+	}
+}
+
+// TestParseConfigMultiDocumentRejected pins the fail-loud multi-document
+// contract from yamlenv.CheckSingleDocument: everything below a stray "---"
+// separator would be silently dropped by the single-document Unmarshal, so
+// the parse rejects it with the typed ErrMultipleDocuments instead.
+func TestParseConfigMultiDocumentRejected(t *testing.T) {
+	t.Parallel()
+	doc := `jobs:
+  - name: caddy
+    local: /sources/caddy
+    remote_host: root@192.0.2.87
+    remote_path: /srv/containers/caddy
+    ssh_key: /keys/id_ed25519
+---
+jobs:
+  - name: shadowed
+`
+	_, err := parseConfig([]byte(doc))
+	if err == nil {
+		t.Fatal("parseConfig with a second YAML document = nil, want error")
+	}
+	if !errors.Is(err, yamlenv.ErrMultipleDocuments) {
+		t.Errorf("error = %q, want errors.Is ErrMultipleDocuments", err)
 	}
 	if !strings.Contains(err.Error(), "parse config") {
 		t.Errorf("error = %q, want to contain 'parse config'", err)
