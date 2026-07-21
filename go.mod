@@ -4,8 +4,12 @@ go 1.26.5
 
 require (
 	github.com/cplieger/health v1.4.0
-	gopkg.in/yaml.v3 v3.0.1
+	go.yaml.in/yaml/v3 v3.0.4
 )
+
+// release-gated: strict-load helpers (CheckSingleDocument, CheckUnknownKeys)
+// are unreleased; resolved via a local go.work until yamlenv/v1.2.0 tags.
+require github.com/cplieger/envx/yamlenv v1.2.0
 
 require github.com/cplieger/slogx v1.4.0
 

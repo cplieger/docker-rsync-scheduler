@@ -13,9 +13,10 @@ import (
 	"time"
 
 	"github.com/cplieger/envx"
+	"github.com/cplieger/envx/yamlenv"
 	"github.com/cplieger/scheduler/v2"
 	"github.com/cplieger/slogx"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // --- Configuration ---
@@ -174,7 +175,21 @@ func loadConfig() (config, error) {
 // parseConfig unmarshals raw YAML into a config without validating it.
 // Kept separate from validate so fuzz/property tests can exercise the
 // parser on arbitrary bytes without needing a real ssh key on disk.
+//
+// Before decoding, the raw bytes pass yamlenv's fail-loud strict checks: a
+// document below a stray "---" separator would be silently ignored by the
+// single-document Unmarshal, and a misspelled or misplaced key (e.g.
+// "max_delet") would be silently dropped while its intended setting stayed
+// at the default. Both run on the raw bytes deliberately -- this app has no
+// env expansion, so the bytes read from disk are exactly what decodes, and
+// the strict-check line numbers point at the file the operator wrote.
 func parseConfig(data []byte) (config, error) {
+	if err := yamlenv.CheckSingleDocument(data); err != nil {
+		return config{}, fmt.Errorf("parse config: %w", err)
+	}
+	if err := yamlenv.CheckUnknownKeys(data, &config{}); err != nil {
+		return config{}, fmt.Errorf("parse config: %w", err)
+	}
 	var cfg config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return config{}, fmt.Errorf("parse config: %w", err)
