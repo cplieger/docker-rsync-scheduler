@@ -2,23 +2,28 @@ package main
 
 import (
 	"log/slog"
-	"strings"
 	"testing"
 	"time"
+
+	"github.com/cplieger/slogx/capture"
 )
 
 // TestReportPass_ranEmitsHeartbeat verifies the staleness heartbeat carries the
-// job tally that Loki absence/skip alerts parse.
+// job tally that Loki absence/skip alerts parse. The message is matched
+// exactly (CountExact) because the Loki rules pin it verbatim.
 func TestReportPass_ranEmitsHeartbeat(t *testing.T) {
-	buf := captureLogs(t, slog.LevelInfo)
+	rec := capture.Default(t)
 	reportPass(&passResult{
 		trigger: "interval",
 		total:   2, ok: 2, emptySkipped: 1, failed: 0, duration: 5 * time.Millisecond,
 	})
-	logs := buf.String()
-	for _, want := range []string{"sync cycle complete", "trigger=interval", "ok=2", "skipped=1", "failed=0"} {
-		if !strings.Contains(logs, want) {
-			t.Errorf("heartbeat log = %q, want substring %q", logs, want)
+	const heartbeat = "sync cycle complete"
+	if got := rec.CountExact(heartbeat); got != 1 {
+		t.Fatalf("heartbeat %q emitted %d time(s), want 1; logs = %q", heartbeat, got, rec.Messages())
+	}
+	for k, v := range map[string]string{"trigger": "interval", "ok": "2", "skipped": "1", "failed": "0"} {
+		if !rec.HasAttr(heartbeat, k, v) {
+			t.Errorf("heartbeat missing attr %s=%s", k, v)
 		}
 	}
 }
@@ -27,20 +32,19 @@ func TestReportPass_ranEmitsHeartbeat(t *testing.T) {
 // pass logs a distinct warn line and NOT the "sync cycle complete" heartbeat
 // (so a drain never registers as a healthy completion) and never at error.
 func TestReportPass_interruptedDoesNotEmitHeartbeat(t *testing.T) {
-	buf := captureLogs(t, slog.LevelInfo)
+	rec := capture.Default(t)
 	reportPass(&passResult{
 		trigger: "interval", interrupted: true,
 		total: 1, ok: 0, failed: 1,
 	})
-	logs := buf.String()
-	if !strings.Contains(logs, "sync cycle interrupted by shutdown") {
-		t.Errorf("log = %q, want 'sync cycle interrupted by shutdown'", logs)
+	if !rec.Contains("sync cycle interrupted by shutdown") {
+		t.Errorf("logs = %q, want 'sync cycle interrupted by shutdown'", rec.Messages())
 	}
-	if strings.Contains(logs, "sync cycle complete") {
-		t.Errorf("log = %q, want NO 'sync cycle complete' heartbeat on an interrupted pass", logs)
+	if got := rec.Count("sync cycle complete"); got != 0 {
+		t.Errorf("logs = %q, want NO 'sync cycle complete' heartbeat on an interrupted pass", rec.Messages())
 	}
-	if strings.Contains(logs, "level=ERROR") {
-		t.Errorf("log = %q, want no ERROR on a shutdown interruption", logs)
+	if got := rec.CountLevel(slog.LevelError, ""); got != 0 {
+		t.Errorf("%d ERROR record(s) on a shutdown interruption, want none; logs = %q", got, rec.Messages())
 	}
 }
 

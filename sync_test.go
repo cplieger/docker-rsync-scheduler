@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"os"
@@ -11,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cplieger/slogx/capture"
 )
 
 // newRunJobSource creates a non-empty temp source dir so runJob does not
@@ -127,7 +128,7 @@ func TestRunPass_aggregatesFailures(t *testing.T) {
 // identical jobResult values, so only the emitted log distinguishes them; this
 // protects the no-false-page contract (Loki alerts on level=error).
 func TestRunJob_parentCancellationLogsShutdownNotFailure(t *testing.T) {
-	buf := captureLogs(t, slog.LevelInfo)
+	rec := capture.Default(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -140,12 +141,11 @@ func TestRunJob_parentCancellationLogsShutdownNotFailure(t *testing.T) {
 	if res.success {
 		t.Errorf("runJob success = true, want false when parent context cancelled")
 	}
-	logs := buf.String()
-	if !strings.Contains(logs, "sync interrupted by shutdown") {
-		t.Errorf("runJob log = %q, want to contain 'sync interrupted by shutdown'", logs)
+	if !rec.Contains("sync interrupted by shutdown") {
+		t.Errorf("runJob logs = %q, want to contain 'sync interrupted by shutdown'", rec.Messages())
 	}
-	if strings.Contains(logs, "level=ERROR") {
-		t.Errorf("runJob log = %q, want no ERROR-level line on graceful shutdown", logs)
+	if got := rec.CountLevel(slog.LevelError, ""); got != 0 {
+		t.Errorf("runJob emitted %d ERROR record(s), want none on graceful shutdown; logs = %q", got, rec.Messages())
 	}
 }
 
@@ -215,18 +215,6 @@ func TestRunPass_shutdownInterruptedJobIsNotCountedAsFailure(t *testing.T) {
 	if got := r.exitStatus(); got != 0 {
 		t.Errorf("exitStatus() = %d, want 0 (interrupted-clean exits success)", got)
 	}
-}
-
-// captureLogs installs a text slog handler over a buffer for the duration of
-// the test and returns the buffer. The caller must NOT be parallel: it mutates
-// the global slog default.
-func captureLogs(t *testing.T, level slog.Level) *bytes.Buffer {
-	t.Helper()
-	var buf bytes.Buffer
-	orig := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: level})))
-	t.Cleanup(func() { slog.SetDefault(orig) })
-	return &buf
 }
 
 // TestDefaultCommandRunner_structural pins the graceful-shutdown construction

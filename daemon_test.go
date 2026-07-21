@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/cplieger/slogx/capture"
 )
 
 // TestExecutor_MarkerFollowsPassOutcome pins the health contract: the marker
@@ -145,24 +147,31 @@ func TestTick_SkipsWhenQueueRejects(t *testing.T) {
 // it swaps the global slog default and sets env.
 func TestStartTicker_FiresStartupThenInterval(t *testing.T) {
 	writeValidCfg(t, t.TempDir()) // empty source: pure-skip passes, no exec
-	buf := captureLogsSync(t, slog.LevelInfo)
+	rec := capture.Default(t)
 
 	d, cancel, execDone, _ := newTestDaemon(t, fixedRunner("true"))
 
 	tickCtx, stopTicker := context.WithCancel(context.Background())
 	tickerDone := startTicker(tickCtx, d, 15*time.Millisecond, true)
 
-	heartbeats := func() []string {
+	// heartbeatTriggers returns each heartbeat's trigger attr, in emit order.
+	heartbeatTriggers := func() []string {
 		var out []string
-		for line := range strings.SplitSeq(buf.String(), "\n") {
-			if strings.Contains(line, "sync cycle complete") {
-				out = append(out, line)
+		for _, r := range rec.Records() {
+			if r.Message != "sync cycle complete" {
+				continue
 			}
+			r.Attrs(func(a slog.Attr) bool {
+				if a.Key == "trigger" {
+					out = append(out, a.Value.String())
+				}
+				return true
+			})
 		}
 		return out
 	}
 	waitFor(t, 5*time.Second, func() bool {
-		return len(heartbeats()) >= 2
+		return len(heartbeatTriggers()) >= 2
 	}, "ticker did not fire startup + interval within 5s")
 	stopTicker()
 	<-tickerDone
@@ -170,12 +179,12 @@ func TestStartTicker_FiresStartupThenInterval(t *testing.T) {
 	d.queue.close()
 	<-execDone
 
-	lines := heartbeats()
-	if !strings.Contains(lines[0], "trigger=startup") {
-		t.Errorf("first heartbeat = %q, want trigger=startup", lines[0])
+	triggers := heartbeatTriggers()
+	if triggers[0] != "startup" {
+		t.Errorf("first heartbeat trigger = %q, want startup", triggers[0])
 	}
-	if !strings.Contains(lines[1], "trigger=interval") {
-		t.Errorf("second heartbeat = %q, want trigger=interval", lines[1])
+	if triggers[1] != "interval" {
+		t.Errorf("second heartbeat trigger = %q, want interval", triggers[1])
 	}
 }
 

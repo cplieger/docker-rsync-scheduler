@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cplieger/envx/yamlenv"
+	"github.com/cplieger/slogx/capture"
 )
 
 // writeKey creates a readable dummy private key inside a temp dir and
@@ -867,16 +868,16 @@ func TestValidate_warnsMaxDeleteWithoutDelete(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			buf := captureLogs(t, slog.LevelWarn)
+			rec := capture.Default(t)
 			j := validJob("caddy", key)
 			j.MaxDelete = tt.maxDelete
 			j.Delete = tt.delete
 			if err := (config{Jobs: []job{j}}).validate(); err != nil {
 				t.Fatalf("validate() = %v, want nil", err)
 			}
-			if got := strings.Contains(buf.String(), warning); got != tt.wantWarn {
-				t.Errorf("validate(max_delete=%v, delete=%v) warned=%v, want %v; log=%q",
-					tt.maxDelete, tt.delete, got, tt.wantWarn, buf.String())
+			if got := rec.Contains(warning); got != tt.wantWarn {
+				t.Errorf("validate(max_delete=%v, delete=%v) warned=%v, want %v; logs=%q",
+					tt.maxDelete, tt.delete, got, tt.wantWarn, rec.Messages())
 			}
 		})
 	}
@@ -898,34 +899,33 @@ func TestValidate_warnsLoneRemoteOwnership(t *testing.T) {
 		name       string
 		uid, gid   *int
 		wantWarn   bool
-		wantFields []string // structured fields the advisory must carry when it fires
+		wantFields map[string]string // structured attrs the advisory must carry when it fires
 	}{
 		{"both set is silent", new(1000), new(1000), false, nil},
-		{"uid only warns", new(1000), nil, true, []string{"remote_uid_set=true", "remote_gid_set=false"}},
-		{"gid only warns", nil, new(1000), true, []string{"remote_uid_set=false", "remote_gid_set=true"}},
+		{"uid only warns", new(1000), nil, true, map[string]string{"remote_uid_set": "true", "remote_gid_set": "false"}},
+		{"gid only warns", nil, new(1000), true, map[string]string{"remote_uid_set": "false", "remote_gid_set": "true"}},
 		{"neither set is silent", nil, nil, false, nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			buf := captureLogs(t, slog.LevelWarn)
+			rec := capture.Default(t)
 			j := validJob("caddy", key)
 			j.RemoteUID = tt.uid
 			j.RemoteGID = tt.gid
 			if err := (config{Jobs: []job{j}}).validate(); err != nil {
 				t.Fatalf("validate() = %v, want nil", err)
 			}
-			logs := buf.String()
-			if got := strings.Contains(logs, warning); got != tt.wantWarn {
-				t.Errorf("validate(uid_set=%v, gid_set=%v) warned=%v, want %v; log=%q",
-					tt.uid != nil, tt.gid != nil, got, tt.wantWarn, logs)
+			if got := rec.Contains(warning); got != tt.wantWarn {
+				t.Errorf("validate(uid_set=%v, gid_set=%v) warned=%v, want %v; logs=%q",
+					tt.uid != nil, tt.gid != nil, got, tt.wantWarn, rec.Messages())
 			}
 			// When the advisory fires it must report WHICH side is set, so an
 			// operator can tell which field to add. Expected values are fixed
 			// literals (not derived from the inputs) to keep the check honest.
-			for _, f := range tt.wantFields {
-				if !strings.Contains(logs, f) {
-					t.Errorf("validate(uid_set=%v, gid_set=%v) log = %q, want field %q",
-						tt.uid != nil, tt.gid != nil, logs, f)
+			for k, v := range tt.wantFields {
+				if !rec.HasAttr(warning, k, v) {
+					t.Errorf("validate(uid_set=%v, gid_set=%v) advisory missing attr %s=%s",
+						tt.uid != nil, tt.gid != nil, k, v)
 				}
 			}
 		})

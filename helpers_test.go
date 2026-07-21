@@ -1,15 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"log/slog"
 	"net"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -17,37 +14,10 @@ import (
 	"github.com/cplieger/scheduler/v2"
 )
 
-// syncBuffer is a mutex-guarded bytes.Buffer for tests that read captured
-// logs while another goroutine (the daemon executor) is still writing them.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
-// captureLogsSync installs a text slog handler over a goroutine-safe buffer
-// for the duration of the test. The caller must NOT be parallel: it mutates
-// the global slog default. Use this (not captureLogs) whenever the logs are
-// polled while a daemon goroutine is running.
-func captureLogsSync(t *testing.T, level slog.Level) *syncBuffer {
-	t.Helper()
-	buf := &syncBuffer{}
-	orig := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: level})))
-	t.Cleanup(func() { slog.SetDefault(orig) })
-	return buf
-}
+// Log capture goes through slogx/capture (capture.Default(t)): the Recorder
+// is concurrency-safe, so it also covers the tests that poll logs while a
+// daemon goroutine is still writing them. Tests using it must NOT be
+// parallel: it swaps the global slog default.
 
 // fixedRunner returns a CommandRunner whose child is the given binary
 // regardless of the requested rsync args — the standard fake for pass-level
