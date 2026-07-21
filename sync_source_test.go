@@ -4,8 +4,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
+
+	"github.com/cplieger/slogx/capture"
 )
 
 func TestSourceIsEmpty(t *testing.T) {
@@ -82,7 +83,7 @@ func TestSourceIsEmpty_onlyGloballyExcludedEntriesIsEmpty(t *testing.T) {
 // masked as a benign empty source. Asserting the WARN is what distinguishes
 // this arm from the silent missing-dir case.
 func TestSourceIsEmpty_unreadableDirSurfacesWarnAndSkips(t *testing.T) {
-	buf := captureLogs(t, slog.LevelWarn)
+	rec := capture.Default(t)
 
 	path := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
@@ -94,8 +95,8 @@ func TestSourceIsEmpty_unreadableDirSurfacesWarnAndSkips(t *testing.T) {
 	if !got {
 		t.Errorf("sourceIsEmpty(regular file) = false, want true (skip to protect remote)")
 	}
-	if !strings.Contains(buf.String(), "source unreadable") {
-		t.Errorf("sourceIsEmpty(regular file) log = %q, want a 'source unreadable' WARN", buf.String())
+	if rec.CountLevel(slog.LevelWarn, "source unreadable") == 0 {
+		t.Errorf("sourceIsEmpty(regular file) logs = %q, want a 'source unreadable' WARN", rec.Messages())
 	}
 }
 
@@ -106,7 +107,7 @@ func TestSourceIsEmpty_unreadableDirSurfacesWarnAndSkips(t *testing.T) {
 // dir). The expected missing-dir (ENOENT) case stays silent; this asserts the
 // non-silent arm so the two are not collapsed.
 func TestSourceIsEmpty_openErrorSurfacesWarnAndSkips(t *testing.T) {
-	buf := captureLogs(t, slog.LevelWarn)
+	rec := capture.Default(t)
 
 	parent := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(parent, []byte("x"), 0o600); err != nil {
@@ -119,7 +120,7 @@ func TestSourceIsEmpty_openErrorSurfacesWarnAndSkips(t *testing.T) {
 	if !got {
 		t.Errorf("sourceIsEmpty(path under a file) = false, want true (skip to protect remote)")
 	}
-	if !strings.Contains(buf.String(), "source unreadable") {
-		t.Errorf("sourceIsEmpty(path under a file) log = %q, want a 'source unreadable' WARN", buf.String())
+	if rec.CountLevel(slog.LevelWarn, "source unreadable") == 0 {
+		t.Errorf("sourceIsEmpty(path under a file) logs = %q, want a 'source unreadable' WARN", rec.Messages())
 	}
 }
