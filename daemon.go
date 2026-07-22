@@ -10,6 +10,7 @@ import (
 
 	"github.com/cplieger/health"
 	"github.com/cplieger/scheduler/v2"
+	"github.com/cplieger/scheduler/v2/trigger"
 )
 
 // --- Daemon: the single owner of sync execution ---
@@ -22,11 +23,28 @@ import (
 // context so rsync drains under the existing SIGTERM-then-grace machinery,
 // and every pass's log lines land on the container log stream because the
 // pass executes in the daemon — in external mode too, which the previous
-// exec-child design could not offer.
+// exec-child design could not offer. The broker itself — bounded FIFO queue,
+// socket server, wire protocol — is the scheduler library's trigger
+// subpackage; this file owns the policy (what a pass does, health mapping,
+// drain-versus-cancel, log wording).
+
+// queueCapacity bounds pending requests in the trigger broker's FIFO. The
+// realistic trigger set is one periodic job (Ofelia) plus a manual exec, so
+// 16 is generous headroom; a client hitting a full queue is rejected
+// immediately with a clear reason (honest backpressure) rather than queued
+// unboundedly.
+const queueCapacity = 16
+
+// newRequest builds one queued pass request for the given trigger label
+// (startup, interval, external). A sync pass takes no arguments — the job
+// set comes from the daemon's mounted YAML config — so the payload is empty.
+func newRequest(trig string) *trigger.Job[struct{}] {
+	return trigger.NewJob(trig, struct{}{})
+}
 
 // daemon carries the executor's dependencies.
 type daemon struct {
-	queue *runQueue
+	queue *trigger.Queue[struct{}]
 	// hc is the single writer of the health marker; every pass outcome
 	// funnels through it (drain latch, interrupted-clean carve-out).
 	hc      *healthController
@@ -57,7 +75,7 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	ln, err := listenTrigger(socketPath)
+	ln, err := trigger.Listen(socketPath)
 	if err != nil {
 		slog.Error("cannot bind trigger socket", "path", socketPath, "error", err)
 		return err
@@ -73,7 +91,7 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 	hc.markInitial(!cfg.ScheduleEnabled)
 
 	d := &daemon{
-		queue:   newRunQueue(queueCapacity),
+		queue:   trigger.NewQueue[struct{}](queueCapacity),
 		hc:      hc,
 		newCmd:  newCmd,
 		timeout: timeout,
@@ -85,8 +103,15 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 		d.runPasses(ctx)
 	}()
 
-	srv := &triggerServer{queue: d.queue}
-	go srv.serve(ln)
+	// The broker owns the wire (decode, event relay, handler draining); the
+	// hook only supplies this app's acceptance log line. The library's
+	// default rejection warn ("trigger request rejected" + reason) already
+	// matches this app's wording, so no OnRejected hook is needed.
+	srv := &trigger.Server[struct{}]{
+		Queue:      d.queue,
+		OnAccepted: func(struct{}) { slog.Info("triggered sync queued") },
+	}
+	srv.Serve(ln)
 
 	tickerDone := startTicker(ctx, d, cfg.Interval, cfg.ScheduleEnabled)
 
@@ -108,13 +133,13 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 	// Stop admission (socket + queue), then wait: the executor delivers the
 	// interrupted in-flight pass's result and cancellation results to
 	// everything still queued; the ticker returns once its waiting tick
-	// request resolves; the handlers return once every accepted request has
+	// request resolves; the server returns once every accepted request has
 	// its final event on the wire.
 	_ = ln.Close()
-	d.queue.close()
+	d.queue.Close()
 	<-executorDone
 	<-tickerDone
-	srv.handlers.Wait()
+	srv.Wait()
 	slog.Info("shutdown complete")
 	return nil
 }
@@ -135,11 +160,11 @@ func startTicker(ctx context.Context, d *daemon, interval time.Duration, enabled
 		defer close(done)
 		startupDone := false
 		scheduler.RunLoop(ctx, func(context.Context) {
-			trigger := "interval"
+			trig := "interval"
 			if !startupDone {
-				trigger, startupDone = "startup", true
+				trig, startupDone = "startup", true
 			}
-			d.tick(trigger)
+			d.tick(trig)
 		}, scheduler.LoopOptions{Interval: interval, FireOnStart: true})
 	}()
 	return done
@@ -151,13 +176,13 @@ func startTicker(ctx context.Context, d *daemon, interval time.Duration, enabled
 // wait always resolves). A rejected submission — the queue full of external
 // requests, or shutdown racing the tick — is logged and skipped: the next
 // interval provides freshness.
-func (d *daemon) tick(trigger string) {
-	r := newRequest(trigger)
-	if err := d.queue.submit(r); err != nil {
-		slog.Warn("scheduled sync skipped", "trigger", trigger, "reason", err)
+func (d *daemon) tick(trig string) {
+	r := newRequest(trig)
+	if err := d.queue.Submit(r); err != nil {
+		slog.Warn("scheduled sync skipped", "trigger", trig, "reason", err)
 		return
 	}
-	<-r.result
+	<-r.Result()
 }
 
 // runPasses is the executor: the only code that runs a sync pass. It serves
@@ -166,9 +191,9 @@ func (d *daemon) tick(trigger string) {
 // explicit not-ok results with a reason — instead of run, so a stop request
 // is never followed by a fresh pass.
 func (d *daemon) runPasses(ctx context.Context) {
-	for r := range d.queue.requests {
+	for r := range d.queue.Jobs() {
 		if ctx.Err() != nil {
-			r.finish(runOutcome{ok: false, reason: "cancelled: scheduler shutting down"})
+			r.Finish(trigger.Outcome{OK: false, Reason: "cancelled: scheduler shutting down"})
 			continue
 		}
 		d.execute(ctx, r)
@@ -188,19 +213,19 @@ func (d *daemon) runPasses(ctx context.Context) {
 // and the interrupted-clean machinery in passResult keeps that drain from
 // registering as a failure — the same drain semantics the pre-rewrite design
 // pinned in its tests.
-func (d *daemon) execute(ctx context.Context, r *request) {
-	close(r.started)
+func (d *daemon) execute(ctx context.Context, r *trigger.Job[struct{}]) {
+	r.Start()
 	start := time.Now()
 
 	cfg, err := loadConfig()
 	if err != nil {
 		d.hc.markUnhealthy()
-		r.finish(runOutcome{ok: false, duration: time.Since(start), reason: "config reload failed"})
+		r.Finish(trigger.Outcome{OK: false, Duration: time.Since(start), Reason: "config reload failed"})
 		return
 	}
 
-	res := runPass(ctx, cfg, d.timeout, r.trigger, d.newCmd)
+	res := runPass(ctx, cfg, d.timeout, r.Trigger, d.newCmd)
 	reportPass(&res)
 	d.hc.apply(&res)
-	r.finish(runOutcome{ok: res.exitStatus() == 0, duration: res.duration})
+	r.Finish(trigger.Outcome{OK: res.exitStatus() == 0, Duration: res.duration})
 }

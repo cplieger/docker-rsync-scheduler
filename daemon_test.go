@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cplieger/scheduler/v2/trigger"
 	"github.com/cplieger/slogx/capture"
 )
 
@@ -24,7 +25,7 @@ func TestExecutor_MarkerFollowsPassOutcome(t *testing.T) {
 	writeValidCfg(t, newRunJobSource(t)) // non-empty source: the runner executes
 	d, _, _, markerPath := newTestDaemon(t, fixedRunner("true"))
 
-	if out := submitWait(t, d, newRequest("external")); !out.ok {
+	if out := submitWait(t, d, newRequest("external")); !out.OK {
 		t.Fatal("clean pass reported ok=false")
 	}
 	if _, err := os.Stat(markerPath); err != nil {
@@ -32,7 +33,7 @@ func TestExecutor_MarkerFollowsPassOutcome(t *testing.T) {
 	}
 
 	d.newCmd = fixedRunner("false")
-	if out := submitWait(t, d, newRequest("external")); out.ok {
+	if out := submitWait(t, d, newRequest("external")); out.OK {
 		t.Fatal("failed pass reported ok=true")
 	}
 	if _, err := os.Stat(markerPath); !errors.Is(err, fs.ErrNotExist) {
@@ -58,10 +59,10 @@ func TestExecutor_ConfigReloadFailureFailsRequestAndMarker(t *testing.T) {
 	t.Setenv("CONFIG_PATH", filepath.Join(t.TempDir(), "absent.yaml"))
 
 	out := submitWait(t, d, newRequest("external"))
-	if out.ok {
+	if out.OK {
 		t.Error("outcome ok=true with an unreadable config, want false")
 	}
-	if out.reason == "" {
+	if out.Reason == "" {
 		t.Error("outcome carries no reason; the client would report a bare failure")
 	}
 	if invoked {
@@ -91,35 +92,35 @@ func TestExecutor_ShutdownCancelsQueuedButResolvesInFlight(t *testing.T) {
 	d, cancel, _, _ := newTestDaemon(t, runner)
 
 	inflight := newRequest("external")
-	if err := d.queue.submit(inflight); err != nil {
-		t.Fatalf("submit(inflight) = %v", err)
+	if err := d.queue.Submit(inflight); err != nil {
+		t.Fatalf("Submit(inflight) = %v", err)
 	}
 	<-entered // the pass is now executing
 
 	queued := newRequest("external")
-	if err := d.queue.submit(queued); err != nil {
-		t.Fatalf("submit(queued) = %v", err)
+	if err := d.queue.Submit(queued); err != nil {
+		t.Fatalf("Submit(queued) = %v", err)
 	}
 
 	cancel()        // SIGTERM lands mid-pass
-	d.queue.close() // daemon stops admission
+	d.queue.Close() // daemon stops admission
 	close(proceed)  // the in-flight child starts under the cancelled ctx and is reaped
 
 	select {
-	case out := <-inflight.result:
-		if !out.ok {
+	case out := <-inflight.Result():
+		if !out.OK {
 			t.Errorf("in-flight pass outcome ok=false, want true (interrupted-clean drains as success)")
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("in-flight result not delivered")
 	}
 	select {
-	case out := <-queued.result:
-		if out.ok {
+	case out := <-queued.Result():
+		if out.OK {
 			t.Error("queued request outcome ok=true after shutdown, want cancelled")
 		}
-		if !strings.Contains(out.reason, "shutting down") {
-			t.Errorf("cancellation reason = %q, want a shutting-down explanation", out.reason)
+		if !strings.Contains(out.Reason, "shutting down") {
+			t.Errorf("cancellation reason = %q, want a shutting-down explanation", out.Reason)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("queued request's cancellation result not delivered")
@@ -131,7 +132,7 @@ func TestExecutor_ShutdownCancelsQueuedButResolvesInFlight(t *testing.T) {
 // block; the next interval provides freshness.
 func TestTick_SkipsWhenQueueRejects(t *testing.T) {
 	t.Parallel()
-	d := &daemon{queue: newRunQueue(0)} // zero capacity: every submit is rejected
+	d := &daemon{queue: trigger.NewQueue[struct{}](0)} // zero capacity: every submit is rejected
 	done := make(chan struct{})
 	go func() { defer close(done); d.tick("interval") }()
 	select {
@@ -176,7 +177,7 @@ func TestStartTicker_FiresStartupThenInterval(t *testing.T) {
 	stopTicker()
 	<-tickerDone
 	cancel()
-	d.queue.close()
+	d.queue.Close()
 	<-execDone
 
 	triggers := heartbeatTriggers()
@@ -192,7 +193,7 @@ func TestStartTicker_FiresStartupThenInterval(t *testing.T) {
 // ticker: the returned channel is already closed and nothing is submitted.
 func TestStartTicker_DisabledInExternalMode(t *testing.T) {
 	t.Parallel()
-	d := &daemon{queue: newRunQueue(4)}
+	d := &daemon{queue: trigger.NewQueue[struct{}](4)}
 	done := startTicker(context.Background(), d, time.Millisecond, false)
 	select {
 	case <-done:
@@ -200,7 +201,7 @@ func TestStartTicker_DisabledInExternalMode(t *testing.T) {
 		t.Fatal("startTicker(enabled=false) did not return a closed channel")
 	}
 	time.Sleep(20 * time.Millisecond) // would be several intervals if a loop were running
-	if n := len(d.queue.requests); n != 0 {
+	if n := len(d.queue.Jobs()); n != 0 {
 		t.Errorf("%d requests submitted in external mode, want 0", n)
 	}
 }
