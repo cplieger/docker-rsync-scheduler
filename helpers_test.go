@@ -51,7 +51,7 @@ func newTestDaemon(t *testing.T, runner scheduler.CommandRunner) (d *daemon, can
 	executorDone := make(chan struct{})
 	go func() {
 		defer close(executorDone)
-		d.runPasses(ctx)
+		trigger.Execute(ctx, d.queue, d.run)
 	}()
 	t.Cleanup(func() {
 		cancelCtx()
@@ -92,7 +92,7 @@ func startTestServer(t *testing.T, runner scheduler.CommandRunner) (sock string,
 		timeout: time.Minute,
 	}
 	execDone := make(chan struct{})
-	go func() { defer close(execDone); d.runPasses(ctx) }()
+	go func() { defer close(execDone); trigger.Execute(ctx, d.queue, d.run) }()
 
 	ln, err := trigger.Listen(sock)
 	if err != nil {
