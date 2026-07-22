@@ -16,3 +16,5 @@ require (
 	github.com/cplieger/scheduler/v2 v2.0.0
 	pgregory.net/rapid v1.3.0 // test-only
 )
+
+replace github.com/cplieger/scheduler/v2 => ../scheduler

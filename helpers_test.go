@@ -6,12 +6,12 @@ import (
 	"net"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/cplieger/health"
 	"github.com/cplieger/scheduler/v2"
+	"github.com/cplieger/scheduler/v2/trigger"
 )
 
 // Log capture goes through slogx/capture (capture.Default(t)): the Recorder
@@ -43,7 +43,7 @@ func newTestDaemon(t *testing.T, runner scheduler.CommandRunner) (d *daemon, can
 	ctx, cancelCtx := context.WithCancel(context.Background())
 	markerPath = filepath.Join(t.TempDir(), "marker")
 	d = &daemon{
-		queue:   newRunQueue(queueCapacity),
+		queue:   trigger.NewQueue[struct{}](queueCapacity),
 		hc:      newHealthController(health.NewMarker(markerPath)),
 		newCmd:  runner,
 		timeout: time.Minute,
@@ -55,24 +55,24 @@ func newTestDaemon(t *testing.T, runner scheduler.CommandRunner) (d *daemon, can
 	}()
 	t.Cleanup(func() {
 		cancelCtx()
-		d.queue.close()
+		d.queue.Close()
 		<-executorDone
 	})
 	return d, cancelCtx, executorDone, markerPath
 }
 
 // submitWait submits a request and returns its outcome.
-func submitWait(t *testing.T, d *daemon, r *request) runOutcome {
+func submitWait(t *testing.T, d *daemon, r *trigger.Job[struct{}]) trigger.Outcome {
 	t.Helper()
-	if err := d.queue.submit(r); err != nil {
-		t.Fatalf("submit() = %v, want nil", err)
+	if err := d.queue.Submit(r); err != nil {
+		t.Fatalf("Submit() = %v, want nil", err)
 	}
 	select {
-	case out := <-r.result:
+	case out := <-r.Result():
 		return out
 	case <-time.After(5 * time.Second):
 		t.Fatal("request result not delivered within 5s")
-		return runOutcome{}
+		return trigger.Outcome{}
 	}
 }
 
@@ -86,7 +86,7 @@ func startTestServer(t *testing.T, runner scheduler.CommandRunner) (sock string,
 
 	ctx, cancel := context.WithCancel(context.Background())
 	d = &daemon{
-		queue:   newRunQueue(queueCapacity),
+		queue:   trigger.NewQueue[struct{}](queueCapacity),
 		hc:      newHealthController(health.NewMarker(filepath.Join(t.TempDir(), "marker"))),
 		newCmd:  runner,
 		timeout: time.Minute,
@@ -94,25 +94,25 @@ func startTestServer(t *testing.T, runner scheduler.CommandRunner) (sock string,
 	execDone := make(chan struct{})
 	go func() { defer close(execDone); d.runPasses(ctx) }()
 
-	ln, err := listenTrigger(sock)
+	ln, err := trigger.Listen(sock)
 	if err != nil {
-		t.Fatalf("listenTrigger() = %v", err)
+		t.Fatalf("trigger.Listen() = %v", err)
 	}
-	srv := &triggerServer{queue: d.queue}
-	go srv.serve(ln)
+	srv := &trigger.Server[struct{}]{Queue: d.queue}
+	srv.Serve(ln)
 
 	t.Cleanup(func() {
 		_ = ln.Close()
 		cancel()
-		d.queue.close()
+		d.queue.Close()
 		<-execDone
-		srv.handlers.Wait()
+		srv.Wait()
 	})
 	return sock, d
 }
 
-// rawRequest dials the socket, sends a request, and returns the decoder over
-// the event stream plus the connection for cleanup.
+// rawRequest dials the socket, sends a request (the empty `{}` frame), and
+// returns the decoder over the event stream plus the connection for cleanup.
 func rawRequest(t *testing.T, sock string) (*json.Decoder, net.Conn) {
 	t.Helper()
 	conn, err := net.DialTimeout("unix", sock, time.Second)
@@ -120,16 +120,16 @@ func rawRequest(t *testing.T, sock string) (*json.Decoder, net.Conn) {
 		t.Fatalf("dial: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	if err := json.NewEncoder(conn).Encode(wireRequest{}); err != nil {
+	if err := json.NewEncoder(conn).Encode(struct{}{}); err != nil {
 		t.Fatalf("send request: %v", err)
 	}
 	return json.NewDecoder(conn), conn
 }
 
 // nextEvent decodes one event with a test deadline.
-func nextEvent(t *testing.T, dec *json.Decoder) wireEvent {
+func nextEvent(t *testing.T, dec *json.Decoder) trigger.Event {
 	t.Helper()
-	var ev wireEvent
+	var ev trigger.Event
 	done := make(chan error, 1)
 	go func() { done <- dec.Decode(&ev) }()
 	select {
@@ -140,39 +140,6 @@ func nextEvent(t *testing.T, dec *json.Decoder) wireEvent {
 		return ev
 	case <-time.After(5 * time.Second):
 		t.Fatal("no event within 5s")
-		return wireEvent{}
-	}
-}
-
-// TestWireEvent_OKIsExplicitOnTheWire pins the protocol regression guard: a
-// done event always carries "ok" (a failed pass must be explicit, not an
-// omitted field a lenient decoder defaults).
-func TestWireEvent_OKIsExplicitOnTheWire(t *testing.T) {
-	t.Parallel()
-	for _, ok := range []bool{true, false} {
-		raw, err := json.Marshal(wireEvent{Event: eventDone, OK: ok})
-		if err != nil {
-			t.Fatalf("marshal: %v", err)
-		}
-		if !strings.Contains(string(raw), `"ok":`) {
-			t.Errorf("wire form %s omits the ok field (ok=%v), want it explicit", raw, ok)
-		}
-	}
-}
-
-// TestWireEvent_RoundTrip pins event symmetry through JSON.
-func TestWireEvent_RoundTrip(t *testing.T) {
-	t.Parallel()
-	ev := wireEvent{Event: eventDone, Reason: "r", DurationMs: 42, OK: true}
-	raw, err := json.Marshal(ev)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	var got wireEvent
-	if err := json.Unmarshal(raw, &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if got != ev {
-		t.Errorf("round trip = %+v, want %+v", got, ev)
+		return trigger.Event{}
 	}
 }
