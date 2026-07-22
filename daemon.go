@@ -100,7 +100,7 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 	executorDone := make(chan struct{})
 	go func() {
 		defer close(executorDone)
-		d.runPasses(ctx)
+		trigger.Execute(ctx, d.queue, d.run)
 	}()
 
 	// The broker owns the wire (decode, event relay, handler draining); the
@@ -185,47 +185,34 @@ func (d *daemon) tick(trig string) {
 	<-r.Result()
 }
 
-// runPasses is the executor: the only code that runs a sync pass. It serves
-// the queue strictly in order until the queue is closed and drained. Once
-// shutdown is signalled, remaining requests are cancelled — delivered as
-// explicit not-ok results with a reason — instead of run, so a stop request
-// is never followed by a fresh pass.
-func (d *daemon) runPasses(ctx context.Context) {
-	for r := range d.queue.Jobs() {
-		if ctx.Err() != nil {
-			r.Finish(trigger.Outcome{OK: false, Reason: "cancelled: scheduler shutting down"})
-			continue
-		}
-		d.execute(ctx, r)
-	}
-}
-
-// execute performs one request: signal the waiter, reload the config (the
-// old external `sync` process re-read it on every trigger, so a config edit
-// takes effect on the next pass without a restart — per-pass reload keeps
-// that contract in both modes, and a config mount that degrades after boot
-// fails the pass loudly instead of syncing from a stale snapshot), run the
-// pass, route the outcome through the reporter and the health controller,
-// and deliver the result.
+// run performs one request: reload the config (the old external `sync`
+// process re-read it on every trigger, so a config edit takes effect on the
+// next pass without a restart — per-pass reload keeps that contract in both
+// modes, and a config mount that degrades after boot fails the pass loudly
+// instead of syncing from a stale snapshot), run the pass, route the outcome
+// through the reporter and the health controller, and return the result. The
+// job lifecycle around it belongs to trigger.Execute — the daemon's single
+// executor loop — which checks the shutdown ctx before each start (queued
+// requests behind a stop are cancelled with an explicit result, never run)
+// and guarantees exactly one delivered result per accepted request, even if
+// this callback panics.
 //
 // The pass runs under the shutdown-cancellable ctx on purpose: SIGTERM
 // interrupts an in-flight rsync (SIGTERM-then-grace via the command runner),
 // and the interrupted-clean machinery in passResult keeps that drain from
 // registering as a failure — the same drain semantics the pre-rewrite design
 // pinned in its tests.
-func (d *daemon) execute(ctx context.Context, r *trigger.Job[struct{}]) {
-	r.Start()
+func (d *daemon) run(ctx context.Context, trig string, _ struct{}) trigger.Outcome {
 	start := time.Now()
 
 	cfg, err := loadConfig()
 	if err != nil {
 		d.hc.markUnhealthy()
-		r.Finish(trigger.Outcome{OK: false, Duration: time.Since(start), Reason: "config reload failed"})
-		return
+		return trigger.Outcome{OK: false, Duration: time.Since(start), Reason: "config reload failed"}
 	}
 
-	res := runPass(ctx, cfg, d.timeout, r.Trigger, d.newCmd)
+	res := runPass(ctx, cfg, d.timeout, trig, d.newCmd)
 	reportPass(&res)
 	d.hc.apply(&res)
-	r.Finish(trigger.Outcome{OK: res.exitStatus() == 0, Duration: res.duration})
+	return trigger.Outcome{OK: res.exitStatus() == 0, Duration: res.duration}
 }
