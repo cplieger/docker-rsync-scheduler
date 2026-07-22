@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/cplieger/health"
-	"github.com/cplieger/scheduler/v2"
-	"github.com/cplieger/scheduler/v2/trigger"
+	"github.com/cplieger/scheduler/v3"
+	"github.com/cplieger/scheduler/v3/trigger"
 )
 
 // Log capture goes through slogx/capture (capture.Default(t)): the Recorder
