@@ -100,6 +100,38 @@ RUN wget -q --tries=3 --timeout=30 \
     && install -D -m 755 rsync /out/usr/bin/rsync
 
 # ---------------------------------------------------------------------------
+# Embedded SBOM fragment. Syft inventories the final image from Alpine's APK
+# database and Go buildinfo, so the source-built rsync is invisible to the
+# signed release SBOM and to vulnerability scanners (the Go wrapper binary IS
+# visible via buildinfo — rsync is the only blind spot). Generate a CycloneDX
+# fragment from the same Renovate-tracked version ARG the build uses — a
+# Renovate bump keeps the SBOM correct with zero extra maintenance — and ship
+# it in the runtime image where the central sbom-cataloger (enabled fleet-wide
+# by the cplieger/ci release pipeline; no per-repo .syft.yaml) picks up
+# *.cdx.json files. The purl records provenance (the upstream dist tarball
+# URL the build fetches above); the CPE uses NVD's canonical vendor:product
+# for rsync (samba:rsync, per the NVD CPE dictionary and e.g. CVE-2024-12084's
+# applicability configuration).
+# ---------------------------------------------------------------------------
+RUN cat > /out/rsync-scheduler.cdx.json <<EOF
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "version": 1,
+  "components": [
+    {
+      "bom-ref": "pkg:generic/rsync@${RSYNC_VERSION#v}?download_url=https://download.samba.org/pub/rsync/rsync-${RSYNC_VERSION#v}.tar.gz",
+      "type": "application",
+      "name": "rsync",
+      "version": "${RSYNC_VERSION#v}",
+      "purl": "pkg:generic/rsync@${RSYNC_VERSION#v}?download_url=https://download.samba.org/pub/rsync/rsync-${RSYNC_VERSION#v}.tar.gz",
+      "cpe": "cpe:2.3:a:samba:rsync:${RSYNC_VERSION#v}:*:*:*:*:*:*:*"
+    }
+  ]
+}
+EOF
+
+# ---------------------------------------------------------------------------
 # Runtime stage - same digest-pinned base as before the source-build
 # conversion; only how rsync is obtained changed (COPY from the builder
 # instead of installing the Alpine package).
@@ -131,6 +163,11 @@ RUN apk upgrade --no-cache \
         zstd-libs
 
 COPY --chmod=755 --from=rsync-builder /out/usr/bin/rsync /usr/bin/rsync
+# CycloneDX SBOM fragment for the source-built rsync (generated in the builder
+# stage from the Renovate-tracked version ARG). Placed where the release
+# pipeline's sbom-cataloger inventories *.cdx.json, so SBOMs and scanners see
+# rsync alongside the APK packages and the Go buildinfo.
+COPY --from=rsync-builder /out/rsync-scheduler.cdx.json /usr/share/sbom/rsync-scheduler.cdx.json
 COPY --chmod=755 --from=go-builder /docker-rsync-scheduler /usr/local/bin/docker-rsync-scheduler
 
 # ---------------------------------------------------------------------------

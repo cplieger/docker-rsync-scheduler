@@ -9,7 +9,9 @@
 # version line is asserted against the pinned upstream release, and the
 # feature set is asserted to keep parity with the Alpine package the source
 # build replaced. The ssh transport (openssh-client, deliberately still an
-# apk package) is asserted present alongside.
+# apk package) is asserted present alongside, as is the embedded CycloneDX
+# SBOM fragment that keeps the source-built rsync visible to the signed
+# release SBOM.
 #
 # Run locally:  sh tests/smoke.sh   (needs rsync + ssh on PATH)
 set -eu
@@ -75,7 +77,39 @@ if ! command -v ssh >/dev/null 2>&1; then
   fail=1
 fi
 
-# 5. --stats label contract: the Go scheduler's parseStats (sync.go) matches
+# 5. Embedded SBOM fragment (Dockerfile rsync-builder stage): the CycloneDX
+#    file covering the source-built rsync must ship in the image, be
+#    JSON-shaped, and name rsync at exactly the pinned version (the release
+#    pipeline's sbom-cataloger inventories it — without it the source-built
+#    rsync is invisible to the signed release SBOM). Gated on
+#    RSYNC_EXPECTED_VERSION like section 2: set in-image by the test stage
+#    (:?-guarded, never skipped there), unset on a plain local run where
+#    /usr/share/sbom does not exist. BusyBox has no jq, so assert shape with
+#    head/tail/grep: non-empty, starts with { and ends with }.
+if [ -n "${RSYNC_EXPECTED_VERSION:-}" ]; then
+  SBOM=/usr/share/sbom/rsync-scheduler.cdx.json
+  expected=${RSYNC_EXPECTED_VERSION#v}
+  if [ ! -s "$SBOM" ]; then
+    err "FAIL: embedded SBOM fragment missing or empty: $SBOM"
+    fail=1
+  else
+    if [ "$(head -c 1 "$SBOM")" != "{" ] || [ "$(tail -c 2 "$SBOM")" != "}" ]; then
+      err "FAIL: embedded SBOM fragment is not a JSON object (bad first/last byte)"
+      fail=1
+    fi
+    grep -q '"name": "rsync"' "$SBOM" || {
+      err "FAIL: embedded SBOM fragment missing component: rsync"
+      fail=1
+    }
+    grep -q "\"version\": \"$expected\"" "$SBOM" || {
+      err "FAIL: embedded SBOM fragment does not carry the pinned rsync version $expected"
+      err "$(cat "$SBOM")"
+      fail=1
+    }
+  fi
+fi
+
+# 6. --stats label contract: the Go scheduler's parseStats (sync.go) matches
 #    "Number of regular files transferred:" and the transferred-size labels in
 #    rsync --stats output. Older rsyncs used a different label ("Number of
 #    files transferred:"), and a future major could rename again — which would
