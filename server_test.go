@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	"github.com/cplieger/scheduler/v2/trigger"
+	"github.com/cplieger/scheduler/v3/trigger"
 )
 
 // The broker mechanics (queue semantics, socket hygiene, wire ordering,

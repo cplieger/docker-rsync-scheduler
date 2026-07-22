@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cplieger/scheduler/v2"
+	"github.com/cplieger/scheduler/v3"
 )
 
 // --- rsync engine ---

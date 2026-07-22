@@ -4,7 +4,7 @@ import (
 	"errors"
 	"log/slog"
 
-	"github.com/cplieger/scheduler/v2/trigger"
+	"github.com/cplieger/scheduler/v3/trigger"
 )
 
 // --- `sync` subcommand: the trigger client ---

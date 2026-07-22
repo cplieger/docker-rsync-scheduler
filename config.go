@@ -14,7 +14,7 @@ import (
 
 	"github.com/cplieger/envx"
 	"github.com/cplieger/envx/yamlenv"
-	"github.com/cplieger/scheduler/v2"
+	"github.com/cplieger/scheduler/v3"
 	"github.com/cplieger/slogx"
 	"go.yaml.in/yaml/v3"
 )
