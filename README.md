@@ -9,31 +9,22 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/docker-rsync-scheduler/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/docker-rsync-scheduler)
 [![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/docker-rsync-scheduler/releases)
 
-Push local directories to a remote host over rsync-and-ssh on a schedule — structured logs, no metrics, no open ports.
+Push local directories to a remote host over rsync-and-ssh on a schedule. Structured logs, no metrics, no open ports.
 
 ## What it does
 
-Reads a YAML config defining _N_ sync jobs. For each job it runs `rsync` over `ssh` to push a local directory one-way to a remote host. Every pass executes inside the long-lived daemon (PID 1) regardless of how it was triggered, so its structured `slog` lines (logfmt, UTC timestamps) always land on the container's log stream for collection by a log aggregator (Alloy, Promtail) and alerting via Grafana or similar; an external `sync` trigger is a thin client that submits a request to the daemon and exits with the pass result.
+Reads a YAML config defining _N_ sync jobs. For each job it runs `rsync` over `ssh` to push a local directory one-way to a remote host. Every pass executes inside the long-lived daemon regardless of how it was triggered, so its structured logs (logfmt, UTC timestamps) always land on the container's log stream, ready for a log aggregator (Alloy, Promtail) and alerting.
 
 - One-way mirror of each configured local directory to a `[user@]host:/path`
 - Per-job `--delete`, `--chown=uid:gid`, and exclude patterns
 - Empty-source guard: a job whose top-level source directory is missing or empty is skipped, so a wholly vanished or unmounted source cannot let `--delete` wipe the matching remote tree. The guard probes the `local` dir against the built-in global excludes only (not per-job `excludes`), so on a `delete: true` job whose own `excludes` could match every entry, set `max_delete` (rsync `--max-delete=N`) as a backstop.
 - Built-in interval scheduler, or hand scheduling to an external scheduler (cron, Ofelia, etc.) via the `sync` subcommand
-- File-marker healthcheck — unhealthy when any job fails, recovers on the next clean pass
+- File-marker healthcheck: unhealthy when any job fails, recovers on the next clean pass
 - Logs only: no Prometheus exporter, no HTTP server, no network listener (triggering uses an in-container unix socket)
-
-## Architecture
-
-- _Scheduler your way._ Ships with a self-contained Go interval scheduler (no external cron, systemd timers, or orchestrator scheduling needed), or hands the cadence to an external scheduler via the `sync` subcommand. See [Scheduling modes](#scheduling-modes).
-- _Single-owner daemon._ PID 1 owns every pass: the built-in ticker and each `sync` trigger submit requests to one bounded FIFO queue served by one executor goroutine, so two passes can never overlap and every pass's logs reach the container log stream in both modes. See [Scheduling modes](#scheduling-modes).
-- _Subcommands._ `daemon` (PID 1, the default command; dispatches built-in vs external based on `SYNC_INTERVAL`), `sync` (submits one pass to the daemon over its in-container unix socket and exits with that pass's result: 0 if all jobs succeed, 1 if any fail), and `health` (the Docker probe). Every trigger — startup, interval, external — executes the same pass function inside the daemon.
-- _No shell, validated config._ Each job runs via `exec.CommandContext` with an explicit argument slice, and every config field is validated at startup. See [Security](#security).
-- _Bounded resources._ Per-job timeout via context (default 10m, override with `SYNC_TIMEOUT`); captured rsync stderr is bounded to 1 MB so a chatty subprocess cannot OOM the container.
-- _Health._ File-marker pattern via [`github.com/cplieger/health`](https://github.com/cplieger/health) — the marker is set after each pass and probed by the `health` subcommand.
 
 ## Quick start
 
-The image is published to both GHCR (`ghcr.io/cplieger/docker-rsync-scheduler`) and Docker Hub (`cplieger/docker-rsync-scheduler`) — identical contents, use whichever you prefer.
+The image is published to both GHCR (`ghcr.io/cplieger/docker-rsync-scheduler`) and Docker Hub (`cplieger/docker-rsync-scheduler`); identical contents, use whichever you prefer.
 
 ```yaml
 services:
@@ -42,8 +33,6 @@ services:
     container_name: rsync
     restart: unless-stopped
     environment:
-      LOG_LEVEL: "info"
-      CONFIG_PATH: "/config/config.yaml"
       SYNC_INTERVAL: "6h"   # Go duration; "off" disables the built-in scheduler
       SYNC_TIMEOUT: "10m"
     volumes:
@@ -51,6 +40,13 @@ services:
       - ./id_ed25519:/keys/id_ed25519:ro
       - /srv/source/certs:/sources/certs:ro
 ```
+
+## Architecture
+
+- _Single-owner daemon._ One long-lived process executes every pass, whatever triggered it: two passes can never overlap, and every pass's logs reach the container log stream in both scheduling modes.
+- _Subcommands._ `daemon` (the default command), `sync` (submits one pass to the daemon and exits with that pass's result: 0 if all jobs succeed, 1 if any fail), and `health` (the Docker probe).
+- _No shell, validated config._ Each job runs with an explicit argument slice (no shell), and every config field is validated at startup. See [Security](#security).
+- _Bounded resources._ Per-job timeout (default 10m, override with `SYNC_TIMEOUT`); captured rsync stderr is capped at 1 MB.
 
 ## Scheduling modes
 
@@ -70,7 +66,7 @@ docker exec rsync docker-rsync-scheduler sync
 
 The `sync` command submits one pass to the daemon and waits: its exit code is non-zero on failure (or when the request is rejected or the daemon is unreachable), and the pass updates the same health marker the long-running container reports. This lets a central scheduler own the cadence.
 
-> **Observability (external mode).** The pass executes inside the daemon (PID 1), not the exec child, so the `sync cycle complete` heartbeat, `sync failed`, `skip empty source`, and per-job lines all land on the container's log stream in external mode too — every Loki rule under [Alerting](#alerting) works in both scheduling modes. The `sync` client's own output is just its lifecycle (`triggered sync accepted/started/complete` plus the result), which your scheduler's job log (for example the Ofelia job result) captures.
+> **Observability (external mode).** The pass executes inside the daemon, not the exec child, so every log line (including the `sync cycle complete` heartbeat) lands on the container's log stream in external mode too, and every Loki rule under [Alerting](#alerting) works in both scheduling modes. The `sync` client prints only its own lifecycle (`triggered sync accepted/started/complete` plus the result), which your scheduler's job log (for example the Ofelia job result) captures.
 
 Example with [Ofelia](https://github.com/mcuadros/ofelia) labels:
 
@@ -81,8 +77,6 @@ services:
     container_name: rsync
     restart: unless-stopped
     environment:
-      LOG_LEVEL: "info"
-      CONFIG_PATH: "/config/config.yaml"
       SYNC_INTERVAL: "off"   # disable built-in loop; Ofelia drives it
       SYNC_TIMEOUT: "10m"
     labels:
@@ -96,60 +90,56 @@ services:
       - /srv/source/certs:/sources/certs:ro
 ```
 
-Overlapping passes cannot happen in either mode: every trigger goes through the daemon's single executor, which runs passes strictly in order. A manual `docker exec … sync` that races a scheduled pass queues behind it and then runs as its own pass with its own result (rsync converges, so a back-to-back duplicate is a cheap delta pass); a full queue rejects the trigger immediately with a clear reason instead of queuing unboundedly. Ofelia's `no-overlap` is still recommended to avoid queuing redundant triggers.
+Overlapping passes cannot happen in either mode: the daemon runs passes strictly in order. A manual `docker exec … sync` that races a scheduled pass queues behind it and then runs as its own pass with its own result; a full queue rejects the trigger immediately with a clear reason instead of queuing unboundedly. Ofelia's `no-overlap` is still recommended to avoid queuing redundant triggers.
 
 ## Configuration reference
 
 ### Environment variables
 
-| Variable        | Description                                                                                                                                                                                                                                                                                                                                                               | Default               | Required |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- | -------- |
-| `CONFIG_PATH`   | Path to the YAML config inside the container                                                                                                                                                                                                                                                                                                                              | `/config/config.yaml` | No       |
-| `SYNC_INTERVAL` | Built-in scheduler cadence as a Go duration (e.g. `6h`, `1h`, `30m`). The first pass runs at startup; subsequent passes fire every interval thereafter. Set to `off` (or `disabled`/`0`) to disable the built-in scheduler and trigger passes externally — see [Scheduling modes](#scheduling-modes). Falls back to `6h` on an unset or unparseable (non-sentinel) value. | `6h`                  | No       |
-| `SYNC_TIMEOUT`  | Per-job rsync timeout as a Go duration (e.g. `10m`, `1h`). Falls back to the default on unset or unparseable values.                                                                                                                                                                                                                                                      | `10m`                 | No       |
-| `LOG_LEVEL`     | Log level: `debug`, `info`, `warn`, or `error`                                                                                                                                                                                                                                                                                                                            | `info`                | No       |
+| Variable | Description | Default | Required |
+| --- | --- | --- | --- |
+| `CONFIG_PATH` | Path to the YAML config inside the container | `/config/config.yaml` | No |
+| `SYNC_INTERVAL` | Built-in scheduler cadence as a Go duration (e.g. `6h`, `30m`); the first pass runs at startup. Set `off` (or `disabled`/`0`) for external triggering, see [Scheduling modes](#scheduling-modes). Falls back to `6h` on unset or unparseable (non-sentinel) values. | `6h` | No |
+| `SYNC_TIMEOUT` | Per-job rsync timeout as a Go duration (e.g. `10m`, `1h`). Falls back to the default on unset or unparseable values. | `10m` | No |
+| `LOG_LEVEL` | Log level: `debug`, `info`, `warn`, or `error` | `info` | No |
 
 ### Config schema (`config.yaml`)
 
-A ready-to-edit [`config.example.yaml`](config.example.yaml) ships in the repo — copy it to `config.yaml` and edit. The container **fails fast** with a clear error if the config is missing or invalid.
+A ready-to-edit, annotated [`config.example.yaml`](config.example.yaml) ships in the repo: copy it to `config.yaml` and edit. The container **fails fast** with a clear error if the config is missing or invalid, including unknown or misspelled keys.
 
-```yaml
-jobs:
-  - name: certs                          # required, unique, used as a log key
-    local: /sources/certs                # required, absolute path inside the container
-    remote_host: root@192.0.2.10         # required, [user@]host (DNS, IPv4, or IPv6 literal)
-    remote_path: /srv/certs              # required, absolute path on the remote
-    remote_uid: 1000                     # optional; with remote_gid -> rsync --chown=uid:gid
-    remote_gid: 1000                     # optional
-    ssh_key: /keys/id_ed25519            # required, private key path inside the container
-    delete: true                         # optional, default false -> rsync --delete when true
-    max_delete: 100                      # optional; with delete -> rsync --max-delete=N (abort if a pass would delete > N files)
-    excludes: ["**/locks", "**/*.lock", "logs"]  # optional, per-job exclude patterns
-```
+Each entry under `jobs:` takes these keys:
 
-The `remote_host` field is `[user@]host`, where `host` is a DNS hostname, an IPv4 address, or an IPv6 literal. Write IPv6 literals as the bare address (`2001:db8::1` or `user@2001:db8::1`) — the brackets rsync's `host:path` syntax needs are added for you. A host containing a colon that is not a valid IP (a trailing colon, or an incomplete address) is rejected at startup so it can't be misread as rsync's daemon-mode `::` separator. Link-local IPv6 with a zone id (`fe80::1%eth0`) is not supported; use a global or ULA address, or define an `ssh_config` `Host` alias and reference the alias name.
+| Key | Default | Description |
+| --- | --- | --- |
+| `name` | _none_ | Required, unique; used as a log key |
+| `local` | _none_ | Required; absolute source path inside the container |
+| `remote_host` | _none_ | Required; `[user@]host` (DNS name, IPv4, or IPv6 literal) |
+| `remote_path` | _none_ | Required; absolute path on the remote |
+| `ssh_key` | _none_ | Required; private key path inside the container |
+| `remote_uid` | _(unset)_ | With `remote_gid`, adds `--chown=uid:gid` |
+| `remote_gid` | _(unset)_ | With `remote_uid`, adds `--chown=uid:gid` |
+| `delete` | `false` | Adds `--delete` when `true` |
+| `max_delete` | _(unset)_ | With `delete`, adds `--max-delete=N` (abort a pass that would delete more than N files); unset leaves deletions uncapped |
+| `excludes` | _(unset)_ | Per-job rsync exclude patterns, added to the built-in globals |
 
-Every job also receives a fixed set of global excludes: `.stfolder`, `.stversions`, `.DS_Store`, `Thumbs.db`. Each job is pushed with `rsync -rlptD` (archive minus owner/group/ACL/xattr) plus `--stats`, the per-job and global excludes, and the `-e "ssh -i <key> -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10"` transport.
+Write IPv6 `remote_host` literals as the bare address (`2001:db8::1` or `user@2001:db8::1`); the brackets rsync's `host:path` syntax needs are added for you. A host containing a colon that is not a valid IP (a trailing colon, or an incomplete address) is rejected at startup so it can't be misread as rsync's daemon-mode `::` separator. Link-local IPv6 with a zone id (`fe80::1%eth0`) is not supported; use a global or ULA address, or define an `ssh_config` `Host` alias and reference the alias name.
+
+Every job also receives a fixed set of global excludes: `.stfolder`, `.stversions`, `.DS_Store`, `Thumbs.db`. Each job is pushed with `rsync -rlptD` (archive minus owner/group/ACL/xattr) plus `--stats`, the per-job and global excludes, and the `-e "ssh -i <key> -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10"` transport (strict host-key pinning replaces `accept-new` when a `known_hosts` file is mounted; see [SSH host-key verification](#ssh-host-key-verification)).
 
 ### Volumes
 
-| Mount                 | Description                                                                                                                                                                  |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/config/config.yaml` | The YAML config (mount read-only). Override the path with `CONFIG_PATH`.                                                                                                     |
+| Mount | Description |
+| --- | --- |
+| `/config/config.yaml` | The YAML config (mount read-only). Override the path with `CONFIG_PATH`. |
 | `/config/known_hosts` | Optional SSH known_hosts file (mount read-only). When present, enables strict host-key pinning instead of TOFU. See [SSH host-key verification](#ssh-host-key-verification). |
-| `/keys/<name>`        | SSH private key(s). Mount read-only; the host file must be mode `0600`.                                                                                                      |
-| (your sources)        | The `local` directories referenced by your jobs. Mount read-only.                                                                                                            |
+| `/keys/<name>` | SSH private key(s). Mount read-only; the host file must be mode `0600`. |
+| (your sources) | The `local` directories referenced by your jobs. Mount read-only. |
 
 ## Healthcheck
 
-The built-in healthcheck (`docker-rsync-scheduler health`) checks for a marker file that is set after each sync pass: healthy when the most recent pass had zero failed jobs, unhealthy when any job failed. Empty-source skips count as success. The container recovers automatically on the next clean pass — no restart required. In built-in mode it begins unhealthy, runs one pass at startup, and transitions accordingly, so size `healthcheck.start_period` for the time the initial pass may take; built-in mode also arms a freshness deadline of `2×SYNC_INTERVAL + jobs×SYNC_TIMEOUT`, so a wedged interval loop (marker present but never refreshed) eventually probes unhealthy and is restarted rather than trusted forever. In external mode the container starts healthy (idle, nothing has failed), each triggered `sync` updates the marker, and no deadline is armed (a marker between sparse triggers must not expire).
+The built-in healthcheck (`docker-rsync-scheduler health`) checks for a marker file that is set after each sync pass: healthy when the most recent pass had zero failed jobs, unhealthy when any job failed. Empty-source skips count as success. The container recovers automatically on the next clean pass, no restart required. In built-in mode it begins unhealthy and flips after the startup pass, so size `healthcheck.start_period` for the time the initial pass may take (the baked default is 120s); built-in mode also arms a freshness deadline of `2×SYNC_INTERVAL + jobs×SYNC_TIMEOUT`, so a wedged interval loop (marker present but never refreshed) eventually probes unhealthy and is restarted. In external mode the container starts healthy (idle, nothing has failed), each triggered `sync` updates the marker, and no deadline is armed (a marker between sparse triggers must not expire).
 
-> Because an empty source is skipped as a success, a job whose source silently becomes empty (for example a read-only bind mount that failed to mount and Docker materialised as an empty directory) keeps the container healthy and never logs at `level=ERROR` — it is invisible to both the error-level and heartbeat-absence alerts. Each skip emits a `level=WARN msg="skip empty source"` line and the `sync cycle complete` heartbeat carries a `skipped` count; add a Loki alert on a persistently non-zero `skipped` (or `skipped == jobs`) across several consecutive passes, or on the recurring `skip empty source` warning, to catch a vanished source before the remote mirror goes stale.
-
-```dockerfile
-HEALTHCHECK --interval=60s --timeout=5s --retries=3 --start-period=120s \
-    CMD ["/usr/local/bin/docker-rsync-scheduler", "health"]
-```
+> An empty source is skipped as a success, so a job whose source silently becomes empty (for example a read-only bind mount that failed to mount and Docker materialised as an empty directory) keeps the container healthy and never logs at `level=ERROR`; it is invisible to both the error-level and heartbeat-absence alerts. Each skip emits a `level=WARN msg="skip empty source"` line and the `sync cycle complete` heartbeat carries a `skipped` count. Alert on a persistently non-zero `skipped` (or `skipped == jobs`) across several consecutive passes, or on the recurring warning, to catch a vanished source before the remote mirror goes stale.
 
 ## Alerting
 
@@ -207,8 +197,8 @@ job's completion line), which distinguishes "the trigger stopped firing" from
 "the container died".
 
 Thresholds and the `severity` label are starting points: size the stall window
-to your pass cadence — `SYNC_INTERVAL` in built-in mode, your external
-scheduler's period otherwise (the 8h default assumes 6h) — adjust the
+to your pass cadence (`SYNC_INTERVAL` in built-in mode, your external
+scheduler's period otherwise; the 8h default assumes 6h), adjust the
 `container` selector (or `job` / `service`, depending on your log collector) to
 your deployment, and route by whatever labels your Alertmanager uses. To also
 catch a source that has silently gone empty (skipped as a success, so it never
@@ -217,7 +207,7 @@ trips the fault rule), see the `skipped` / `skip empty source` note under
 
 ## Security
 
-No network listener, no HTTP server, no exposed ports. Triggering is an in-container unix socket (`/tmp/docker-rsync-scheduler.sock`, owner-only `0600`), so trigger authority is scoped to the container's own user — the same boundary `docker exec` already enforces. The image ships `openssh-client` only — no `sshd`. Each job is executed with an explicit argument slice via `exec.CommandContext`; the `-e "ssh ..."` value is a single argument that rsync splits internally, so nothing is passed through a shell. Config is validated at startup and reloaded per pass: required fields present, names unique, `local`/`remote_path` absolute, `remote_host` matched against a strict pattern, the ssh key readable, and every field rejected if it contains shell metacharacters or control characters (defense-in-depth, since the arg-list exec already prevents interpretation).
+No network listener, no HTTP server, no exposed ports. Triggering is an in-container unix socket (`/tmp/docker-rsync-scheduler.sock`, owner-only `0600`), so trigger authority is scoped to the container's own user, the same boundary `docker exec` already enforces. The image ships `openssh-client` only, no `sshd`. Each job is executed with an explicit argument slice via `exec.CommandContext`; the `-e "ssh ..."` value is a single argument that rsync splits internally, so nothing is passed through a shell. Config is validated at startup and reloaded per pass: required fields present, names unique, `local`/`remote_path` absolute, `remote_host` matched against a strict pattern, the ssh key readable, and every field rejected if it contains shell metacharacters or control characters (defense-in-depth, since the arg-list exec already prevents interpretation).
 
 ### SSH host-key verification
 
@@ -238,30 +228,20 @@ volumes:
   - ./known_hosts:/config/known_hosts:ro
 ```
 
-| Tool                                                                | Result                              |
-| ------------------------------------------------------------------- | ----------------------------------- |
-| [govulncheck](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) | No vulnerabilities in call graph    |
-| [golangci-lint](https://golangci-lint.run/) (gosec, gocritic)       | 0 issues                            |
-| [trivy](https://trivy.dev/)                                         | Inherits the Alpine base image scan |
-| [gitleaks](https://github.com/gitleaks/gitleaks)                    | No secrets detected                 |
-| [hadolint](https://github.com/hadolint/hadolint)                    | Clean                               |
-
 _Why it runs as root._ The container runs as root by design: it must read host-owned source files (e.g. a host UID like 1000) across multiple bind mounts. A fixed non-root `USER` would break this. Mount sources read-only and use a dedicated, least-privilege SSH key on the remote.
 
 ## Dependencies
 
-All dependencies are updated automatically via [Renovate](https://github.com/renovatebot/renovate). Base images and Go modules are pinned by digest/version. `rsync` is compiled from the pinned upstream release tarball (`RSYNC_VERSION` in the Dockerfile, SHA256-verified fail-closed, Renovate-tracked) with feature parity to the Alpine package it replaced (ACLs, xattrs, xxhash checksums, zstd/lz4 compression), asserted by a build-time smoke test. The `openssh-client` apk package and the base userland (including rsync's runtime libraries) install unpinned so they track the digest-pinned Alpine release; they move only when the image is rebuilt, and the publishing pipeline rebuilds the image on a schedule when its last build grows stale, so that float window stays bounded.
+All dependencies are updated automatically via [Renovate](https://github.com/renovatebot/renovate); base images and Go modules are pinned by digest/version, and `rsync` is compiled from the pinned, SHA256-verified upstream release tarball with feature parity to the Alpine package it replaced (ACLs, xattrs, xxhash checksums, zstd/lz4 compression). The `openssh-client` package and the base userland (including rsync's runtime libraries) track the digest-pinned Alpine release and move when the image is rebuilt.
 
-**Major rsync versions:** a major version bump PR does not auto-merge. Review the [upstream release notes](https://rsync.samba.org/) for flag or protocol changes before merging (the rsync wire protocol negotiates with older remote versions, but flag semantics can change across majors).
+| Dependency | Source |
+| --- | --- |
+| golang | [Go](https://hub.docker.com/_/golang) |
+| alpine | [Docker Hub](https://hub.docker.com/_/alpine) |
+| rsync | [rsync upstream](https://github.com/RsyncProject/rsync) (pinned source build) |
+| openssh-client | [Alpine](https://pkgs.alpinelinux.org/packages?name=openssh-client) |
 
-| Dependency     | Source                                                                        |
-| -------------- | ----------------------------------------------------------------------------- |
-| golang         | [Go](https://hub.docker.com/_/golang)                                         |
-| alpine         | [Docker Hub](https://hub.docker.com/_/alpine)                                 |
-| rsync          | [rsync upstream](https://github.com/RsyncProject/rsync) (pinned source build) |
-| openssh-client | [Alpine](https://pkgs.alpinelinux.org/packages?name=openssh-client)           |
-
-Runtime Go modules: [`github.com/cplieger/health`](https://github.com/cplieger/health), [`github.com/cplieger/scheduler`](https://github.com/cplieger/scheduler), [`github.com/cplieger/slogx`](https://github.com/cplieger/slogx), and [`gopkg.in/yaml.v3`](https://gopkg.in/yaml.v3).
+Runtime Go modules: [`github.com/cplieger/health`](https://github.com/cplieger/health), [`github.com/cplieger/scheduler`](https://github.com/cplieger/scheduler), [`github.com/cplieger/slogx`](https://github.com/cplieger/slogx), [`github.com/cplieger/envx`](https://github.com/cplieger/envx), and [`go.yaml.in/yaml/v3`](https://github.com/yaml/go-yaml).
 
 ## Credits
 
@@ -279,4 +259,4 @@ This project was built with AI-assisted tooling using [Claude](https://claude.co
 
 ## License
 
-This project is licensed under the [GNU General Public License v3.0](LICENSE).
+GPL-3.0-or-later. See [LICENSE](LICENSE).
