@@ -4,7 +4,7 @@ go 1.26.5
 
 require (
 	github.com/cplieger/health v1.4.0
-	go.yaml.in/yaml/v3 v3.0.4
+	go.yaml.in/yaml/v3 v3.0.5
 )
 
 require github.com/cplieger/envx/yamlenv v1.2.0
