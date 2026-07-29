@@ -1,0 +1,12 @@
+# punused findings adjudicated as false positives. One literal substring per
+# line, matched against punused's output line; full-line `#` comments carry the
+# reason. Invalid-by-construction classes: `.kiro/steering/tools.md`.
+#
+# cappedBuffer's own doc declares it an io.Writer that retains at most max bytes
+# so the subprocess is never blocked on a full pipe. runJob assigns it to both
+# exec.Cmd.Stdout and .Stderr, so those lines do not compile without Write, and
+# at runtime it is the only path by which rsync's output reaches parseStats and
+# tail. punused resolves explicit call sites only, which is why the sibling
+# String() -- called directly -- is not flagged and this one is.
+# Upstream: bep/punused#3.
+method (*cappedBuffer).Write
