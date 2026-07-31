@@ -9,7 +9,7 @@ require (
 
 require github.com/cplieger/envx/yamlenv v1.2.1
 
-require github.com/cplieger/slogx v1.5.0
+require github.com/cplieger/slogx v1.6.0
 
 require github.com/cplieger/pathinside v1.0.0 // indirect
 
