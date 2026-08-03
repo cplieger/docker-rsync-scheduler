@@ -19,6 +19,17 @@ ARG RSYNC_VERSION=v3.4.4
 # gpg --show-keys --with-fingerprint rsync-signing-key.gpg  # expect fpr above
 # gpgv --keyring ./rsync-signing-key.gpg "rsync-${V#v}.tar.gz.asc" "rsync-${V#v}.tar.gz"
 # sha256sum "rsync-${V#v}.tar.gz"   # paste the result here only after gpgv passes
+# The marker below records this pin's tarball URL in the machine-readable form
+# the shared repin-sha.sh recompute script reads. The automation it enables is
+# deliberately withheld here: that script hashes the tarball but performs no
+# signature check, so running it would replace the authenticated pin with
+# trust-on-first-use. rsync is therefore left out of the Renovate preset's
+# postUpgradeTasks rule, the marker is inert, and a bump still gets the
+# `manual-sha-bump` label plus the human gpg steps above. It stays that way
+# until gpgv runs INSIDE this build against a keyring committed in-repo,
+# following docker-smtp-relay's postfix-release.gpg model; until then the gpg
+# procedure above is what applies.
+# repin: dep=RsyncProject/rsync url=https://download.samba.org/pub/rsync/rsync-{version_nov}.tar.gz
 ARG RSYNC_SHA256=bd88cf82fa653da32314fb229136407c5c90f80d1758d8f4b091767877d8fa96
 
 FROM golang:1.26-trixie@sha256:4ee9ffa999b4583ce281939cdff828763083610292f252279a0cee77473bd9a7 AS go-builder
