@@ -32,7 +32,7 @@ ARG RSYNC_VERSION=v3.4.4
 # repin: dep=RsyncProject/rsync url=https://download.samba.org/pub/rsync/rsync-{version_nov}.tar.gz
 ARG RSYNC_SHA256=bd88cf82fa653da32314fb229136407c5c90f80d1758d8f4b091767877d8fa96
 
-FROM golang:1.26-trixie@sha256:4ee9ffa999b4583ce281939cdff828763083610292f252279a0cee77473bd9a7 AS go-builder
+FROM golang:1.26-trixie@sha256:87ffdb09b6a2e29ff910748b745395e8a0299aa80b7c0551cdca9b55e3fd2b3e AS go-builder
 ENV GOTOOLCHAIN=auto
 
 WORKDIR /src
