@@ -1,5 +1,5 @@
-github.com/cplieger/envx v1.5.1 h1:uzNePwLQYna5ojRfRKHMVGxHlqdDNwGttBgo0UYPyOM=
-github.com/cplieger/envx v1.5.1/go.mod h1:bdIxSs3VcSw/2zR1d+bNWAnwn/ISYngodlsrV6Re6O8=
+github.com/cplieger/envx v1.6.0 h1:TMYjXLAJQDlwddx9dU6+ErURtaO4L1lFfKyrf9SzSOY=
+github.com/cplieger/envx v1.6.0/go.mod h1:bdIxSs3VcSw/2zR1d+bNWAnwn/ISYngodlsrV6Re6O8=
 github.com/cplieger/envx/yamlenv v1.2.1 h1:EzLTghpO16rFdf9RImru1t2wMR2QNGpRIvQw7M4jSZA=
 github.com/cplieger/envx/yamlenv v1.2.1/go.mod h1:Ur9/Rynk/DCB6QkqPpg/DEHCr5GhiAXpTGqinBqGNlI=
 github.com/cplieger/health v1.4.0 h1:MnLfSZNRnq7wYSMVi1s8Ox0kowk5iPzmqVKQ5JHHsoM=
