@@ -1,7 +1,7 @@
 # check=error=true
 
 # renovate: datasource=github-tags depName=RsyncProject/rsync
-ARG RSYNC_VERSION=v3.4.4
+ARG RSYNC_VERSION=v3.5.0
 # When RSYNC_VERSION is bumped, update this SHA256 to match the new dist
 # tarball. Renovate can't recompute it (github-tags exposes the git sha, not
 # the tarball hash), so it labels the bump PR `manual-sha-bump` and puts these
