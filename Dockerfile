@@ -1,7 +1,7 @@
 # check=error=true
 
 # renovate: datasource=github-tags depName=RsyncProject/rsync
-ARG RSYNC_VERSION=v3.4.4
+ARG RSYNC_VERSION=v3.5.0
 # Renovate's github-tags datasource exposes the git sha, not the tarball hash,
 # so the repin postUpgradeTask recomputes this SHA256 from the marker URL below
 # and commits it in the same commit as the RSYNC_VERSION bump.
@@ -15,7 +15,7 @@ ARG RSYNC_VERSION=v3.4.4
 # CURRENT release, so a pin there 404s the moment upstream publishes the next
 # version; that is how the v3.4.4 pin stopped building.
 # repin: dep=RsyncProject/rsync url=https://download.samba.org/pub/rsync/src/rsync-{version_nov}.tar.gz
-ARG RSYNC_SHA256=bd88cf82fa653da32314fb229136407c5c90f80d1758d8f4b091767877d8fa96
+ARG RSYNC_SHA256=c7ffd1ef653e99540f661e47cb00b7f9cad1ee6b972399b16f93d672656e0d33
 
 FROM golang:1.26-trixie@sha256:87ffdb09b6a2e29ff910748b745395e8a0299aa80b7c0551cdca9b55e3fd2b3e AS go-builder
 ENV GOTOOLCHAIN=auto
