@@ -232,7 +232,7 @@ _Why it runs as root._ The container runs as root by design: it must read host-o
 
 ## Dependencies
 
-All dependencies are updated automatically via [Renovate](https://github.com/renovatebot/renovate); base images and Go modules are pinned by digest/version, and `rsync` is compiled from the pinned, SHA256-verified upstream release tarball with feature parity to the Alpine package it replaced (ACLs, xattrs, xxhash checksums, zstd/lz4 compression). The `openssh-client` package and the base userland (including rsync's runtime libraries) track the digest-pinned Alpine release and move when the image is rebuilt.
+All dependencies are updated automatically via [Renovate](https://github.com/renovatebot/renovate); base images and Go modules are pinned by digest/version, and `rsync` is compiled from the pinned upstream release tarball with feature parity to the Alpine package it replaced (ACLs, xattrs, xxhash checksums, zstd/lz4 compression). The build gates that tarball twice before it is extracted: `gpgv` verifies the detached upstream signature against the rsync release signing key committed as `rsync-release.gpg`, and `sha256sum -c` verifies the pinned digest. A version bump therefore needs no manual step, because the digest is recomputed automatically and a swapped tarball still fails the signature gate. The `openssh-client` package and the base userland (including rsync's runtime libraries) track the digest-pinned Alpine release and move when the image is rebuilt.
 
 | Dependency | Source |
 | --- | --- |

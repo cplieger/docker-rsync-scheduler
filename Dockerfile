@@ -2,34 +2,19 @@
 
 # renovate: datasource=github-tags depName=RsyncProject/rsync
 ARG RSYNC_VERSION=v3.4.4
-# When RSYNC_VERSION is bumped, update this SHA256 to match the new dist
-# tarball. Renovate can't recompute it (github-tags exposes the git sha, not
-# the tarball hash), so it labels the bump PR `manual-sha-bump` and puts these
-# steps in the PR body. Verify the upstream signature FIRST, then hash, so the
-# pin records authenticated bytes rather than trust-on-first-use: upstream
-# publishes rsync-X.Y.Z.tar.gz.asc beside the tarball, and releases >= 3.4.0
-# are signed by Andrew Tridgell <andrew@tridgell.net> (signer named on
-# https://rsync.samba.org/download.html; key from https://keys.openpgp.org/,
-# fingerprint 9FEF 112D CE19 A0DC 7E88 2CB8 1BB2 4997 A853 5F6F):
-# V=<new tag>
-# curl -sLO "https://download.samba.org/pub/rsync/rsync-${V#v}.tar.gz"
-# curl -sLO "https://download.samba.org/pub/rsync/rsync-${V#v}.tar.gz.asc"
-# curl -sL "https://keys.openpgp.org/vks/v1/by-email/andrew%40tridgell.net" \
-#   | gpg --dearmor -o rsync-signing-key.gpg
-# gpg --show-keys --with-fingerprint rsync-signing-key.gpg  # expect fpr above
-# gpgv --keyring ./rsync-signing-key.gpg "rsync-${V#v}.tar.gz.asc" "rsync-${V#v}.tar.gz"
-# sha256sum "rsync-${V#v}.tar.gz"   # paste the result here only after gpgv passes
-# The marker below records this pin's tarball URL in the machine-readable form
-# the shared repin-sha.sh recompute script reads. The automation it enables is
-# deliberately withheld here: that script hashes the tarball but performs no
-# signature check, so running it would replace the authenticated pin with
-# trust-on-first-use. rsync is therefore left out of the Renovate preset's
-# postUpgradeTasks rule, the marker is inert, and a bump still gets the
-# `manual-sha-bump` label plus the human gpg steps above. It stays that way
-# until gpgv runs INSIDE this build against a keyring committed in-repo,
-# following docker-smtp-relay's postfix-release.gpg model; until then the gpg
-# procedure above is what applies.
-# repin: dep=RsyncProject/rsync url=https://download.samba.org/pub/rsync/rsync-{version_nov}.tar.gz
+# Renovate's github-tags datasource exposes the git sha, not the tarball hash,
+# so the repin postUpgradeTask recomputes this SHA256 from the marker URL below
+# and commits it in the same commit as the RSYNC_VERSION bump.
+# Authenticity does NOT rest on whoever computed this hash: gpgv verifies the
+# release's detached .asc inside the builder stage below, against the signing
+# key committed beside this file. A recompute (bot or human) that adopted
+# swapped bytes would fail that gate, which is why this pin can be automated
+# at all — a hash refreshed from the same server that serves the tarball is
+# trust-on-first-use on its own.
+# The URL points at the src/ ARCHIVE directory. Its parent holds only the
+# CURRENT release, so a pin there 404s the moment upstream publishes the next
+# version; that is how the v3.4.4 pin stopped building.
+# repin: dep=RsyncProject/rsync url=https://download.samba.org/pub/rsync/src/rsync-{version_nov}.tar.gz
 ARG RSYNC_SHA256=bd88cf82fa653da32314fb229136407c5c90f80d1758d8f4b091767877d8fa96
 
 FROM golang:1.26-trixie@sha256:87ffdb09b6a2e29ff910748b745395e8a0299aa80b7c0551cdca9b55e3fd2b3e AS go-builder
@@ -60,12 +45,13 @@ SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 # index). rsync itself stays version+SHA pinned below, it is the shipped
 # artifact. The set mirrors Alpine 3.24-stable's rsync APKBUILD makedepends
 # (acl/attr/lz4/popt/xxhash/zlib/zstd headers, linux-headers, perl) plus
-# build-base for the toolchain.
+# build-base for the toolchain and gpgv for the release-signature check.
 # hadolint ignore=DL3018
 RUN apk add --no-cache \
         acl-dev \
         attr-dev \
         build-base \
+        gpgv \
         linux-headers \
         lz4-dev \
         perl \
@@ -77,11 +63,27 @@ RUN apk add --no-cache \
 ARG RSYNC_VERSION
 ARG RSYNC_SHA256
 WORKDIR /build/rsync
+# Andrew Tridgell's rsync release signing key as a minimal dearmored keyring
+# (v4 RSA-4096, created 2017-09-23, no expiry; fingerprint
+# 9FEF112DCE19A0DC7E882CB81BB24997A8535F6F). https://rsync.samba.org/download.html
+# names him as the signer of every release from 3.4.0 and points at
+# keys.openpgp.org; the committed bytes are that export, cross-checked against
+# keyserver.ubuntu.com (byte-identical primary key and subkey packets, which
+# differ only in third-party signatures the keyservers each carry).
+# Refresh (only if upstream ever rotates the key - verify the new fingerprint
+# against multiple authoritative sources first):
+# curl -sL "https://keys.openpgp.org/vks/v1/by-email/andrew%40tridgell.net" \
+#   | gpg --dearmor > rsync-release.gpg
+COPY rsync-release.gpg /usr/local/share/rsync-release.gpg
 # Fetch the upstream dist tarball (stable release asset from the project's
-# download server, NOT the auto-generated GitHub tag archive) and verify it
-# fail-closed against the pinned SHA256 before extracting. Configure flags
-# mirror Alpine 3.24-stable's rsync APKBUILD: ACL + xattr support, xxhash
-# checksums, system popt and zlib (not the bundled copies), no md2man doc
+# download server, NOT the auto-generated GitHub tag archive) plus its
+# detached signature, then apply both gates fail-closed before extracting:
+# gpgv authenticates the publisher against the committed keyring, and
+# sha256sum -c freezes the exact bytes this repo reviewed. Order matters — a
+# bad signature stops the build before the pin is consulted at all.
+# Configure flags mirror Alpine 3.24-stable's rsync APKBUILD: ACL + xattr
+# support, xxhash checksums, system popt and zlib (not the bundled copies),
+# no md2man doc
 # generation, and OpenSSL checksums disabled (the APKBUILD disables them
 # since the xxhash family is faster); zstd and lz4 compression are enabled
 # by configure's default detection of their -dev packages above. Omitted vs
@@ -90,10 +92,14 @@ WORKDIR /build/rsync
 # needing python3; this image never shipped it). LTO matches the APKBUILD's
 # CFLAGS. The stripped binary is staged under /out for the runtime COPY.
 RUN wget -q --tries=3 --timeout=30 \
-      "https://download.samba.org/pub/rsync/rsync-${RSYNC_VERSION#v}.tar.gz" \
+      "https://download.samba.org/pub/rsync/src/rsync-${RSYNC_VERSION#v}.tar.gz" \
+    && wget -q --tries=3 --timeout=30 \
+      "https://download.samba.org/pub/rsync/src/rsync-${RSYNC_VERSION#v}.tar.gz.asc" \
+    && gpgv --keyring /usr/local/share/rsync-release.gpg \
+        "rsync-${RSYNC_VERSION#v}.tar.gz.asc" "rsync-${RSYNC_VERSION#v}.tar.gz" \
     && echo "${RSYNC_SHA256}  rsync-${RSYNC_VERSION#v}.tar.gz" | sha256sum -c - \
     && tar xzf "rsync-${RSYNC_VERSION#v}.tar.gz" --strip-components=1 --no-same-owner \
-    && rm "rsync-${RSYNC_VERSION#v}.tar.gz" \
+    && rm "rsync-${RSYNC_VERSION#v}.tar.gz" "rsync-${RSYNC_VERSION#v}.tar.gz.asc" \
     && CFLAGS="-O2 -flto=auto" ./configure \
         --prefix=/usr \
         --sysconfdir=/etc \
@@ -131,11 +137,11 @@ RUN cat > /out/rsync-scheduler.cdx.json <<EOF
   "version": 1,
   "components": [
     {
-      "bom-ref": "pkg:generic/rsync@${RSYNC_VERSION#v}?download_url=https://download.samba.org/pub/rsync/rsync-${RSYNC_VERSION#v}.tar.gz",
+      "bom-ref": "pkg:generic/rsync@${RSYNC_VERSION#v}?download_url=https://download.samba.org/pub/rsync/src/rsync-${RSYNC_VERSION#v}.tar.gz",
       "type": "application",
       "name": "rsync",
       "version": "${RSYNC_VERSION#v}",
-      "purl": "pkg:generic/rsync@${RSYNC_VERSION#v}?download_url=https://download.samba.org/pub/rsync/rsync-${RSYNC_VERSION#v}.tar.gz",
+      "purl": "pkg:generic/rsync@${RSYNC_VERSION#v}?download_url=https://download.samba.org/pub/rsync/src/rsync-${RSYNC_VERSION#v}.tar.gz",
       "cpe": "cpe:2.3:a:samba:rsync:${RSYNC_VERSION#v}:*:*:*:*:*:*:*"
     }
   ]
