@@ -152,7 +152,7 @@ func TestStartTicker_FiresStartupThenInterval(t *testing.T) {
 
 	d, cancel, execDone, _ := newTestDaemon(t, fixedRunner("true"))
 
-	tickCtx, stopTicker := context.WithCancel(context.Background())
+	tickCtx, stopTicker := context.WithCancel(t.Context())
 	tickerDone := startTicker(tickCtx, d, 15*time.Millisecond, true)
 
 	// heartbeatTriggers returns each heartbeat's trigger attr, in emit order.
@@ -194,7 +194,7 @@ func TestStartTicker_FiresStartupThenInterval(t *testing.T) {
 func TestStartTicker_DisabledInExternalMode(t *testing.T) {
 	t.Parallel()
 	d := &daemon{queue: trigger.NewQueue[struct{}](4)}
-	done := startTicker(context.Background(), d, time.Millisecond, false)
+	done := startTicker(t.Context(), d, time.Millisecond, false)
 	select {
 	case <-done:
 	case <-time.After(time.Second):
@@ -219,7 +219,7 @@ func TestRunDaemon_ExternalModeBootsHealthyServesAndShutsDownCleanly(t *testing.
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	sock := testSocketPath(t)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	var runErr error
 	go func() {

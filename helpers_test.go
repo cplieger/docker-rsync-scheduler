@@ -40,6 +40,9 @@ func recordingRunner(t *testing.T, bin string) scheduler.CommandRunner {
 // a channel closed when the executor has drained, and the marker path.
 func newTestDaemon(t *testing.T, runner scheduler.CommandRunner) (d *daemon, cancel context.CancelFunc, done <-chan struct{}, markerPath string) {
 	t.Helper()
+	// Not t.Context(): the executor must stay alive through the t.Cleanup below,
+	// which cancels it and then waits for the drain. t.Context() is already
+	// cancelled by the time cleanup runs.
 	ctx, cancelCtx := context.WithCancel(context.Background())
 	markerPath = filepath.Join(t.TempDir(), "marker")
 	d = &daemon{
@@ -84,6 +87,8 @@ func startTestServer(t *testing.T, runner scheduler.CommandRunner) (sock string,
 	t.Helper()
 	sock = filepath.Join(t.TempDir(), "s.sock")
 
+	// Not t.Context(): the executor and server are torn down by the t.Cleanup
+	// below, which cancels this context and then waits for the drain.
 	ctx, cancel := context.WithCancel(context.Background())
 	d = &daemon{
 		queue:   trigger.NewQueue[struct{}](queueCapacity),

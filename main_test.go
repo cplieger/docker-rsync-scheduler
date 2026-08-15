@@ -44,7 +44,7 @@ func testSocketPath(t *testing.T) string {
 // Not parallel: sets env.
 func TestRunDaemon_badConfigReturnsError(t *testing.T) {
 	t.Setenv("CONFIG_PATH", filepath.Join(t.TempDir(), "absent.yaml"))
-	err := runDaemon(context.Background(), testSocketPath(t), recordingRunner(t, "true"))
+	err := runDaemon(t.Context(), testSocketPath(t), recordingRunner(t, "true"))
 	if err == nil {
 		t.Fatal("runDaemon() with a missing config = nil, want error")
 	}
@@ -59,6 +59,7 @@ func TestRunDaemon_externalModeReturnsNilOnShutdown(t *testing.T) {
 	writeValidCfg(t, t.TempDir())
 	t.Setenv("SYNC_INTERVAL", "off")
 	t.Cleanup(func() { _ = os.Remove(healthMarkerPath) })
+	// Deliberately pre-cancelled (not t.Context()) to drive the shutdown arm.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := runDaemon(ctx, testSocketPath(t), recordingRunner(t, "true")); err != nil {
@@ -75,6 +76,7 @@ func TestRunDaemon_builtinModeReturnsNilOnShutdown(t *testing.T) {
 	writeValidCfg(t, t.TempDir())
 	t.Setenv("SYNC_INTERVAL", "6h")
 	t.Cleanup(func() { _ = os.Remove(healthMarkerPath) })
+	// Deliberately pre-cancelled (not t.Context()) to drive the shutdown arm.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := runDaemon(ctx, testSocketPath(t), recordingRunner(t, "true")); err != nil {
