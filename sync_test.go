@@ -41,7 +41,7 @@ func TestRunJob_successParsesStatsAndMarksSuccess(t *testing.T) {
 		return exec.CommandContext(ctx, "sh", "-c",
 			"printf 'Number of regular files transferred: 5\\nTotal transferred file size: 2048 bytes\\n'; exit 0")
 	}
-	res := runJob(context.Background(), runJobJob(newRunJobSource(t)), time.Minute, newCmd)
+	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), time.Minute, newCmd)
 	if !res.success {
 		t.Errorf("success = false, want true")
 	}
@@ -64,7 +64,7 @@ func TestRunJob_failureCapturesExitCodeAndStderr(t *testing.T) {
 		return exec.CommandContext(ctx, "sh", "-c",
 			"printf 'rsync error: link_stat failed\\n' >&2; exit 23")
 	}
-	res := runJob(context.Background(), runJobJob(newRunJobSource(t)), time.Minute, newCmd)
+	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), time.Minute, newCmd)
 	if res.success {
 		t.Errorf("success = true, want false")
 	}
@@ -81,7 +81,7 @@ func TestRunJob_emptySourceSkipsWithoutRunning(t *testing.T) {
 		t.Error("runner invoked for empty source; want skip")
 		return exec.CommandContext(ctx, "true")
 	}
-	res := runJob(context.Background(), runJobJob(t.TempDir()), time.Minute, newCmd)
+	res := runJob(t.Context(), runJobJob(t.TempDir()), time.Minute, newCmd)
 	if !res.skipped {
 		t.Errorf("skipped = false, want true")
 	}
@@ -102,7 +102,7 @@ func TestRunPass_aggregatesFailures(t *testing.T) {
 	}
 	src := newRunJobSource(t)
 	cfg := config{Jobs: []job{*runJobJob(src), *runJobJob(src)}}
-	r := runPass(context.Background(), cfg, time.Minute, "test", newCmd)
+	r := runPass(t.Context(), cfg, time.Minute, "test", newCmd)
 	if r.failed != 1 {
 		t.Errorf("failed = %d, want 1", r.failed)
 	}
@@ -130,6 +130,7 @@ func TestRunPass_aggregatesFailures(t *testing.T) {
 func TestRunJob_parentCancellationLogsShutdownNotFailure(t *testing.T) {
 	rec := capture.Default(t)
 
+	// Deliberately pre-cancelled (not t.Context()) to drive the shutdown arm.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -162,7 +163,7 @@ func TestRunPass_emptySourceSkippedNotCountedAsFailure(t *testing.T) {
 	}
 	cfg := config{Jobs: []job{*runJobJob(t.TempDir())}}
 
-	r := runPass(context.Background(), cfg, time.Minute, "test", newCmd)
+	r := runPass(t.Context(), cfg, time.Minute, "test", newCmd)
 
 	if r.failed != 0 {
 		t.Errorf("failed = %d, want 0 (an empty-source skip is not a failure)", r.failed)
@@ -187,7 +188,7 @@ func TestRunPass_emptySourceSkippedNotCountedAsFailure(t *testing.T) {
 // outlives the drain.
 func TestRunPass_shutdownInterruptedJobIsNotCountedAsFailure(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 
 	var calls int
 	newCmd := func(cmdCtx context.Context, _ string, _ ...string) *exec.Cmd {
@@ -222,7 +223,7 @@ func TestRunPass_shutdownInterruptedJobIsNotCountedAsFailure(t *testing.T) {
 // a 5s WaitDelay before SIGKILL, a non-nil SIGTERM Cancel closure, and the
 // verbatim arg slice. Mutating WaitDelay (e.g. 5s -> 9s) fails this test.
 func TestDefaultCommandRunner_structural(t *testing.T) {
-	cmd := defaultCommandRunner(context.Background(), "echo", "hi", "there")
+	cmd := defaultCommandRunner(t.Context(), "echo", "hi", "there")
 	if cmd.WaitDelay != 5*time.Second {
 		t.Errorf("WaitDelay = %v, want 5s", cmd.WaitDelay)
 	}
@@ -239,7 +240,7 @@ func TestDefaultCommandRunner_structural(t *testing.T) {
 // Wait must return a termination error proving the SIGTERM closure ran (the
 // closure is otherwise invisible to the fake-injecting unit tests).
 func TestDefaultCommandRunner_cancelSignalsProcess(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cmd := defaultCommandRunner(ctx, "sleep", "30")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -254,7 +255,7 @@ func TestDefaultCommandRunner_cancelSignalsProcess(t *testing.T) {
 // healthSignal's interrupted carve-out at the runPass integration level.
 func TestRunPass_realFailureDuringShutdownStillUnhealthy(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	var calls int
 	newCmd := func(cmdCtx context.Context, _ string, _ ...string) *exec.Cmd {
 		calls++
