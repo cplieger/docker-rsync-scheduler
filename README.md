@@ -241,7 +241,7 @@ All dependencies are updated automatically via [Renovate](https://github.com/ren
 | rsync | [rsync upstream](https://github.com/RsyncProject/rsync) (pinned source build) |
 | openssh-client | [Alpine](https://pkgs.alpinelinux.org/packages?name=openssh-client) |
 
-Runtime Go modules: [`github.com/cplieger/health`](https://github.com/cplieger/health), [`github.com/cplieger/scheduler`](https://github.com/cplieger/scheduler), [`github.com/cplieger/slogx`](https://github.com/cplieger/slogx), [`github.com/cplieger/envx`](https://github.com/cplieger/envx), and [`go.yaml.in/yaml/v3`](https://github.com/yaml/go-yaml).
+Runtime Go modules: [`github.com/cplieger/health`](https://github.com/cplieger/health), [`github.com/cplieger/scheduler`](https://github.com/cplieger/scheduler), [`github.com/cplieger/slogx`](https://github.com/cplieger/slogx), [`github.com/cplieger/envx`](https://github.com/cplieger/envx), [`github.com/cplieger/envx/yamlenv`](https://github.com/cplieger/envx), and [`go.yaml.in/yaml/v3`](https://github.com/yaml/go-yaml).
 
 ## Credits
 

@@ -8,7 +8,7 @@ import (
 
 // The broker mechanics (queue semantics, socket hygiene, wire ordering,
 // backpressure rejection, undecodable requests, departed clients) are the
-// scheduler library's and are tested in scheduler/v2/trigger. The tests here
+// scheduler library's and are tested in scheduler/v4/trigger. The tests here
 // pin what stays THIS app's: the executor's pass-outcome policy as observed
 // over the real socket. The exit-code half of the same contract is pinned
 // end-to-end in client_test.go; the drain-versus-cancel split in
