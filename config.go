@@ -448,7 +448,7 @@ func loadSyncTimeout() time.Duration {
 // with the scheduler enabled (a warning is logged for the negative and
 // unparseable cases). scheduleEnabled is true only in built-in mode.
 func loadInterval() (interval time.Duration, scheduleEnabled bool) {
-	s := scheduler.ParseInterval(os.Getenv("SYNC_INTERVAL"), defaultInterval,
+	s := scheduler.ParseInterval(envx.String("SYNC_INTERVAL", ""), defaultInterval,
 		scheduler.WithName("SYNC_INTERVAL"))
 	return s.Interval, s.Mode == scheduler.ModeBuiltin
 }
