@@ -2,6 +2,7 @@
 package main
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -117,7 +118,7 @@ func hasShellMeta(s string) bool {
 // setupLogger installs a slog text handler that emits canonical logfmt
 // (`time=... level=... msg=... k=v`) to stderr for Loki/Alloy collection.
 func setupLogger() {
-	levelStr := strings.TrimSpace(envx.String("LOG_LEVEL", "info"))
+	levelStr := strings.TrimSpace(cmp.Or(envx.String("LOG_LEVEL"), "info"))
 	level, recognized := slogx.ParseLevel(levelStr, slog.LevelInfo)
 	slogx.Setup(slogx.Options{Level: level})
 	if !recognized {
@@ -127,7 +128,7 @@ func setupLogger() {
 
 // configPath returns the active config path, honouring CONFIG_PATH.
 func configPath() string {
-	return envx.String("CONFIG_PATH", defaultConfigPath)
+	return cmp.Or(envx.String("CONFIG_PATH"), defaultConfigPath)
 }
 
 // loadConfig reads, parses, and validates the YAML config. On any
@@ -448,7 +449,7 @@ func loadSyncTimeout() time.Duration {
 // with the scheduler enabled (a warning is logged for the negative and
 // unparseable cases). scheduleEnabled is true only in built-in mode.
 func loadInterval() (interval time.Duration, scheduleEnabled bool) {
-	s := scheduler.ParseInterval(envx.String("SYNC_INTERVAL", ""), defaultInterval,
+	s := scheduler.ParseInterval(envx.String("SYNC_INTERVAL"), defaultInterval,
 		scheduler.WithName("SYNC_INTERVAL"))
 	return s.Interval, s.Mode == scheduler.ModeBuiltin
 }
