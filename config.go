@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cplieger/envx"
-	"github.com/cplieger/envx/yamlenv"
-	"github.com/cplieger/scheduler/v3"
+	"github.com/cplieger/envx/v2"
+	"github.com/cplieger/envx/yamlenv/v2"
+	"github.com/cplieger/scheduler/v4"
 	"github.com/cplieger/slogx"
 	"go.yaml.in/yaml/v3"
 )
