@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/cplieger/scheduler/v4/trigger"
@@ -191,19 +192,30 @@ func TestStartTicker_FiresStartupThenInterval(t *testing.T) {
 
 // TestStartTicker_DisabledInExternalMode pins that external mode runs no
 // ticker: the returned channel is already closed and nothing is submitted.
+// Runs in a synctest bubble so the "no tick fired" half is exact rather than
+// probabilistic — everything in the bubble is in-memory (a buffered queue and
+// a startTicker that starts no goroutine at all), so the fake clock can
+// always advance.
 func TestStartTicker_DisabledInExternalMode(t *testing.T) {
 	t.Parallel()
-	d := &daemon{queue: trigger.NewQueue[struct{}](4)}
-	done := startTicker(t.Context(), d, time.Millisecond, false)
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("startTicker(enabled=false) did not return a closed channel")
-	}
-	time.Sleep(20 * time.Millisecond) // would be several intervals if a loop were running
-	if n := len(d.queue.Jobs()); n != 0 {
-		t.Errorf("%d requests submitted in external mode, want 0", n)
-	}
+	synctest.Test(t, func(t *testing.T) {
+		d := &daemon{queue: trigger.NewQueue[struct{}](4)}
+		done := startTicker(t.Context(), d, time.Millisecond, false)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("startTicker(enabled=false) did not return a closed channel")
+		}
+		// Advance twenty virtual intervals and let the bubble settle: a
+		// regression that started the loop would have submitted ~20 requests
+		// by the time this returns, so the assertion below cannot pass
+		// vacuously because a real-clock goroutine simply had not been
+		// scheduled yet.
+		synctest.Sleep(20 * time.Millisecond)
+		if n := len(d.queue.Jobs()); n != 0 {
+			t.Errorf("%d requests submitted in external mode, want 0", n)
+		}
+	})
 }
 
 // TestRunDaemon_ExternalModeBootsHealthyServesAndShutsDownCleanly is the
