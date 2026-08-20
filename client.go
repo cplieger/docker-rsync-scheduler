@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/cplieger/scheduler/v4/trigger"
 )
@@ -26,7 +30,15 @@ import (
 func runClient(socketPath string) int {
 	setupLogger()
 
-	final, err := trigger.Submit(socketPath, struct{}{}, func(ev trigger.Event) {
+	// The daemon owns the run; this process only waits for its result, and
+	// that wait is unbounded by contract. Bind it to the terminal so an
+	// operator interrupting the `docker exec` unwinds here -- closing the
+	// connection, which the daemon observes -- instead of leaving the socket
+	// half-open until the kernel reaps this process.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	final, err := trigger.Submit(ctx, socketPath, struct{}{}, func(ev trigger.Event) {
 		switch ev.Kind {
 		case trigger.EventQueued:
 			slog.Info("triggered sync accepted")
