@@ -100,7 +100,7 @@ Overlapping passes cannot happen in either mode: the daemon runs passes strictly
 | --- | --- | --- | --- |
 | `CONFIG_PATH` | Path to the YAML config inside the container | `/config/config.yaml` | No |
 | `SYNC_INTERVAL` | Built-in scheduler cadence as a Go duration (e.g. `6h`, `30m`); the first pass runs at startup. Set `off` (or `disabled`/`0`) for external triggering, see [Scheduling modes](#scheduling-modes). Falls back to `6h` on unset or unparseable (non-sentinel) values. | `6h` | No |
-| `SYNC_TIMEOUT` | Per-job rsync timeout as a Go duration (e.g. `10m`, `1h`). Falls back to the default on unset or unparseable values. | `10m` | No |
+| `SYNC_TIMEOUT` | Per-job rsync timeout as a Go duration (e.g. `10m`, `1h`). Falls back to the default on unset, non-positive, or unparseable values, so `0` does not disable the timeout. | `10m` | No |
 | `LOG_LEVEL` | Log level: `debug`, `info`, `warn`, or `error` | `info` | No |
 
 ### Config schema (`config.yaml`)
@@ -241,7 +241,7 @@ All dependencies are updated automatically via [Renovate](https://github.com/ren
 | rsync | [rsync upstream](https://github.com/RsyncProject/rsync) (pinned source build) |
 | openssh-client | [Alpine](https://pkgs.alpinelinux.org/packages?name=openssh-client) |
 
-Runtime Go modules: [`github.com/cplieger/health`](https://github.com/cplieger/health), [`github.com/cplieger/scheduler`](https://github.com/cplieger/scheduler), [`github.com/cplieger/slogx`](https://github.com/cplieger/slogx), [`github.com/cplieger/envx`](https://github.com/cplieger/envx), [`github.com/cplieger/envx/yamlenv`](https://github.com/cplieger/envx), and [`go.yaml.in/yaml/v3`](https://github.com/yaml/go-yaml).
+Runtime Go modules: [`github.com/cplieger/health`](https://github.com/cplieger/health), [`github.com/cplieger/scheduler/v4`](https://github.com/cplieger/scheduler), [`github.com/cplieger/slogx`](https://github.com/cplieger/slogx), [`github.com/cplieger/envx/v2`](https://github.com/cplieger/envx), [`github.com/cplieger/envx/yamlenv/v2`](https://github.com/cplieger/envx), and [`go.yaml.in/yaml/v3`](https://github.com/yaml/go-yaml).
 
 ## Credits
 
