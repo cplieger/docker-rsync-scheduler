@@ -681,10 +681,15 @@ func TestLoadConfig_rejectsOverCapBytes(t *testing.T) {
 }
 
 func TestLoadSyncTimeout(t *testing.T) {
+	// The default is a documented part of the container's contract (10m, in
+	// the README's SYNC_TIMEOUT row), so this arm asserts the duration itself
+	// rather than the constant the function returns: an expectation of
+	// defaultSyncTimeout holds for whatever that constant says, including a
+	// zero that would expire every job's context before rsync starts.
 	t.Run("default when unset", func(t *testing.T) {
 		t.Setenv("SYNC_TIMEOUT", "")
-		if got := loadSyncTimeout(); got != defaultSyncTimeout {
-			t.Errorf("loadSyncTimeout() = %v, want %v", got, defaultSyncTimeout)
+		if got := loadSyncTimeout(); got != 10*time.Minute {
+			t.Errorf("loadSyncTimeout() with SYNC_TIMEOUT unset = %v, want 10m0s", got)
 		}
 	})
 	t.Run("parsed value", func(t *testing.T) {
