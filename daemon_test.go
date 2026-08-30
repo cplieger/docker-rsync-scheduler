@@ -124,6 +124,109 @@ func TestExecutor_ValidConfigReloadUsesReplacementJobs(t *testing.T) {
 	}
 }
 
+// TestExecutor_EmptySourceIsRecheckedEachPass pins that the empty-source guard
+// is re-evaluated per request: an operator submitting consecutive daemon
+// requests while the mounted source empties out must see the later pass skipped
+// before rsync runs. The oracle is the injected runner's invocation count, not
+// a sourceIsEmpty call count. Not parallel: sets env and swaps the global slog
+// default.
+func TestExecutor_EmptySourceIsRecheckedEachPass(t *testing.T) {
+	rec := capture.Default(t)
+	source := newRunJobSource(t)
+	writeValidCfg(t, source)
+
+	var mu sync.Mutex
+	calls := 0
+	runner := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return exec.CommandContext(ctx, "true")
+	}
+	d, _, _, _ := newTestDaemon(t, runner)
+
+	if out := submitWait(t, d, newRequest("external")); !out.OK {
+		t.Fatal("first pass reported ok=false")
+	}
+	movedFile := filepath.Join(t.TempDir(), "f")
+	if err := os.Rename(filepath.Join(source, "f"), movedFile); err != nil {
+		t.Fatalf("empty source: %v", err)
+	}
+	if out := submitWait(t, d, newRequest("external")); !out.OK {
+		t.Fatal("second pass reported ok=false")
+	}
+
+	mu.Lock()
+	gotCalls := calls
+	mu.Unlock()
+	if gotCalls != 1 {
+		t.Errorf("rsync invocations across populated then empty passes = %d, want 1", gotCalls)
+	}
+	const heartbeat = "sync cycle complete"
+	if !rec.HasAttr(heartbeat, "skipped", "1") {
+		t.Errorf("second pass logs = %q, want heartbeat with skipped=1", rec.Messages())
+	}
+	if !rec.HasAttr(heartbeat, "failed", "0") {
+		t.Errorf("second pass logs = %q, want heartbeat with failed=0", rec.Messages())
+	}
+}
+
+// TestExecutor_ReloadedJobKeepsStrictHostKeyMode pins that the boot-time
+// host-key posture reaches a job first read from a REPLACEMENT config: the
+// protocol oracle is the -e ssh command handed to rsync, which under strict
+// mode carries StrictHostKeyChecking=yes and the mounted UserKnownHostsFile.
+// The key path is fixture data, so only the two options that ARE the posture
+// are asserted. Not parallel: sets env.
+func TestExecutor_ReloadedJobKeepsStrictHostKeyMode(t *testing.T) {
+	firstSource := newRunJobSource(t)
+	cfgPath := writeValidCfg(t, firstSource)
+	key := filepath.Join(filepath.Dir(cfgPath), "id_ed25519")
+
+	var mu sync.Mutex
+	var sshCommands []string
+	runner := func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		for i, arg := range args {
+			if arg == "-e" && i+1 < len(args) {
+				mu.Lock()
+				sshCommands = append(sshCommands, args[i+1])
+				mu.Unlock()
+				break
+			}
+		}
+		return exec.CommandContext(ctx, "true")
+	}
+	d, _, _, _ := newTestDaemon(t, runner)
+	d.transport.hostKeys = hostKeyStrict
+
+	if out := submitWait(t, d, newRequest("external")); !out.OK {
+		t.Fatal("first pass reported ok=false")
+	}
+	secondSource := newRunJobSource(t)
+	replacement := "jobs:\n  - name: replacement\n    local: " + secondSource + "\n" +
+		"    remote_host: root@192.0.2.10\n    remote_path: /srv/replacement\n" +
+		"    ssh_key: " + key + "\n"
+	if err := os.WriteFile(cfgPath, []byte(replacement), 0o600); err != nil {
+		t.Fatalf("replace config: %v", err)
+	}
+	if out := submitWait(t, d, newRequest("external")); !out.OK {
+		t.Fatal("second pass reported ok=false")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sshCommands) != 2 {
+		t.Fatalf("captured ssh commands = %v, want exactly two", sshCommands)
+	}
+	for _, want := range []string{
+		"-o StrictHostKeyChecking=yes",
+		"-o UserKnownHostsFile=" + knownHostsPath,
+	} {
+		if !strings.Contains(sshCommands[1], want) {
+			t.Errorf("replacement job ssh command = %q, want it to contain %q", sshCommands[1], want)
+		}
+	}
+}
+
 // TestExecutor_ShutdownCancelsQueuedButResolvesInFlight pins the drain
 // contract: SIGTERM interrupts the in-flight pass (which resolves as an
 // interrupted-clean drain, ok=true, per the pass semantics the pre-rewrite
@@ -393,5 +496,161 @@ func TestRunDaemon_BuiltinModeStartsUnhealthyUntilStartupPassCompletes(t *testin
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("runDaemon did not return after shutdown")
+	}
+}
+
+
+// TestRunDaemon_UnusableKnownHostsRefusesStartupWithDiagnostic pins the
+// published refusal: a mounted known_hosts the app cannot read a host key out
+// of must stop the boot with an actionable record, before the trigger socket
+// or the health marker exist. Not parallel: it swaps the global slog default,
+// sets env, reassigns knownHostsPath and uses the package-global
+// healthMarkerPath.
+func TestRunDaemon_UnusableKnownHostsRefusesStartupWithDiagnostic(t *testing.T) {
+	writeValidCfg(t, t.TempDir())
+	t.Setenv("SYNC_INTERVAL", "off")
+	t.Cleanup(func() { _ = os.Remove(healthMarkerPath) })
+	_ = os.Remove(healthMarkerPath)
+
+	emptyKnownHosts := filepath.Join(t.TempDir(), "known_hosts")
+	if err := os.WriteFile(emptyKnownHosts, []byte("# no entries\n"), 0o600); err != nil {
+		t.Fatalf("write known_hosts: %v", err)
+	}
+	originalKnownHostsPath := knownHostsPath
+	knownHostsPath = emptyKnownHosts
+	t.Cleanup(func() { knownHostsPath = originalKnownHostsPath })
+
+	rec := capture.Default(t)
+	sock := testSocketPath(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	done := make(chan error, 1)
+	go func() { done <- runDaemon(ctx, sock, fixedRunner("true")) }()
+
+	var runErr error
+	select {
+	case runErr = <-done:
+	case <-time.After(2 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("runDaemon did not refuse an unusable known_hosts file")
+	}
+	if runErr == nil {
+		t.Fatal("runDaemon() with an unusable known_hosts file = nil, want error")
+	}
+
+	const message = "cannot determine the ssh host-key posture"
+	if got := rec.CountLevel(slog.LevelError, message); got != 1 {
+		t.Errorf("%q ERROR records = %d, want 1; logs = %q", message, got, rec.Messages())
+	}
+	wantHint := "mount a non-empty known_hosts file at " + emptyKnownHosts + ", or omit the mount for accept-new"
+	if !rec.HasAttr(message, "hint", wantHint) {
+		t.Errorf("%q missing hint=%q; logs = %q", message, wantHint, rec.Messages())
+	}
+	if _, err := os.Stat(sock); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("trigger socket exists after refused startup; stat error = %v, want not-exist", err)
+	}
+	if _, err := os.Stat(healthMarkerPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("health marker exists after refused startup; stat error = %v, want not-exist", err)
+	}
+}
+
+// TestRunDaemon_ShutdownCancelsQueuedClientAfterInFlightDrain pins the shutdown
+// ORDER, which is a property of five statements in runDaemon and can only be
+// observed with work present in BOTH request states at the drain. The executor
+// unit test stages both states against the queue directly, so it cannot see the
+// listener-close, queue-close, executor-wait, ticker-wait, server-wait sequence;
+// the live external-mode test cancels only after its sole client has completed.
+// Request A is held inside the pass runner, B's queued wire event is awaited,
+// then the context is cancelled: A must get its clean interrupted result, B must
+// get the scheduler's explicit cancellation reason and never a started event,
+// and runDaemon itself must return.
+// Not parallel: sets env and binds a socket.
+func TestRunDaemon_ShutdownCancelsQueuedClientAfterInFlightDrain(t *testing.T) {
+	writeValidCfg(t, newRunJobSource(t))
+	t.Setenv("SYNC_INTERVAL", "off")
+	marker := health.NewMarker(healthMarkerPath)
+	marker.Cleanup()
+	t.Cleanup(marker.Cleanup)
+
+	entered := make(chan struct{})
+	proceed := make(chan struct{})
+	var enterOnce sync.Once
+	var proceedOnce sync.Once
+	release := func() { proceedOnce.Do(func() { close(proceed) }) }
+	runner := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		enterOnce.Do(func() { close(entered) })
+		<-proceed
+		return exec.CommandContext(ctx, "sleep", "30")
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	sock := testSocketPath(t)
+	done := make(chan struct{})
+	var runErr error
+	go func() {
+		defer close(done)
+		runErr = runDaemon(ctx, sock, runner)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		release()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("runDaemon did not stop during test cleanup")
+		}
+	})
+
+	waitFor(t, 2*time.Second, func() bool {
+		_, err := os.Stat(sock)
+		return err == nil
+	}, "daemon did not bind the trigger socket")
+
+	decInFlight, _ := rawRequest(t, sock)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first request did not enter the pass runner")
+	}
+	decQueued, _ := rawRequest(t, sock)
+	if ev := nextEvent(t, decQueued); ev.Kind != trigger.EventQueued {
+		t.Fatalf("queued client's first event = %q, want %q", ev.Kind, trigger.EventQueued)
+	}
+
+	cancel()
+	release()
+
+	for {
+		ev := nextEvent(t, decInFlight)
+		if ev.Kind != trigger.EventDone {
+			continue
+		}
+		if !ev.OK {
+			t.Errorf("in-flight client's final event = %+v, want done ok=true", ev)
+		}
+		break
+	}
+	for {
+		ev := nextEvent(t, decQueued)
+		if ev.Kind == trigger.EventStarted {
+			t.Error("queued client received a started event after shutdown")
+		}
+		if ev.Kind != trigger.EventDone {
+			continue
+		}
+		if ev.OK || ev.Reason != trigger.CancelledReason {
+			t.Errorf("queued client's final event = %+v, want done ok=false reason=%q", ev, trigger.CancelledReason)
+		}
+		break
+	}
+
+	select {
+	case <-done:
+		if runErr != nil {
+			t.Errorf("runDaemon() = %v, want nil", runErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runDaemon did not return after draining in-flight and queued requests")
 	}
 }

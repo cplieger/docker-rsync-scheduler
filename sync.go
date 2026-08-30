@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -8,11 +9,12 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/cplieger/scheduler/v4"
@@ -36,10 +38,22 @@ const (
 	truncMarker = "...(truncated)..."
 
 	// rsyncVanishedExit is rsync's code 24. Upstream classifies it as a warning
-	// rather than an error (log.c: "VANISHED is not an error, only a warning") and
-	// only reports it when nothing else failed (a transfer error overwrites it with
-	// 23), so the transfer succeeded for every file that still existed.
+	// rather than an error (log.c: "VANISHED is not an error, only a warning"), so
+	// the transfer succeeded for every file that still existed. It does NOT mean
+	// nothing else went wrong: cleanup.c assigns 24 AFTER the --max-delete status
+	// 25, so 24 also masks a capped deletion.
 	rsyncVanishedExit = 24
+
+	// rsyncDelLimitWarn is the stderr line rsync's generator prints when
+	// --max-delete stops deletions. Because 24 overwrites 25, this line is
+	// the only place a capped deletion survives when a source file also
+	// vanished in the same pass.
+	rsyncDelLimitWarn = "Deletions stopped due to --max-delete limit"
+
+	// rsyncSignalExit is rsync's code 20 (RERR_SIGNAL), which it reports only
+	// from its own SIGINT/SIGHUP/SIGTERM handlers -- so it is signal-exclusive
+	// and says nothing about who sent the signal.
+	rsyncSignalExit = 20
 )
 
 // globalExcludes are applied to every job in addition to the per-job
@@ -47,21 +61,10 @@ const (
 // never be mirrored to a remote.
 var globalExcludes = []string{".stfolder", ".stversions", ".DS_Store", "Thumbs.db"}
 
-// globalExcludeSet is globalExcludes as a set for O(1) membership tests in
-// sourceIsEmpty. Derived from globalExcludes so the two cannot drift.
-var globalExcludeSet = func() map[string]bool {
-	m := make(map[string]bool, len(globalExcludes))
-	for _, e := range globalExcludes {
-		m[e] = true
-	}
-	return m
-}()
-
 // defaultCommandRunner builds the rsync subprocess commands with graceful
 // shutdown — SIGTERM on context cancellation, then a DefaultGrace (5s) window
-// before os/exec escalates to SIGKILL — via the shared scheduler library
-// (identical to the hand-rolled runner it replaces). The caller wires
-// Stdout/Stderr on the returned command before Run.
+// before os/exec escalates to SIGKILL — via the shared scheduler library. The
+// caller wires Stdout/Stderr on the returned command before Run.
 var defaultCommandRunner = scheduler.NewCommandRunner(scheduler.DefaultGrace)
 
 // syncStats holds the figures parsed from rsync --stats output.
@@ -88,7 +91,7 @@ type jobResult struct {
 // read-only by the operator) switches ssh from TOFU (accept-new) to strict
 // host-key pinning — a stronger security posture for environments where the
 // remote host key is pre-known. classifyKnownHosts decides that once at boot.
-const knownHostsPath = "/config/known_hosts"
+var knownHostsPath = "/config/known_hosts"
 
 // hostKeyMode is the ssh host-key verification posture, decided once at boot
 // from the content of knownHostsPath and then carried through the pass.
@@ -113,14 +116,46 @@ func (m hostKeyMode) String() string {
 	return "accept-new"
 }
 
+// transport carries the boot-decided rsync transport policy: the ssh
+// host-key posture plus the operator's opt-in attribute and compression
+// switches. The zero value is the shipped default — accept-new TOFU, no
+// attribute flags, no compression — so a caller that wants today's
+// behaviour passes transport{}.
+type transport struct {
+	compress string // "" = off, otherwise an rsync --compress-choice name or "auto"
+	hostKeys hostKeyMode
+	acls     bool
+	xattrs   bool
+}
+
+// extras renders the opt-in switches for the startup banner's rsync_extras
+// attribute, so an operator can confirm a switch took effect; the argument
+// slice itself is never logged.
+func (t transport) extras() string {
+	var on []string
+	if t.acls {
+		on = append(on, "acls")
+	}
+	if t.xattrs {
+		on = append(on, "xattrs")
+	}
+	if t.compress != "" {
+		on = append(on, "compress="+t.compress)
+	}
+	if len(on) == 0 {
+		return "none"
+	}
+	return strings.Join(on, ",")
+}
+
 // classifyKnownHosts decides the host-key posture from what is mounted at
 // path. Absent means accept-new (TOFU). A path that is not a regular file, or
 // a file carrying no entries, can pin nothing: ssh then fails every pass with
-// "Host key verification failed", so this returns an error naming the path and
-// the daemon refuses to start rather than reporting pinning it does not have.
-// Entries are counted, never parsed -- validating one would re-implement ssh's
-// hostfile parser -- so a marker (@cert-authority, @revoked) or hashed (|1|)
-// line counts.
+// "Host key verification failed", so the daemon refuses to start rather than
+// reporting pinning it does not have. Entries are counted, never parsed --
+// parsing would re-implement ssh's hostfile parser -- so a marker
+// (@cert-authority, @revoked) or hashed (|1|) line counts. Lines are read in
+// bounded pieces, so a wrongly-mounted large file cannot exhaust boot memory.
 func classifyKnownHosts(path string) (hostKeyMode, error) {
 	info, err := os.Stat(path)
 	switch {
@@ -131,16 +166,31 @@ func classifyKnownHosts(path string) (hostKeyMode, error) {
 	case !info.Mode().IsRegular():
 		return hostKeyAcceptNew, fmt.Errorf("known_hosts %q is not a regular file", path)
 	}
-	data, err := os.ReadFile(path) // #nosec G304 -- operator-mounted known_hosts path
+	f, err := os.Open(path) // #nosec G304 -- operator-mounted known_hosts path
 	if err != nil {
 		return hostKeyAcceptNew, fmt.Errorf("known_hosts %q: %w", path, err)
 	}
-	for line := range strings.Lines(string(data)) {
-		if t := strings.TrimSpace(line); t != "" && !strings.HasPrefix(t, "#") {
+	defer func() { _ = f.Close() }()
+	br := bufio.NewReader(f)
+	inComment := false
+	for {
+		r, _, rerr := br.ReadRune()
+		switch {
+		case errors.Is(rerr, io.EOF):
+			return hostKeyAcceptNew, fmt.Errorf("known_hosts %q has no entries", path)
+		case rerr != nil:
+			return hostKeyAcceptNew, fmt.Errorf("known_hosts %q: %w", path, rerr)
+		case r == '\n':
+			inComment = false
+		case inComment, unicode.IsSpace(r):
+			// Discarding rune by rune allocates nothing, so a line of any
+			// length stays inside the reader's fixed buffer.
+		case r == '#':
+			inComment = true
+		default:
 			return hostKeyStrict, nil
 		}
 	}
-	return hostKeyAcceptNew, fmt.Errorf("known_hosts %q has no entries", path)
 }
 
 // sshCommand builds the single -e argument string. rsync splits it
@@ -165,9 +215,22 @@ func sshCommand(key string, mode hostKeyMode) string {
 
 // buildRsyncArgs assembles the explicit argument slice for a job. The
 // archive-ish flag set is -rlptD (recurse, links, perms, times, devices/
-// specials) minus owner/group/ACL/xattr, matching a logs-only one-way push.
-func buildRsyncArgs(j *job, mode hostKeyMode) []string {
+// specials) minus owner/group/ACL/xattr, matching a logs-only one-way push;
+// -A, -X and -z are appended only for the switches the operator opted into.
+func buildRsyncArgs(j *job, tr transport) []string {
 	args := []string{"-rlptD"}
+	if tr.acls {
+		args = append(args, "-A")
+	}
+	if tr.xattrs {
+		args = append(args, "-X")
+	}
+	if tr.compress != "" {
+		args = append(args, "-z")
+		if tr.compress != "auto" {
+			args = append(args, "--compress-choice="+tr.compress)
+		}
+	}
 	if j.Delete {
 		args = append(args, "--delete")
 		// --max-delete (when configured) caps the deletions a single pass may
@@ -180,7 +243,7 @@ func buildRsyncArgs(j *job, mode hostKeyMode) []string {
 	if j.RemoteUID != nil && j.RemoteGID != nil {
 		args = append(args, fmt.Sprintf("--chown=%d:%d", *j.RemoteUID, *j.RemoteGID))
 	}
-	args = append(args, "--stats", "-e", sshCommand(j.SSHKey, mode))
+	args = append(args, "--stats", "-e", sshCommand(j.SSHKey, tr.hostKeys))
 
 	// Every pattern goes through --filter with an explicit "- " rule prefix rather
 	// than --exclude: rsync reads an --exclude VALUE in old-prefix mode, where a
@@ -203,54 +266,39 @@ func buildRsyncArgs(j *job, mode hostKeyMode) []string {
 	return args
 }
 
-// sourceIsEmpty reports whether the local source directory has nothing worth
-// mirroring: it is missing, unreadable, truly empty, or contains ONLY
-// globally-excluded entries (.stfolder, .DS_Store, …). Such a source skips the
-// job, because an empty sender under --delete deletes every non-excluded file on
-// the receiver — and an excludes-only source would pass a naive "any entry
-// present" check while transferring nothing. Any read error is treated as empty
-// for the same reason. This is a pre-flight check, not a guarantee: rsync builds
-// its own file list after the process starts, so a source that empties in that
-// window still reaches --delete, and --max-delete is the only backstop inside the
-// transfer.
-//
-// Only globalExcludes are considered here, not per-job excludes. The globals
-// are exact filenames, so membership is exact and cheap; per-job excludes are
-// rsync glob patterns whose matching semantics are not safely replicated with a
-// simple name comparison (a wrong guess would falsely skip a real source). A
-// source reduced to only per-job-excluded content is therefore still mirrored;
-// bound that residual case with an rsync --max-delete backstop if needed.
-func sourceIsEmpty(path string) bool {
+// sourceIsEmpty reports whether the local source has nothing worth mirroring:
+// missing, truly empty, or holding ONLY globally-excluded entries. Such a source
+// skips the job, because an empty sender under --delete deletes every
+// non-excluded file on the receiver. Any other read failure is returned as an
+// error, so a broken source is never mistaken for a benign empty one. Per-job
+// excludes are deliberately not applied: they are rsync globs, and approximating
+// their match could falsely skip a real source. Pre-flight only — rsync rebuilds
+// its own file list after this returns.
+func sourceIsEmpty(path string) (bool, error) {
 	f, err := os.Open(path) // #nosec G304 -- operator-mounted source path
 	if err != nil {
-		// A missing dir is the expected "not yet mounted / empty" case and
-		// stays silent. Any other open error (permission denied, broken mount)
-		// is surfaced -- still skip to protect the remote, but do not mask the
-		// breakage as a benign empty source.
-		if !errors.Is(err, os.ErrNotExist) {
-			slog.Warn("source unreadable, skipping to protect remote", "path", path, "error", err)
+		if errors.Is(err, os.ErrNotExist) {
+			return true, nil
 		}
-		return true
+		return false, err
 	}
 	defer func() { _ = f.Close() }()
 
-	// Scan all top-level entries in batches, short-circuiting on the first
-	// entry rsync would actually mirror (i.e. not in globalExcludeSet). io.EOF
-	// is the normal end-of-directory signal; any other read error (I/O failure,
-	// not-a-directory) is a broken source -- skip for safety but surface it.
+	// Scan top-level entries in batches, short-circuiting on the first entry
+	// rsync would mirror (not in globalExcludes). io.EOF ends the directory;
+	// any other read error is returned, not skipped.
 	for {
 		names, rerr := f.Readdirnames(256)
 		for _, n := range names {
-			if !globalExcludeSet[n] {
-				return false // a mirrorable entry exists
+			if !slices.Contains(globalExcludes, n) {
+				return false, nil // a mirrorable entry exists
 			}
 		}
 		if errors.Is(rerr, io.EOF) {
-			return true // only globally-excluded entries (or none)
+			return true, nil // only globally-excluded entries (or none)
 		}
 		if rerr != nil {
-			slog.Warn("source unreadable, skipping to protect remote", "path", path, "error", rerr)
-			return true
+			return false, rerr
 		}
 	}
 }
@@ -289,25 +337,12 @@ func parseNum(s string) int64 {
 	return n
 }
 
-// exitCode extracts a process exit code from a run error: 0 for success,
-// the real code for a non-zero exit, and -1 for failures that never
-// produced an exit status (e.g. binary not found, context cancellation).
-func exitCode(err error) int {
-	if err == nil {
-		return 0
-	}
-	if ee, ok := errors.AsType[*exec.ExitError](err); ok {
-		return ee.ExitCode()
-	}
-	return -1
-}
-
 // tail returns the last n bytes of s, prefixed to indicate truncation. The cut
 // advances to the next rune start, so no continuation byte of a split rune
 // survives at the head of the retained tail (which would render as
-// unattributable noise: the rune it belonged to is gone). It re-encodes
-// nothing, so a byte that was never part of a valid rune is returned as it
-// stands.
+// unattributable noise: the rune it belonged to is gone). Leading continuation
+// bytes are skipped whether they came from a split valid rune or malformed
+// input; invalid bytes elsewhere in the retained tail are returned unchanged.
 func tail(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -322,11 +357,21 @@ func tail(s string, n int) string {
 // runJob executes one sync job and returns its result. An empty source is
 // skipped and counts as success. Otherwise success is rsync exiting 0, or
 // exiting with the vanished-files warning code.
-func runJob(ctx context.Context, j *job, timeout time.Duration, mode hostKeyMode, newCmd scheduler.CommandRunner) jobResult {
+func runJob(ctx context.Context, j *job, timeout time.Duration, tr transport, newCmd scheduler.CommandRunner) jobResult {
 	start := time.Now()
 	var res jobResult
 
-	if sourceIsEmpty(j.Local) {
+	empty, err := sourceIsEmpty(j.Local)
+	if err != nil {
+		res.duration = time.Since(start)
+		slog.Error("sync failed",
+			"job", j.Name,
+			"path", j.Local,
+			"duration_ms", res.duration.Milliseconds(),
+			"error", err)
+		return res
+	}
+	if empty {
 		slog.Warn("skip empty source", "job", j.Name, "path", j.Local)
 		res.skipped = true
 		res.success = true
@@ -339,64 +384,91 @@ func runJob(ctx context.Context, j *job, timeout time.Duration, mode hostKeyMode
 
 	outBuf := &cappedBuffer{max: outputCapBytes}
 	errBuf := &cappedBuffer{max: outputCapBytes}
-	cmd := newCmd(jobCtx, "rsync", buildRsyncArgs(j, mode)...)
+	cmd := newCmd(jobCtx, "rsync", buildRsyncArgs(j, tr)...)
 	cmd.Stdout = outBuf
 	cmd.Stderr = errBuf
 
 	runErr := cmd.Run()
 	res.duration = time.Since(start)
-	res.exitCode = exitCode(runErr)
 
 	stats := parseStats(outBuf.String())
 	res.files = stats.files
 	res.bytes = stats.bytes
 
-	if runErr != nil {
-		res.stderrTail = tail(errBuf.String(), logStderrTailBytes)
-		// A cancelled parent context means graceful shutdown SIGTERM'd this
-		// in-flight rsync -- not a real failure; real timeouts cancel only
-		// jobCtx (not ctx) so they still reach the error branch below.
-		if ctx.Err() != nil {
-			res.interrupted = true
-			slog.Info("sync interrupted by shutdown",
-				"job", j.Name,
-				"duration_ms", res.duration.Milliseconds())
-			return res
-		}
-		if res.exitCode == rsyncVanishedExit {
-			res.success = true
-			slog.Warn("sync completed with vanished source files",
-				"job", j.Name,
-				"files", res.files,
-				"bytes", res.bytes,
-				"duration_ms", res.duration.Milliseconds(),
-				"rsync_exit", res.exitCode,
-				"stderr", res.stderrTail)
-			return res
-		}
-		slog.Error("sync failed",
+	// The child's report decides the outcome; ctx.Err() carries causality only
+	// where that report is absent or signal-shaped, because os/exec substitutes
+	// ctx.Err() for a nil error on SUCCESS only, never for a non-zero exit.
+	ps := cmd.ProcessState
+	if ps != nil {
+		res.exitCode = ps.ExitCode()
+	}
+
+	if runErr == nil {
+		res.success = true
+		slog.Info("sync ok",
 			"job", j.Name,
-			"duration_ms", res.duration.Milliseconds(),
-			"timed_out", errors.Is(jobCtx.Err(), context.DeadlineExceeded),
-			"error", runErr,
-			"rsync_exit", res.exitCode,
-			"stderr", res.stderrTail)
+			"files", res.files,
+			"bytes", res.bytes,
+			"duration_ms", res.duration.Milliseconds())
 		return res
 	}
 
-	res.success = true
-	slog.Info("sync ok",
+	res.stderrTail = tail(errBuf.String(), logStderrTailBytes)
+	drained := false
+	switch {
+	case ps == nil:
+		// No child ran: Start refused on an already-cancelled context, or the
+		// exec itself failed. This is the only state with no exit status.
+		res.exitCode = -1
+		drained = ctx.Err() != nil
+	case ps.Success():
+		// Exit 0 with a non-nil error: os/exec's success-only ctx.Err()
+		// substitution, or exec.ErrWaitDelay after a clean exit. The transfer
+		// completed either way.
+		res.success = true
+		slog.Warn("sync completed with a residual run error",
+			"job", j.Name,
+			"files", res.files,
+			"bytes", res.bytes,
+			"duration_ms", res.duration.Milliseconds(),
+			"error", runErr)
+		return res
+	case res.exitCode == rsyncVanishedExit && !strings.Contains(errBuf.String(), rsyncDelLimitWarn):
+		res.success = true
+		slog.Warn("sync completed with vanished source files",
+			"job", j.Name,
+			"files", res.files,
+			"bytes", res.bytes,
+			"duration_ms", res.duration.Milliseconds(),
+			"rsync_exit", res.exitCode,
+			"stderr", res.stderrTail)
+		return res
+	case res.exitCode < 0, res.exitCode == rsyncSignalExit:
+		// Died on a signal: our SIGTERM arriving before rsync installed its own
+		// handlers, or the WaitDelay SIGKILL -- ours iff the parent is cancelled.
+		drained = ctx.Err() != nil
+	}
+
+	if drained {
+		res.interrupted = true
+		slog.Info("sync interrupted by shutdown",
+			"job", j.Name,
+			"duration_ms", res.duration.Milliseconds())
+		return res
+	}
+	slog.Error("sync failed",
 		"job", j.Name,
-		"files", res.files,
-		"bytes", res.bytes,
-		"duration_ms", res.duration.Milliseconds())
+		"duration_ms", res.duration.Milliseconds(),
+		"timed_out", errors.Is(jobCtx.Err(), context.DeadlineExceeded),
+		"error", runErr,
+		"rsync_exit", res.exitCode,
+		"stderr", res.stderrTail)
 	return res
 }
 
 // passResult is the structured outcome of one sync pass. The health
 // controller, the reporter, and the pass exit status each derive their action
-// from this single value, so the outcomes can never be re-conflated by a
-// caller reading a bare int.
+// from this single value.
 type passResult struct {
 	trigger      string        // startup | interval | external
 	total        int           // jobs configured
@@ -407,26 +479,17 @@ type passResult struct {
 	interrupted  bool          // ctx cancelled mid-pass (graceful shutdown drain)
 }
 
-// healthSignal reports whether this result should write the health marker
-// (set) and to what value (healthy). Every pass writes its value EXCEPT an
-// interrupted-clean one — no job failed (interrupted and unstarted jobs are
-// not counted as failures) and a shutdown signal coincided with pass-end —
-// which writes nothing, so a graceful drain cannot stamp a false-unhealthy
-// marker that would outlive it. A real failure still writes unhealthy when
-// interrupted, and shutdown itself marks unhealthy via beginDrain.
-func (r *passResult) healthSignal() (set, healthy bool) {
-	if r.interrupted && r.failed == 0 {
-		return false, false // interrupted-clean: no job failed; don't downgrade the marker
-	}
-	return true, r.failed == 0
-}
+// healthy reports the marker value this pass implies: a pass is healthy iff no
+// job failed. Interrupted and unstarted jobs are not failures, so a pass cut
+// short by shutdown with every started job succeeding is healthy.
+func (r *passResult) healthy() bool { return r.failed == 0 }
 
 // exitStatus is the pass's process-level status, delivered to a triggering
 // `sync` client as its exit code: 1 on any job failure, 0 on a clean pass.
 //
 // An interrupted-clean pass exits 0 — no job failed, and interrupted or
-// unstarted jobs are not counted as failures. healthSignal declines to write
-// the marker in the same case, so the two agree: exit 0 and no
+// unstarted jobs are not counted as failures. The health controller declines
+// to write the marker in the same case, so the two agree: exit 0 and no
 // false-unhealthy marker. An interrupted pass with a real failure exits 1.
 func (r *passResult) exitStatus() int {
 	if r.failed > 0 {
@@ -435,28 +498,22 @@ func (r *passResult) exitStatus() int {
 	return 0
 }
 
-// runPass runs every job once and returns a structured result. It performs NO
-// pass-level logging and never touches the health marker: reportPass owns the
-// pass-level log line and the health controller owns the marker, each
-// deriving its action from the returned result. Keeping execution separate
-// from interpretation is what prevents an early return from silently omitting
-// a signal. Concurrency control is not this function's job: the daemon's
-// single executor goroutine is the only caller, and the queue in front of it
-// serializes every trigger source (ticker, socket clients) — the flock that
-// used to guard a cross-process `sync` exec is gone because there is no
-// second executing process anymore.
-func runPass(ctx context.Context, cfg config, timeout time.Duration, mode hostKeyMode, trigger string, newCmd scheduler.CommandRunner) passResult {
+// runPass runs every job once and returns their aggregate result. The daemon's
+// single executor is the only caller and owns serialization; reportPass and the
+// health controller own the pass-level side effects.
+func runPass(ctx context.Context, cfg config, timeout time.Duration, tr transport, trigger string, newCmd scheduler.CommandRunner) passResult {
 	res := passResult{trigger: trigger, total: len(cfg.Jobs)}
 	start := time.Now()
 	for i := range cfg.Jobs {
 		if ctx.Err() != nil {
-			// Graceful shutdown landed mid-pass: do not start the remaining jobs
-			// under an already-cancelled context (they would fail-fast and
-			// inflate the failure count). res.interrupted is recorded after the
-			// loop so healthSignal/reportPass see the drain.
+			// Graceful shutdown landed mid-pass: do not start the remaining jobs. A
+			// cancelled parent classifies as interrupted, never failed, but each
+			// unstarted job would still log its own line — or count as an ok skip if
+			// its source is empty — claiming outcomes the drain never considered.
+			// res.interrupted is recorded after the loop so the pass reports the drain.
 			break
 		}
-		jr := runJob(ctx, &cfg.Jobs[i], timeout, mode, newCmd)
+		jr := runJob(ctx, &cfg.Jobs[i], timeout, tr, newCmd)
 		switch {
 		case jr.skipped:
 			res.emptySkipped++
@@ -466,9 +523,9 @@ func runPass(ctx context.Context, cfg config, timeout time.Duration, mode hostKe
 		case jr.interrupted:
 			// SIGTERM'd mid-transfer by graceful shutdown. runJob classifies this
 			// as "not a real failure"; do NOT count it as failed, so an otherwise
-			// clean pass keeps failed==0 and healthSignal's interrupted-clean
-			// carve-out can fire (no false-unhealthy marker, exit 0). A genuine
-			// rsync failure still lands in the default arm and sets failed>0.
+			// clean pass keeps failed==0, so it exits 0 and the health controller
+			// writes no marker for it. A genuine rsync failure still lands in the
+			// default arm and sets failed>0.
 		default:
 			res.failed++
 		}
@@ -478,9 +535,9 @@ func runPass(ctx context.Context, cfg config, timeout time.Duration, mode hostKe
 	return res
 }
 
-// reportPass emits the single pass-level log line for a pass. Every pass
-// produces exactly one structured line, so no path can return from a pass
-// without a signal.
+// reportPass emits the single pass-level log line for a pass that RAN:
+// exactly one structured line per runPass result, heartbeat or drain. A
+// request that never reaches runPass carries its own error record instead.
 func reportPass(r *passResult) {
 	if r.interrupted {
 		// A real pass began but was cut short by graceful shutdown. Logged at

@@ -11,7 +11,9 @@
 # build replaced. The ssh transport (openssh-client, deliberately still an
 # apk package) is asserted present alongside, as is the embedded CycloneDX
 # SBOM fragment that keeps the source-built rsync visible to the signed
-# release SBOM.
+# release SBOM. A real --max-delete run pins the verbatim stderr line sync.go's
+# exit-24 classifier keys on, so an upstream rewording fails the build instead
+# of silently reporting a tripped deletion cap as a clean pass.
 #
 # Run locally:  sh tests/smoke.sh   (needs rsync + ssh on PATH)
 set -eu
@@ -70,14 +72,49 @@ for feature in ACLs xattrs xxhash zstd lz4; do
   esac
 done
 
-# 4. The ssh transport is present (openssh-client stays an apk package; every
+# 4. --max-delete diagnostic contract: sync.go's exit-24 classifier keys on
+#    rsyncDelLimitWarn, the verbatim stderr line below, to tell "only files
+#    vanished" (a healthy pass) from "the deletion cap also tripped" (a failed
+#    one) -- rsync assigns 24 AFTER status 25, so that line is the only
+#    surviving witness. A reworded upstream message makes a tripped
+#    --max-delete report as a clean healthy pass, so pin the behaviour with a
+#    real local run. Needs no ssh and no network.
+del_dir=$(mktemp -d)
+mkdir -p "$del_dir/src" "$del_dir/dst"
+printf 'a' >"$del_dir/src/a"
+printf 'b' >"$del_dir/src/b"
+if rsync -rlptD "$del_dir/src/" "$del_dir/dst/" >/dev/null 2>&1; then
+  rm -f "$del_dir/src/a" "$del_dir/src/b"
+  del_out=$(rsync -rlptD --delete --max-delete=1 "$del_dir/src/" "$del_dir/dst/" 2>&1) && del_rc=0 || del_rc=$?
+  if [ "$del_rc" -eq 0 ]; then
+    err "FAIL: 'rsync --delete --max-delete=1' succeeded with the cap tripped (sync.go's exit-24 classifier expects a failure)"
+    err "$del_out"
+    fail=1
+  fi
+  case "$del_out" in
+    *"Deletions stopped due to --max-delete limit"*) ;;
+    *)
+      err "FAIL: rsync no longer prints 'Deletions stopped due to --max-delete limit' on a tripped cap."
+      err "      sync.go's rsyncDelLimitWarn constant is that exact string, and its exit-24 classifier"
+      err "      keys on it; without the line a tripped --max-delete reports as a clean healthy pass."
+      err "$del_out"
+      fail=1
+      ;;
+  esac
+else
+  err "FAIL: local rsync seed transfer for the --max-delete check failed"
+  fail=1
+fi
+rm -rf "$del_dir"
+
+# 5. The ssh transport is present (openssh-client stays an apk package; every
 #    job runs rsync -e ssh).
 if ! command -v ssh >/dev/null 2>&1; then
   err "FAIL: ssh not found on PATH (openssh-client missing)"
   fail=1
 fi
 
-# 5. Embedded SBOM fragment (Dockerfile rsync-builder stage): the CycloneDX
+# 6. Embedded SBOM fragment (Dockerfile rsync-builder stage): the CycloneDX
 #    file covering the source-built rsync must ship in the image, be
 #    JSON-shaped, and name rsync at exactly the pinned version (the release
 #    pipeline's sbom-cataloger inventories it — without it the source-built
@@ -109,7 +146,7 @@ if [ -n "${RSYNC_EXPECTED_VERSION:-}" ]; then
   fi
 fi
 
-# 6. --stats label contract: the Go scheduler's parseStats (sync.go) matches
+# 7. --stats label contract: the Go scheduler's parseStats (sync.go) matches
 #    "Number of regular files transferred:" and the transferred-size labels in
 #    rsync --stats output. Older rsyncs used a different label ("Number of
 #    files transferred:"), and a future major could rename again — which would

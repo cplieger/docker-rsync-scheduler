@@ -26,7 +26,7 @@ func probeOptions() []health.ProbeOption {
 		return nil
 	}
 	data, err := readCappedConfig(configPath())
-	if err != nil || len(data) > configCapBytes {
+	if err != nil {
 		return nil
 	}
 	cfg, err := parseConfig(data)
@@ -64,10 +64,10 @@ type healthMarker interface {
 // funnels through its mutex, and it enforces one invariant the bare marker
 // cannot: once shutdown begins, health is monotonic toward unhealthy. A pass
 // that finishes right as the container is draining can never flip the marker
-// back to healthy, and an interrupted-clean pass — which carries no health
-// signal of its own — never writes at all. These two guarantees are what make
-// the marker reflect the last real pass outcome instead of whichever
-// goroutine happened to write last.
+// back to healthy, and an interrupted-clean pass — no job failed, and
+// shutdown coincided with pass-end — never writes at all. These two guarantees
+// are what make the marker reflect the last real pass outcome instead of
+// whichever goroutine happened to write last.
 type healthController struct {
 	marker   healthMarker
 	mu       sync.Mutex
@@ -88,16 +88,15 @@ func (h *healthController) markInitial(healthy bool) {
 	h.marker.Set(healthy)
 }
 
-// apply translates a pass result into a marker write. An interrupted-clean
-// pass carries no health signal and is ignored (see passResult.healthSignal);
-// any other pass writes its health value, unless shutdown has begun and that
-// value is healthy (the drain latch stops a late success from masking
-// shutdown).
+// apply translates a pass result into a marker write, and holds both drain
+// rules: an interrupted-clean pass writes nothing (no job failed, so there is
+// no state to record and a drain must not emit a healthy transition), and no
+// pass writes healthy once shutdown has begun.
 func (h *healthController) apply(r *passResult) {
-	set, healthy := r.healthSignal()
-	if !set {
+	if r.interrupted && r.failed == 0 {
 		return
 	}
+	healthy := r.healthy()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.draining && healthy {

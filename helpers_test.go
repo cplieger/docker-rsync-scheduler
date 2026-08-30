@@ -28,13 +28,6 @@ func fixedRunner(bin string) scheduler.CommandRunner {
 	}
 }
 
-// recordingRunner is fixedRunner with a test handle, for call sites that read
-// better with the t argument (parity with the sibling scheduler's suite).
-func recordingRunner(t *testing.T, bin string) scheduler.CommandRunner {
-	t.Helper()
-	return fixedRunner(bin)
-}
-
 // newTestDaemon builds a daemon wired to a temp health marker and the given
 // runner, with the executor started. Returns the daemon, the shutdown cancel,
 // a channel closed when the executor has drained, and the marker path.

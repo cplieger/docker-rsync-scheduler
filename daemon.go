@@ -33,10 +33,10 @@ type daemon struct {
 	queue *trigger.Queue[struct{}]
 	// hc is the single writer of the health marker; every pass outcome
 	// funnels through it (drain latch, interrupted-clean carve-out).
-	hc       *healthController
-	newCmd   scheduler.CommandRunner
-	timeout  time.Duration
-	hostKeys hostKeyMode
+	hc        *healthController
+	newCmd    scheduler.CommandRunner
+	timeout   time.Duration
+	transport transport
 }
 
 // runDaemon runs the long-running container (the `daemon` subcommand): it
@@ -47,6 +47,12 @@ type daemon struct {
 // each rsync child (defaultCommandRunner in production; injected by tests).
 // Returning an error exits non-zero.
 func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandRunner) error {
+	// The marker is created and its removal deferred before the first thing that
+	// can fail: /tmp survives a docker restart, so a boot that fails after a crash
+	// must not leave the previous life's healthy marker for the healthcheck.
+	marker := health.NewMarker(healthMarkerPath)
+	defer marker.Cleanup()
+
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
@@ -66,20 +72,17 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 		return err
 	}
 
-	marker := health.NewMarker(healthMarkerPath)
-	defer marker.Cleanup()
 	hc := newHealthController(marker)
-	// Built-in mode starts unhealthy until the first pass proves the setup
-	// (the startup pass flips it); external mode starts healthy — idle,
-	// nothing has failed — and each triggered pass updates it.
+	// Inverted on purpose: built-in scheduling starts UNHEALTHY.
 	hc.markInitial(!scheduleEnabled)
 
+	tr := loadTransport(hostKeys)
 	d := &daemon{
-		queue:    trigger.NewQueue[struct{}](queueCapacity),
-		hc:       hc,
-		newCmd:   newCmd,
-		timeout:  timeout,
-		hostKeys: hostKeys,
+		queue:     trigger.NewQueue[struct{}](queueCapacity),
+		hc:        hc,
+		newCmd:    newCmd,
+		timeout:   timeout,
+		transport: tr,
 	}
 
 	executorDone := make(chan struct{})
@@ -87,6 +90,17 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 		defer close(executorDone)
 		trigger.Execute(ctx, d.queue, d.run)
 	}()
+
+	// Announced before admission opens: the accept loop and the ticker's first
+	// fire log from other goroutines, so the boot record must precede them.
+	mode, intervalAttr := "external", "none"
+	if scheduleEnabled {
+		mode, intervalAttr = "built-in", interval.String()
+	}
+	slog.Info("container started ("+mode+" scheduling)",
+		"jobs", len(cfg.Jobs), "config", configPath(), "interval", intervalAttr,
+		"ssh_hostkey_mode", hostKeys.String(), "rsync_extras", tr.extras(),
+		"socket", socketPath)
 
 	// The broker owns the wire (decode, event relay, handler draining); the
 	// hook only supplies this app's acceptance log line. The library's
@@ -99,14 +113,6 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 	srv.Serve(ln)
 
 	tickerDone := startTicker(ctx, d, interval, scheduleEnabled)
-
-	mode, intervalAttr := "external", "none"
-	if scheduleEnabled {
-		mode, intervalAttr = "built-in", interval.String()
-	}
-	slog.Info("container started ("+mode+" scheduling)",
-		"jobs", len(cfg.Jobs), "config", configPath(), "interval", intervalAttr,
-		"ssh_hostkey_mode", hostKeys.String(), "socket", socketPath)
 
 	<-ctx.Done()
 	slog.Info("shutting down", "cause", context.Cause(ctx))
@@ -183,7 +189,7 @@ func (d *daemon) run(ctx context.Context, trig string, _ struct{}) trigger.Outco
 		return trigger.Outcome{OK: false, Duration: time.Since(start), Reason: "config reload failed"}
 	}
 
-	res := runPass(ctx, cfg, d.timeout, d.hostKeys, trig, d.newCmd)
+	res := runPass(ctx, cfg, d.timeout, d.transport, trig, d.newCmd)
 	reportPass(&res)
 	d.hc.apply(&res)
 	return trigger.Outcome{OK: res.exitStatus() == 0, Duration: res.duration}

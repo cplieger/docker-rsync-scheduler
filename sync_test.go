@@ -40,7 +40,7 @@ func TestRunJob_successParsesStatsAndMarksSuccess(t *testing.T) {
 		return exec.CommandContext(ctx, "sh", "-c",
 			"printf 'Number of regular files transferred: 5\\nTotal transferred file size: 2048 bytes\\n'; exit 0")
 	}
-	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), time.Minute, hostKeyAcceptNew, newCmd)
+	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), time.Minute, transport{}, newCmd)
 	if !res.success {
 		t.Errorf("success = false, want true")
 	}
@@ -63,7 +63,7 @@ func TestRunJob_failureCapturesExitCodeAndStderr(t *testing.T) {
 		return exec.CommandContext(ctx, "sh", "-c",
 			"printf 'rsync error: link_stat failed\\n' >&2; exit 23")
 	}
-	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), time.Minute, hostKeyAcceptNew, newCmd)
+	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), time.Minute, transport{}, newCmd)
 	if res.success {
 		t.Errorf("success = true, want false")
 	}
@@ -86,7 +86,7 @@ func TestRunJob_failureRetainsFinalStderrDiagnostic(t *testing.T) {
 			"dd if=/dev/zero bs=1048576 count=2 1>&2 2>/dev/null; printf 'terminal-diagnostic\\n' >&2; exit 23")
 	}
 
-	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), time.Minute, hostKeyAcceptNew, newCmd)
+	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), time.Minute, transport{}, newCmd)
 
 	if !strings.HasSuffix(res.stderrTail, "terminal-diagnostic\n") {
 		t.Errorf("stderrTail suffix = %q, want terminal diagnostic", res.stderrTail)
@@ -113,7 +113,7 @@ func TestRunJob_vanishedFilesIsSuccessWithWarning(t *testing.T) {
 			"printf 'Number of regular files transferred: 3\\nTotal transferred file size: 1024 bytes\\n'; "+
 				"printf 'file has vanished: \"/src/gone\"\\n' >&2; exit 24")
 	}
-	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), time.Minute, hostKeyAcceptNew, newCmd)
+	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), time.Minute, transport{}, newCmd)
 	if !res.success || res.exitCode != rsyncVanishedExit {
 		t.Errorf("runJob(exit 24) = success:%v exitCode:%d, want true 24", res.success, res.exitCode)
 	}
@@ -143,13 +143,12 @@ func TestRunPass_vanishedFilesPassStaysHealthyAndExitsZero(t *testing.T) {
 		return exec.CommandContext(ctx, "sh", "-c", "exit 24")
 	}
 	src := newRunJobSource(t)
-	r := runPass(t.Context(), config{Jobs: []job{*runJobJob(src)}}, time.Minute, hostKeyAcceptNew, "test", newCmd)
+	r := runPass(t.Context(), config{Jobs: []job{*runJobJob(src)}}, time.Minute, transport{}, "test", newCmd)
 	if r.failed != 0 || r.ok != 1 {
 		t.Errorf("runPass(exit 24) = failed:%d ok:%d, want 0 1", r.failed, r.ok)
 	}
-	set, healthy := r.healthSignal()
-	if !set || !healthy {
-		t.Errorf("healthSignal() = set:%v healthy:%v, want true true", set, healthy)
+	if !r.healthy() {
+		t.Errorf("healthy() = false, want true")
 	}
 	if got := r.exitStatus(); got != 0 {
 		t.Errorf("exitStatus() = %d, want 0 (a vanished-files pass is a success)", got)
@@ -161,7 +160,7 @@ func TestRunJob_emptySourceSkipsWithoutRunning(t *testing.T) {
 		t.Error("runner invoked for empty source; want skip")
 		return exec.CommandContext(ctx, "true")
 	}
-	res := runJob(t.Context(), runJobJob(t.TempDir()), time.Minute, hostKeyAcceptNew, newCmd)
+	res := runJob(t.Context(), runJobJob(t.TempDir()), time.Minute, transport{}, newCmd)
 	if !res.skipped {
 		t.Errorf("skipped = false, want true")
 	}
@@ -182,7 +181,7 @@ func TestRunPass_aggregatesFailures(t *testing.T) {
 	}
 	src := newRunJobSource(t)
 	cfg := config{Jobs: []job{*runJobJob(src), *runJobJob(src)}}
-	r := runPass(t.Context(), cfg, time.Minute, hostKeyAcceptNew, "test", newCmd)
+	r := runPass(t.Context(), cfg, time.Minute, transport{}, "test", newCmd)
 	if r.failed != 1 {
 		t.Errorf("failed = %d, want 1", r.failed)
 	}
@@ -192,7 +191,7 @@ func TestRunPass_aggregatesFailures(t *testing.T) {
 	if calls != 2 {
 		t.Errorf("calls = %d, want 2", calls)
 	}
-	if _, healthy := r.healthSignal(); healthy {
+	if r.healthy() {
 		t.Error("healthy = true, want false (a job failed)")
 	}
 	if r.exitStatus() != 1 {
@@ -217,10 +216,13 @@ func TestRunJob_parentCancellationLogsShutdownNotFailure(t *testing.T) {
 	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 		return exec.CommandContext(ctx, "sh", "-c", "exit 1")
 	}
-	res := runJob(ctx, runJobJob(newRunJobSource(t)), time.Minute, hostKeyAcceptNew, newCmd)
+	res := runJob(ctx, runJobJob(newRunJobSource(t)), time.Minute, transport{}, newCmd)
 
 	if res.success {
 		t.Errorf("runJob success = true, want false when parent context cancelled")
+	}
+	if res.exitCode != -1 {
+		t.Errorf("exitCode = %d, want -1 (no child ran, so there is no exit status)", res.exitCode)
 	}
 	if !rec.Contains("sync interrupted by shutdown") {
 		t.Errorf("runJob logs = %q, want to contain 'sync interrupted by shutdown'", rec.Messages())
@@ -240,7 +242,7 @@ func TestRunJob_jobTimeoutIsReportedAsFailure(t *testing.T) {
 		return exec.CommandContext(ctx, "sleep", "30")
 	}
 
-	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), 20*time.Millisecond, hostKeyAcceptNew, newCmd)
+	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), 20*time.Millisecond, transport{}, newCmd)
 
 	if res.success || res.interrupted {
 		t.Errorf("runJob timeout = success:%v interrupted:%v, want false false", res.success, res.interrupted)
@@ -276,7 +278,7 @@ func TestRunPass_emptySourceSkippedNotCountedAsFailure(t *testing.T) {
 	}
 	cfg := config{Jobs: []job{*runJobJob(t.TempDir())}}
 
-	r := runPass(t.Context(), cfg, time.Minute, hostKeyAcceptNew, "test", newCmd)
+	r := runPass(t.Context(), cfg, time.Minute, transport{}, "test", newCmd)
 
 	if r.failed != 0 {
 		t.Errorf("failed = %d, want 0 (an empty-source skip is not a failure)", r.failed)
@@ -287,7 +289,7 @@ func TestRunPass_emptySourceSkippedNotCountedAsFailure(t *testing.T) {
 	if r.ok != 1 {
 		t.Errorf("ok = %d, want 1 (a skip counts toward ok)", r.ok)
 	}
-	if _, healthy := r.healthSignal(); !healthy {
+	if !r.healthy() {
 		t.Error("healthy = false, want true (an all-skip pass is healthy)")
 	}
 }
@@ -297,7 +299,7 @@ func TestRunPass_emptySourceSkippedNotCountedAsFailure(t *testing.T) {
 // interrupted in-flight job must NOT count as a failure (runJob treats it as
 // "not a real failure"), the remaining jobs must NOT be started under the dead
 // context, and the resulting interrupted-clean pass (failed==0) must take
-// healthSignal's no-write carve-out and exit 0 — so no false-unhealthy marker
+// the health controller's no-write carve-out and exit 0 — so no false-unhealthy marker
 // outlives the drain.
 func TestRunPass_shutdownInterruptedJobIsNotCountedAsFailure(t *testing.T) {
 	t.Parallel()
@@ -312,7 +314,7 @@ func TestRunPass_shutdownInterruptedJobIsNotCountedAsFailure(t *testing.T) {
 	src := newRunJobSource(t)
 	cfg := config{Jobs: []job{*runJobJob(src), *runJobJob(src)}}
 
-	r := runPass(ctx, cfg, time.Minute, hostKeyAcceptNew, "test", newCmd)
+	r := runPass(ctx, cfg, time.Minute, transport{}, "test", newCmd)
 
 	if calls != 1 {
 		t.Errorf("commandRunner calls = %d, want 1 (the second job must be skipped under the cancelled context)", calls)
@@ -323,8 +325,8 @@ func TestRunPass_shutdownInterruptedJobIsNotCountedAsFailure(t *testing.T) {
 	if !r.interrupted {
 		t.Error("interrupted = false, want true")
 	}
-	if set, _ := r.healthSignal(); set {
-		t.Error("healthSignal set = true, want false (interrupted-clean must not write a false-unhealthy marker)")
+	if !r.healthy() {
+		t.Error("healthy() = false, want true (interrupted-clean is not a failure)")
 	}
 	if got := r.exitStatus(); got != 0 {
 		t.Errorf("exitStatus() = %d, want 0 (interrupted-clean exits success)", got)
@@ -348,7 +350,7 @@ func TestDefaultCommandRunner_cancelSignalsProcess(t *testing.T) {
 }
 
 // TestRunPass_realFailureDuringShutdownStillUnhealthy pins the failed>0 half of
-// healthSignal's interrupted carve-out at the runPass integration level.
+// the interrupted carve-out in apply, at the runPass integration level.
 func TestRunPass_realFailureDuringShutdownStillUnhealthy(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
@@ -363,18 +365,130 @@ func TestRunPass_realFailureDuringShutdownStillUnhealthy(t *testing.T) {
 	}
 	src := newRunJobSource(t)
 	cfg := config{Jobs: []job{*runJobJob(src), *runJobJob(src)}}
-	r := runPass(ctx, cfg, time.Minute, hostKeyAcceptNew, "test", newCmd)
+	r := runPass(ctx, cfg, time.Minute, transport{}, "test", newCmd)
 	if r.failed != 1 {
 		t.Errorf("failed = %d, want 1", r.failed)
 	}
 	if !r.interrupted {
 		t.Error("interrupted = false, want true")
 	}
-	set, healthy := r.healthSignal()
-	if !set || healthy {
-		t.Errorf("healthSignal() = (set=%v, healthy=%v), want (true, false)", set, healthy)
+	if r.healthy() {
+		t.Errorf("healthy() = true, want false")
 	}
 	if got := r.exitStatus(); got != 1 {
 		t.Errorf("exitStatus() = %d, want 1", got)
+	}
+}
+
+
+// TestRunPass_childFailureUnderCancelledParentStillFails pins the race the
+// classifier exists for: a child that reports a concrete non-zero exit of its
+// own while the parent context is ALREADY cancelled. os/exec substitutes
+// ctx.Err() only for a nil error, so that report reaches runJob intact and must
+// be classified as a failure, not swallowed as a drain. A ctx-first read makes
+// this row go red. The runner deliberately builds a context-free command so the
+// child runs to completion under the cancelled parent, which is the state the
+// census measured.
+func TestRunPass_childFailureUnderCancelledParentStillFails(t *testing.T) {
+	rec := capture.Default(t) // process-global handler: no t.Parallel
+	ctx, cancel := context.WithCancel(t.Context())
+
+	newCmd := func(context.Context, string, ...string) *exec.Cmd {
+		cancel() // the drain lands while this child is already exiting
+		return exec.Command("sh", "-c", "printf 'rsync error: some files could not be transferred\\n' >&2; exit 23")
+	}
+	src := newRunJobSource(t)
+
+	r := runPass(ctx, config{Jobs: []job{*runJobJob(src)}}, time.Minute, transport{}, "test", newCmd)
+
+	if r.failed != 1 {
+		t.Errorf("failed = %d, want 1 (a concrete child failure is not a drain)", r.failed)
+	}
+	if got := r.exitStatus(); got != 1 {
+		t.Errorf("exitStatus() = %d, want 1", got)
+	}
+	const message = "sync failed"
+	if got := rec.CountLevel(slog.LevelError, message); got != 1 {
+		t.Errorf("%q ERROR records = %d, want 1; logs = %q", message, got, rec.Messages())
+	}
+	if !rec.HasAttr(message, "rsync_exit", "23") {
+		t.Errorf("%q missing rsync_exit=23; logs = %q", message, rec.Messages())
+	}
+	if got := rec.CountExact("sync interrupted by shutdown"); got != 0 {
+		t.Errorf("%q emitted %d time(s), want 0; logs = %q", "sync interrupted by shutdown", got, rec.Messages())
+	}
+}
+
+// TestRunPass_signalExitUnderCancelledParentIsInterruptedClean pins the
+// complement: rsync exits 20 (RERR_SIGNAL) when it is signalled, which is what
+// a graceful drain of a mid-transfer pass looks like. Under a cancelled parent
+// that stays interrupted-clean — exit 0 for the triggering client and no marker
+// write at all — which is the drain contract a bare ctx-first-to-child-first
+// swap would destroy.
+func TestRunPass_signalExitUnderCancelledParentIsInterruptedClean(t *testing.T) {
+	rec := capture.Default(t) // process-global handler: no t.Parallel
+	ctx, cancel := context.WithCancel(t.Context())
+
+	newCmd := func(context.Context, string, ...string) *exec.Cmd {
+		cancel()
+		return exec.Command("sh", "-c", "exit 20")
+	}
+	src := newRunJobSource(t)
+
+	r := runPass(ctx, config{Jobs: []job{*runJobJob(src)}}, time.Minute, transport{}, "test", newCmd)
+
+	if !r.interrupted {
+		t.Error("interrupted = false, want true")
+	}
+	if r.failed != 0 {
+		t.Errorf("failed = %d, want 0 (exit 20 under a cancelled parent is a drain)", r.failed)
+	}
+	if got := r.exitStatus(); got != 0 {
+		t.Errorf("exitStatus() = %d, want 0", got)
+	}
+	m := &fakeMarker{}
+	newHealthController(m).apply(&r)
+	if _, writes := m.state(); writes != 0 {
+		t.Errorf("marker writes = %d, want 0 (an interrupted-clean drain writes nothing)", writes)
+	}
+	if got := rec.CountExact("sync failed"); got != 0 {
+		t.Errorf("%q emitted %d time(s), want 0; logs = %q", "sync failed", got, rec.Messages())
+	}
+	if !rec.Contains("sync interrupted by shutdown") {
+		t.Errorf("logs = %q, want to contain 'sync interrupted by shutdown'", rec.Messages())
+	}
+}
+
+// TestRunPass_vanishedWithDeleteLimitIsFailure is the oracle for the vanished
+// arm's second witness. rsync assigns 24 AFTER the --max-delete status 25, so
+// exit 24 alone cannot distinguish "only files vanished" from "the deletion cap
+// also tripped"; the del-limit line on stderr is the only surviving evidence.
+// Deleting that witness makes this row go red while
+// TestRunJob_vanishedFilesIsSuccessWithWarning (exit 24, no such line) stays
+// green — the two together pin the split.
+func TestRunPass_vanishedWithDeleteLimitIsFailure(t *testing.T) {
+	rec := capture.Default(t) // process-global handler: no t.Parallel
+	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c",
+			"printf 'file has vanished: \"/src/gone\"\\n' >&2; "+
+				"printf '"+rsyncDelLimitWarn+" (4 skipped)\\n' >&2; exit 24")
+	}
+	src := newRunJobSource(t)
+
+	r := runPass(t.Context(), config{Jobs: []job{*runJobJob(src)}}, time.Minute, transport{}, "test", newCmd)
+
+	if r.failed != 1 {
+		t.Errorf("failed = %d, want 1 (a capped deletion is a failed pass)", r.failed)
+	}
+	if got := r.exitStatus(); got != 1 {
+		t.Errorf("exitStatus() = %d, want 1", got)
+	}
+	const message = "sync failed"
+	if got := rec.CountLevel(slog.LevelError, message); got != 1 {
+		t.Errorf("%q ERROR records = %d, want 1; logs = %q", message, got, rec.Messages())
+	}
+	if got := rec.CountExact("sync completed with vanished source files"); got != 0 {
+		t.Errorf("%q emitted %d time(s), want 0; logs = %q",
+			"sync completed with vanished source files", got, rec.Messages())
 	}
 }

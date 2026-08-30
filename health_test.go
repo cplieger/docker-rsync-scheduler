@@ -1,13 +1,14 @@
 package main
 
 import (
+	"math"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeMarker records marker writes so tests can assert the health controller's
-// decisions without touching the filesystem. Fields are ordered largest-first
-// for fieldalignment.
+// decisions without touching the filesystem.
 type fakeMarker struct {
 	mu     sync.Mutex
 	writes int
@@ -27,21 +28,31 @@ func (m *fakeMarker) state() (value bool, writes int) {
 	return m.value, m.writes
 }
 
-func TestHealthController_applyRanCleanIsHealthy(t *testing.T) {
+// TestMaxAgeFor_saturatesOverflow pins the published saturating contract at
+// both overflow boundaries: an interval past half the Duration range, and a
+// jobs*timeout product that would carry the sum past it. Either guard removed
+// wraps — negative for the interval arm (disarming health.WithMaxAge), a short
+// positive lease for the jobs arm (restarting a healthy container) — so the
+// expected value is the contract's own maximum, not arithmetic recomputed from
+// the body.
+func TestMaxAgeFor_saturatesOverflow(t *testing.T) {
 	t.Parallel()
-	m := &fakeMarker{}
-	newHealthController(m).apply(&passResult{failed: 0})
-	if v, w := m.state(); !v || w != 1 {
-		t.Errorf("after clean pass: value=%v writes=%d, want true 1", v, w)
+	const maxDur = time.Duration(math.MaxInt64)
+	tests := []struct {
+		name              string
+		interval, timeout time.Duration
+		jobs              int
+	}{
+		{name: "interval", interval: maxDur/2 + 1, timeout: time.Minute, jobs: 1},
+		{name: "job_timeouts", interval: time.Hour, timeout: maxDur, jobs: 2},
 	}
-}
-
-func TestHealthController_applyRanFailedIsUnhealthy(t *testing.T) {
-	t.Parallel()
-	m := &fakeMarker{}
-	newHealthController(m).apply(&passResult{failed: 1})
-	if v, _ := m.state(); v {
-		t.Error("after failed pass: value=true, want false")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := maxAgeFor(tt.interval, tt.timeout, tt.jobs); got != maxDur {
+				t.Errorf("maxAgeFor(%v, %v, %d) = %v, want %v", tt.interval, tt.timeout, tt.jobs, got, maxDur)
+			}
+		})
 	}
 }
 

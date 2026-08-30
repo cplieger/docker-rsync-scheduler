@@ -103,7 +103,10 @@ Overlapping passes cannot happen in either mode: the daemon runs passes strictly
 | `CONFIG_PATH` | Path to the YAML config inside the container | `/config/config.yaml` | No |
 | `SYNC_INTERVAL` | Built-in scheduler cadence as a Go duration (e.g. `6h`, `30m`); the first pass runs at startup. Set `off` (or `disabled`/`0`) for external triggering, see [Scheduling modes](#scheduling-modes). Falls back to `6h` on unset or unparseable (non-sentinel) values. | `6h` | No |
 | `SYNC_TIMEOUT` | Per-job rsync timeout as a Go duration (e.g. `10m`, `1h`). Falls back to the default on unset, non-positive, or unparseable values, so `0` does not disable the timeout. | `10m` | No |
-| `LOG_LEVEL` | Log level: `debug`, `info`, `warn`, or `error` | `info` | No |
+| `LOG_LEVEL` | Log level: `debug`, `info`, `warn`, or `error`. The startup record (`container started`) and the per-pass heartbeat (`sync cycle complete`) are Info records, so `warn` and `error` remove them and disarm the staleness alert below. | `info` | No |
+| `SYNC_ACLS` | `true` adds rsync `-A` (`--acls`). The remote rsync must support ACLs; verify against your target, because a restricted wrapper such as `rrsync` can filter the option set. | `false` | No |
+| `SYNC_XATTRS` | `true` adds rsync `-X` (`--xattrs`). Same remote precondition as `SYNC_ACLS`. | `false` | No |
+| `SYNC_COMPRESS` | Compression: `off` (or `no`/`false`/`0`) disables it; `on` (or `yes`/`true`/`1`/`auto`) adds `-z` and lets rsync negotiate the algorithm; `zstd`, `lz4` or `zlib` adds `-z --compress-choice=<name>`. Name an algorithm only when you know the receiver has it: the remote refuses an algorithm it lacks and EVERY pass then fails. `on` negotiates and is always safe. Any other value logs a warning and leaves compression off. | `off` | No |
 
 ### Config schema (`config.yaml`)
 
@@ -128,7 +131,7 @@ Write IPv6 `remote_host` literals as the bare address (`2001:db8::1` or `user@20
 
 Two jobs that point at one remote tree with `delete` set warn at startup: each pass can delete what the other put there. rsync excludes are what make such a pair safe, and the container does not try to decide whether yours is.
 
-Every job also receives a fixed set of global excludes: `.stfolder`, `.stversions`, `.DS_Store`, `Thumbs.db`. Each job is pushed with `rsync -rlptD` (archive minus owner/group/ACL/xattr) plus `--stats`, the per-job and global excludes, and the `-e "ssh -i <key> -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10"` transport (strict host-key pinning replaces `accept-new` when a `known_hosts` file is mounted; see [SSH host-key verification](#ssh-host-key-verification)).
+Every job also receives a fixed set of global excludes: `.stfolder`, `.stversions`, `.DS_Store`, `Thumbs.db`. Each job is pushed with `rsync -rlptD` (archive minus owner/group/ACL/xattr) plus `--stats`, the per-job and global excludes, the `-A`, `-X` and `-z` flags for whichever of `SYNC_ACLS`, `SYNC_XATTRS` and `SYNC_COMPRESS` you set, and the `-e "ssh -i <key> -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10"` transport (strict host-key pinning replaces `accept-new` when a `known_hosts` file is mounted; see [SSH host-key verification](#ssh-host-key-verification)).
 
 ### Volumes
 
@@ -192,6 +195,11 @@ groups:
             "sync failed" line either. Restart the container.
 ```
 
+`RsyncSchedulerStalled` matches an Info record, so it needs `LOG_LEVEL` at
+`debug` or `info`; at `warn` or `error` the heartbeat is never emitted and the
+rule fires permanently. The `sync failed` fault rule is an Error record and is
+unaffected.
+
 The "sync cycle complete" line is emitted whether a pass finished clean or with
 failures, so the stall rule is a pure deadman for a scheduler that has stopped
 running (in external mode, one that has stopped being triggered), while per-job
@@ -212,7 +220,7 @@ silently gone empty, and a pass whose rsync reports vanished source files
 
 ## Security
 
-No network listener, no HTTP server, no exposed ports. Triggering is an in-container unix socket (`/tmp/docker-rsync-scheduler.sock`, owner-only `0600`), so trigger authority is scoped to the container's own user, the same boundary `docker exec` already enforces. The image ships `openssh-client` only, no `sshd`. Each job is executed with an explicit argument slice via `exec.CommandContext`; the `-e "ssh ..."` value is a single argument that rsync splits internally, so nothing is passed through a shell. Config is validated at startup and reloaded per pass: required fields present, names unique, `local`/`remote_path` absolute, `remote_host` matched against a strict pattern, the ssh key readable, and every field rejected if it contains shell metacharacters or control characters (defense-in-depth, since the arg-list exec already prevents interpretation).
+No network listener, no HTTP server, no exposed ports. Triggering is an in-container unix socket (`/tmp/docker-rsync-scheduler.sock`, owner-only `0600`), so trigger authority is scoped to the container's own user, the same boundary `docker exec` already enforces. The image ships `openssh-client` only, no `sshd`. Each job is executed with an explicit argument slice via `exec.CommandContext`, and the `-e "ssh ..."` value is one argument that rsync splits into an argv vector itself, so nothing on the local side reaches a shell. The destination argument does reach the remote login shell, so `remote_path` alone is held to a shell-metacharacter refusal, and it also refuses glob characters (`*?[]`), which rsync deliberately does not escape: a pattern-shaped path lets the remote side pick whichever tree matches, and under `--delete` that is the wrong tree. Config is validated at startup and reloaded per pass: required fields present, names unique, `local`/`remote_path` absolute, `remote_host` matched against a strict pattern, the ssh key readable, `ssh_key` and `remote_path` free of spaces, and every field refused ASCII control characters.
 
 ### SSH host-key verification
 
@@ -239,7 +247,7 @@ _Why it runs as root._ The container runs as root by design: it must read host-o
 
 ## Dependencies
 
-All dependencies are updated automatically via [Renovate](https://github.com/renovatebot/renovate); base images and Go modules are pinned by digest/version, and `rsync` is compiled from the pinned upstream release tarball with feature parity to the Alpine package it replaced (ACLs, xattrs, xxhash checksums, zstd/lz4 compression). The build gates that tarball twice before it is extracted: `gpgv` verifies the detached upstream signature against the rsync release signing key committed as `rsync-release.gpg`, and `sha256sum -c` verifies the pinned digest. A version bump therefore needs no manual step, because the digest is recomputed automatically and a swapped tarball still fails the signature gate. The `openssh-client` package and the base userland (including rsync's runtime libraries) track the digest-pinned Alpine release and move when the image is rebuilt.
+All dependencies are updated automatically via [Renovate](https://github.com/renovatebot/renovate); base images and Go modules are pinned by digest/version, and `rsync` is compiled from the pinned upstream release tarball with feature parity to the Alpine package it replaced (ACLs, xattrs, xxhash checksums, zstd/lz4 compression). The ACL, xattr and compression halves are reachable through `SYNC_ACLS`, `SYNC_XATTRS` and `SYNC_COMPRESS`; xxhash needs nothing, because it is the negotiated checksum on every pass. The build gates that tarball twice before it is extracted: `gpgv` verifies the detached upstream signature against the rsync release signing key committed as `rsync-release.gpg`, and `sha256sum -c` verifies the pinned digest. A version bump therefore needs no manual step, because the digest is recomputed automatically and a swapped tarball still fails the signature gate. The `openssh-client` package and the base userland (including rsync's runtime libraries) track the digest-pinned Alpine release and move when the image is rebuilt.
 
 | Dependency | Source |
 | --- | --- |

@@ -1,8 +1,6 @@
 package main
 
 import (
-	"errors"
-	"os/exec"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -80,44 +78,6 @@ func TestParseStats(t *testing.T) {
 				t.Errorf("parseStats bytes = %d, want %d", got.bytes, tt.wantBytes)
 			}
 		})
-	}
-}
-
-func TestExitCode(t *testing.T) {
-	t.Parallel()
-	if got := exitCode(nil); got != 0 {
-		t.Errorf("exitCode(nil) = %d, want 0", got)
-	}
-	if got := exitCode(errors.New("boom")); got != -1 {
-		t.Errorf("exitCode(generic) = %d, want -1", got)
-	}
-
-	cmd := exec.Command("sh", "-c", "exit 23")
-	runErr := cmd.Run()
-	if got := exitCode(runErr); got != 23 {
-		t.Errorf("exitCode(exit 23) = %d, want 23", got)
-	}
-}
-
-// TestCappedBuffer_capEnforcedAcrossWrites pins the sliding window across two
-// writes. The second write is a full-cap write, so it discards the retained
-// prefix entirely; observing the retained bytes rather than the count is what
-// catches a Next/append inversion.
-func TestCappedBuffer_capEnforcedAcrossWrites(t *testing.T) {
-	t.Parallel()
-	b := &cappedBuffer{max: 4}
-
-	n1, _ := b.Write([]byte("ab"))
-	n2, _ := b.Write([]byte("cdef"))
-
-	if n1 != 2 || n2 != 4 {
-		t.Errorf("Write lengths = (%d, %d), want (2, 4)", n1, n2)
-	}
-	if b.String() != "cdef" {
-		t.Errorf("cappedBuffer after writes = %q, want cdef", b.String())
-	}
-	if len(b.String()) > 4 {
-		t.Errorf("cappedBuffer length = %d, want <= cap 4", len(b.String()))
 	}
 }
 

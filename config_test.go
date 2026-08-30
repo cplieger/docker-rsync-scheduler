@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -206,12 +207,11 @@ func TestValidate(t *testing.T) {
 			wantErr: "remote_host",
 		},
 		{
-			name: "dangerous char in local",
+			name: "semicolon in local is accepted",
 			cfg: config{Jobs: []job{{
 				Name: "j", Local: "/a;rm", RemoteHost: "host",
 				RemotePath: "/b", SSHKey: key,
 			}}},
-			wantErr: "forbidden characters",
 		},
 		{
 			name: "dollar in remote_path",
@@ -227,16 +227,15 @@ func TestValidate(t *testing.T) {
 				Name: "j", Local: "/a\nrm", RemoteHost: "host",
 				RemotePath: "/b", SSHKey: key,
 			}}},
-			wantErr: "forbidden characters",
+			wantErr: "control characters",
 		},
 		{
-			name: "dangerous char in exclude",
+			name: "semicolon in exclude is accepted",
 			cfg: config{Jobs: []job{{
 				Name: "j", Local: "/a", RemoteHost: "host",
 				RemotePath: "/b", SSHKey: key,
 				Excludes: []string{"good", "bad;evil"},
 			}}},
-			wantErr: "forbidden characters",
 		},
 		{
 			name: "glob exclude is allowed",
@@ -247,12 +246,12 @@ func TestValidate(t *testing.T) {
 			}}},
 		},
 		{
-			name: "ssh_key missing file",
+			name: "ssh_key is a directory",
 			cfg: config{Jobs: []job{{
 				Name: "j", Local: "/a", RemoteHost: "host",
-				RemotePath: "/b", SSHKey: "/nonexistent/key",
+				RemotePath: "/b", SSHKey: t.TempDir(),
 			}}},
-			wantErr: "not readable",
+			wantErr: "not a regular file",
 		},
 	}
 
@@ -272,6 +271,33 @@ func TestValidate(t *testing.T) {
 				t.Errorf("validate() error = %q, want to contain %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestValidate_sshKeyMissingIsNotExist pins the missing-key CAUSE at the frame
+// an operator's `config validation failed` record carries. job.validate wraps
+// checkReadable's error with %w, and errors.Is traverses that chain, so this is
+// the same sentinel test one frame out — and unlike a direct test of the private
+// helper it survives a rename, an extraction or a replacement of checkReadable.
+// An edit that rewraps with %v keeps the "not readable" substring green while
+// this assertion goes red, which is the contract break no linter catches.
+func TestValidate_sshKeyMissingIsNotExist(t *testing.T) {
+	t.Parallel()
+	cfg := config{Jobs: []job{{
+		Name: "j", Local: "/a", RemoteHost: "host",
+		RemotePath: "/b", SSHKey: filepath.Join(t.TempDir(), "absent"),
+	}}}
+
+	err := cfg.validate()
+
+	if err == nil {
+		t.Fatalf("validate() with a missing ssh_key = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "not readable") {
+		t.Errorf("validate() error = %q, want to contain 'not readable'", err)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("errors.Is(validate() error, os.ErrNotExist) = false, want true; error = %q", err)
 	}
 }
 
@@ -389,9 +415,8 @@ func TestParseConfigInvalidYAML(t *testing.T) {
 // TestParseConfigUnknownKeyRejected pins the fail-loud unknown-key contract
 // from yamlenv.CheckUnknownKeys: a misspelled optional job key (max_delet
 // for max_delete) is a parse error naming the key, not a silently ignored
-// setting that leaves the intended cap unset. The entry arrives sanitised
-// (`line N: unknown configuration key "max_delet"`), so the operator keeps the
-// line and the key without the Go type name the raw yaml.v3 message leaks.
+// setting that leaves the intended cap unset. The parse fails and the message
+// names the operator's key and its line, in yaml.v3's own words.
 func TestParseConfigUnknownKeyRejected(t *testing.T) {
 	t.Parallel()
 	doc := `
@@ -551,55 +576,30 @@ func TestLoadConfig_validateErrorMsg(t *testing.T) {
 	}
 }
 
+// TestLoadConfigMissingFile pins the only actionable record an operator with an
+// empty /config sees: loadConfig emits it before returning its error, and
+// dispatch exits 1 without printing that error. Deleting the record, lowering
+// its level, or dropping its path or hint leaves an err != nil assertion green.
 func TestLoadConfigMissingFile(t *testing.T) {
-	t.Setenv("CONFIG_PATH", filepath.Join(t.TempDir(), "absent.yaml"))
+	rec := capture.Default(t)
+	path := filepath.Join(t.TempDir(), "absent.yaml")
+	t.Setenv("CONFIG_PATH", path)
+
 	if _, err := loadConfig(); err == nil {
 		t.Fatal("loadConfig on missing file: want error")
 	}
-}
 
-func TestCheckReadable(t *testing.T) {
-	t.Run("readable file returns nil", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "key")
-		if err := os.WriteFile(path, []byte("k"), 0o600); err != nil {
-			t.Fatalf("setup: %v", err)
-		}
-
-		if err := checkReadable(path); err != nil {
-			t.Errorf("checkReadable(%q) = %v, want nil", path, err)
-		}
-	})
-
-	// A missing file must surface a genuine not-exist error. If the err != nil
-	// guard is negated, the function skips the early return and instead closes
-	// a nil *os.File, which reports os.ErrInvalid ("invalid argument") rather
-	// than the real not-exist cause — a regression this assertion catches.
-	t.Run("missing file returns a not-exist error", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "absent")
-
-		err := checkReadable(path)
-
-		if err == nil {
-			t.Fatalf("checkReadable(%q) = nil, want error", path)
-		}
-		if !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("checkReadable(%q) = %v, want an os.ErrNotExist", path, err)
-		}
-	})
-
-	// A directory opens successfully and can never be a private key, so the
-	// kind check is what stops boot validation certifying a config ssh cannot
-	// authenticate with — and in external mode ssh's own complaint is up to
-	// SYNC_INTERVAL away.
-	t.Run("directory is refused", func(t *testing.T) {
-		dir := t.TempDir()
-
-		err := checkReadable(dir)
-
-		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
-			t.Errorf("checkReadable(%q) = %v, want a not-a-regular-file refusal", dir, err)
-		}
-	})
+	const message = "config not found"
+	if got := rec.CountLevel(slog.LevelError, message); got != 1 {
+		t.Errorf("%q ERROR records = %d, want 1; logs = %q", message, got, rec.Messages())
+	}
+	if !rec.HasAttr(message, "path", path) {
+		t.Errorf("%q missing path=%q; logs = %q", message, path, rec.Messages())
+	}
+	const hint = "mount a config.yaml at this path — see config.example.yaml in the repo"
+	if !rec.HasAttr(message, "hint", hint) {
+		t.Errorf("%q missing hint=%q; logs = %q", message, hint, rec.Messages())
+	}
 }
 
 // TestLoadConfig_acceptsExactlyCapBytes pins the upper boundary of the size
@@ -734,6 +734,40 @@ func TestLoadSyncTimeout(t *testing.T) {
 	})
 }
 
+// TestLoadSyncTimeout_NonPositiveWarnsWithFallback pins the app-owned half of
+// the SYNC_TIMEOUT contract: a syntactically valid but non-positive duration is
+// parsed by envx and then rejected here, so the WARN naming the rejected value
+// and the applied default is the operator's only record of the substitution.
+// Not parallel: capture.Default swaps the global slog default.
+func TestLoadSyncTimeout_NonPositiveWarnsWithFallback(t *testing.T) {
+	const message = "SYNC_TIMEOUT must be positive, using default"
+	tests := []struct {
+		name, value, wantRejected string
+	}{
+		{name: "negative", value: "-5m", wantRejected: "-5m0s"},
+		{name: "zero", value: "0", wantRejected: "0s"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := capture.Default(t)
+			t.Setenv("SYNC_TIMEOUT", tt.value)
+
+			if got := loadSyncTimeout(); got != 10*time.Minute {
+				t.Errorf("loadSyncTimeout() with SYNC_TIMEOUT=%q = %v, want 10m0s", tt.value, got)
+			}
+			if got := rec.CountLevel(slog.LevelWarn, message); got != 1 {
+				t.Errorf("%q WARN records for SYNC_TIMEOUT=%q = %d, want 1; logs = %q", message, tt.value, got, rec.Messages())
+			}
+			if !rec.HasAttr(message, "value", tt.wantRejected) {
+				t.Errorf("%q missing value=%q; logs = %q", message, tt.wantRejected, rec.Messages())
+			}
+			if !rec.HasAttr(message, "default", "10m0s") {
+				t.Errorf("%q missing default=10m0s; logs = %q", message, rec.Messages())
+			}
+		})
+	}
+}
+
 func TestSetupLogger_levelMapping(t *testing.T) {
 	orig := slog.Default()
 	t.Cleanup(func() { slog.SetDefault(orig) })
@@ -751,7 +785,10 @@ func TestSetupLogger_levelMapping(t *testing.T) {
 		{"uppercase is lowercased", "DEBUG", slog.LevelDebug},
 		{"surrounding whitespace trimmed", "  warn  ", slog.LevelWarn},
 		{"unset defaults to info", "", slog.LevelInfo},
+		{"set-but-empty defaults to info", "   ", slog.LevelInfo},
 		{"unrecognized defaults to info", "bogus", slog.LevelInfo},
+		{"offset syntax is not published, so info", "info+4", slog.LevelInfo},
+		{"negative offset syntax is not published either", "error-1", slog.LevelInfo},
 	}
 
 	for _, tt := range tests {
@@ -770,12 +807,14 @@ func TestSetupLogger_levelMapping(t *testing.T) {
 	}
 }
 
-// TestSetupLogger_warnsOnUnrecognizedLevel pins the rejected-value warning on
-// the REAL production handler: setupLogger installs its own handler over
-// slog.Default(), so capture.Default cannot see this record — the operator
-// reads it off the container's stderr, which is what this redirects.
-// Not parallel: sets env and swaps os.Stderr plus the global slog default.
-func TestSetupLogger_warnsOnUnrecognizedLevel(t *testing.T) {
+// captureSetupLoggerStderr installs the logger for the given LOG_LEVEL value on
+// the REAL production handler and returns what it wrote to stderr. setupLogger
+// installs its own handler over slog.Default(), so capture.Default cannot see
+// its records — the operator reads them off the container's stderr, which is
+// what this redirects. Callers must not be parallel: this sets env and swaps
+// os.Stderr plus the global slog default.
+func captureSetupLoggerStderr(t *testing.T, level string) string {
+	t.Helper()
 	originalLogger := slog.Default()
 	originalStderr := os.Stderr
 	stderrPath := filepath.Join(t.TempDir(), "stderr")
@@ -789,7 +828,7 @@ func TestSetupLogger_warnsOnUnrecognizedLevel(t *testing.T) {
 		slog.SetDefault(originalLogger)
 		_ = stderr.Close()
 	})
-	t.Setenv("LOG_LEVEL", "bogus")
+	t.Setenv("LOG_LEVEL", level)
 
 	setupLogger()
 
@@ -802,7 +841,15 @@ func TestSetupLogger_warnsOnUnrecognizedLevel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read stderr capture: %v", err)
 	}
-	logs := string(out)
+	return string(out)
+}
+
+// TestSetupLogger_warnsOnUnrecognizedLevel pins the rejected-value warning's
+// attributes, including that the record echoes the operator's RAW value.
+// Not parallel: sets env and swaps os.Stderr plus the global slog default.
+func TestSetupLogger_warnsOnUnrecognizedLevel(t *testing.T) {
+	logs := captureSetupLoggerStderr(t, " bogus ")
+
 	const message = `msg="unrecognized LOG_LEVEL, using info"`
 	if got := strings.Count(logs, message); got != 1 {
 		t.Errorf("setupLogger() warning count = %d, want 1; stderr = %q", got, logs)
@@ -810,12 +857,50 @@ func TestSetupLogger_warnsOnUnrecognizedLevel(t *testing.T) {
 	if !strings.Contains(logs, "level=WARN") {
 		t.Errorf("setupLogger() stderr = %q, want level=WARN", logs)
 	}
-	if !strings.Contains(logs, "value=bogus") {
-		t.Errorf("setupLogger() stderr = %q, want value=bogus", logs)
+	if !strings.Contains(logs, `value=" bogus "`) {
+		t.Errorf("setupLogger() stderr = %q, want the raw value echoed as value=\" bogus \"", logs)
+	}
+}
+
+// TestSetupLogger_warningFiresOnlyForUnpublishedValues pins WHICH values the
+// refusal covers. The offset rows are the ones that matter: slog's levels are
+// four apart, so "info+4" parses to slog.LevelWarn — filtering the parsed level
+// against the four published constants would accept it silently and raise the
+// threshold to WARN, which disarms the shipped staleness alert. Testing the
+// INPUT over the four published names makes the claim true by construction.
+// Not parallel: each case sets env and swaps os.Stderr plus the global default.
+func TestSetupLogger_warningFiresOnlyForUnpublishedValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		level string
+		want  int
+	}{
+		{name: "debug", level: "debug", want: 0},
+		{name: "info", level: "info", want: 0},
+		{name: "warn", level: "warn", want: 0},
+		{name: "error", level: "error", want: 0},
+		{name: "warning alias", level: "warning", want: 0},
+		{name: "padded warn", level: "  warn  ", want: 0},
+		{name: "unset", level: "", want: 0},
+		{name: "set but whitespace only", level: "   ", want: 0},
+		{name: "positive offset", level: "info+4", want: 1},
+		{name: "negative offset", level: "error-1", want: 1},
+	}
+
+	const message = `msg="unrecognized LOG_LEVEL, using info"`
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := captureSetupLoggerStderr(t, tt.level)
+			if got := strings.Count(logs, message); got != tt.want {
+				t.Errorf("setupLogger() LOG_LEVEL=%q warning count = %d, want %d; stderr = %q",
+					tt.level, got, tt.want, logs)
+			}
+		})
 	}
 }
 
 func TestLoadConfig_readErrorWhenPathIsDir(t *testing.T) {
+	rec := capture.Default(t)
 	dir := t.TempDir() // a directory: refused by the regular-file check
 
 	t.Setenv("CONFIG_PATH", dir)
@@ -827,6 +912,12 @@ func TestLoadConfig_readErrorWhenPathIsDir(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "read config") {
 		t.Errorf("loadConfig() dir error = %q, want to contain 'read config'", err)
+	}
+	// The complement of TestLoadConfigMissingFile: a read refusal that is not
+	// os.ErrNotExist must not be reported as an absent config.
+	const notFound = "config not found"
+	if got := rec.CountLevel(slog.LevelError, notFound); got != 0 {
+		t.Errorf("%q ERROR records = %d, want 0; logs = %q", notFound, got, rec.Messages())
 	}
 }
 
@@ -1043,12 +1134,12 @@ func TestValidate_remotePathWithGlobRejected(t *testing.T) {
 // addressing one remote tree with either deleting is accepted (an rsync exclude
 // can protect the receiver, so the pair CAN be correct) but warned about,
 // because otherwise each pass silently deletes the other's files while the
-// heartbeat still reports failed=0. Identity is host+key+path, so a different
-// host, a disjoint path, or neither job deleting stays silent.
+// heartbeat still reports failed=0. Identity is host+path, so a different host,
+// a disjoint path, or neither job deleting stays silent.
 func TestValidate_warnsSharedDestinations(t *testing.T) {
 	// Not parallel: capture.Default swaps the global slog default.
 	key := writeKey(t)
-	const warning = "two jobs share a remote destination and one deletes"
+	const warning = "jobs share a remote destination tree and one deletes"
 
 	tests := []struct {
 		name             string
@@ -1078,5 +1169,209 @@ func TestValidate_warnsSharedDestinations(t *testing.T) {
 					tt.pathA, tt.pathB, tt.hostB, got, tt.wantWarn, rec.Messages())
 			}
 		})
+	}
+}
+
+
+// TestValidate_sharedDestinationsIdentityIsTheHostComponent pins the identity
+// the advisory compares. A bare host and the same host with a login prefix
+// address one tree (the container runs as root by design, so an omitted user IS
+// root), and RFC 4343 makes DNS case insignificant — so both pairs must warn.
+// Under the old raw-string guard both were silent, which suppressed the advisory
+// for exactly the pairs it exists to describe.
+func TestValidate_sharedDestinationsIdentityIsTheHostComponent(t *testing.T) {
+	// Not parallel: capture.Default swaps the global slog default.
+	key := writeKey(t)
+	const warning = "jobs share a remote destination tree and one deletes"
+
+	tests := []struct{ name, hostA, hostB string }{
+		{"bare host and root@host are one host", "defiant", "root@defiant"},
+		{"DNS case is insignificant", "Defiant", "defiant"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := capture.Default(t)
+			a, b := validJob("a", key), validJob("b", key)
+			a.RemoteHost, a.RemotePath, a.Delete = tt.hostA, "/srv/x", true
+			b.RemoteHost, b.RemotePath = tt.hostB, "/srv/x"
+			if err := (config{Jobs: []job{a, b}}).validate(); err != nil {
+				t.Fatalf("validate() = %v, want nil", err)
+			}
+			if !rec.Contains(warning) {
+				t.Errorf("validate(%q vs %q) did not warn; logs=%q", tt.hostA, tt.hostB, rec.Messages())
+			}
+		})
+	}
+}
+
+// TestValidate_sharedDestinationsSuppressionByKeyIsGone pins the other half of
+// the identity change: two jobs reaching one tree with DIFFERENT ssh keys must
+// still warn, because two keys can reach one tree. The keys are reported in the
+// record instead of compared, since a path-rooting rrsync wrapper on one of them
+// is what makes a flagged pair safe.
+func TestValidate_sharedDestinationsSuppressionByKeyIsGone(t *testing.T) {
+	rec := capture.Default(t)
+	keyA, keyB := writeKey(t), writeKey(t)
+	a, b := validJob("a", keyA), validJob("b", keyB)
+	a.RemotePath, a.Delete = "/srv/x", true
+	b.RemotePath = "/srv/x"
+
+	if err := (config{Jobs: []job{a, b}}).validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil", err)
+	}
+
+	const warning = "jobs share a remote destination tree and one deletes"
+	if !rec.Contains(warning) {
+		t.Errorf("validate() with two ssh keys on one tree did not warn; logs=%q", rec.Messages())
+	}
+}
+
+// TestValidate_sharedDestinationsOutputIsBounded pins the amplification fix: the
+// pairwise emitter produced one record per unordered pair, so 100 mutually
+// overlapping deleting jobs cost 4,950 records and 1,000 cost 499,500 — paid
+// twice before the first rsync in built-in mode. Grouping by conflicting tree
+// makes it ONE. The assertion is a bounded record count, never serialized bytes
+// or any other implementation detail.
+func TestValidate_sharedDestinationsOutputIsBounded(t *testing.T) {
+	rec := capture.Default(t)
+	key := writeKey(t)
+	jobs := make([]job, 0, 40)
+	for i := range 40 {
+		j := validJob(fmt.Sprintf("job-%02d", i), key)
+		j.RemotePath, j.Delete = "/srv/x", true
+		jobs = append(jobs, j)
+	}
+
+	if err := (config{Jobs: jobs}).validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil", err)
+	}
+
+	const warning = "jobs share a remote destination tree and one deletes; each pass may delete the others' files"
+	if got := rec.CountExact(warning); got != 1 {
+		t.Errorf("validate() with 40 identical deleting destinations emitted %d advisory records, want 1", got)
+	}
+}
+
+// TestValidate_sharedDestinationsOneRecordPerTree pins that the grouping is per
+// conflicting TREE and not per host: one host holding two independent overlaps
+// (/a with /a/x, /b with /b/y) must produce two records, so neither conflict is
+// conflated with the other or dropped past a per-host sample budget.
+func TestValidate_sharedDestinationsOneRecordPerTree(t *testing.T) {
+	rec := capture.Default(t)
+	key := writeKey(t)
+	paths := []string{"/a", "/a/x", "/b", "/b/y"}
+	jobs := make([]job, 0, len(paths))
+	for i, p := range paths {
+		j := validJob(fmt.Sprintf("job-%d", i), key)
+		j.RemotePath, j.Delete = p, true
+		jobs = append(jobs, j)
+	}
+
+	if err := (config{Jobs: jobs}).validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil", err)
+	}
+
+	const warning = "jobs share a remote destination tree and one deletes; each pass may delete the others' files"
+	if got := rec.CountExact(warning); got != 2 {
+		t.Errorf("validate() with two independent overlaps on one host emitted %d records, want 2; logs=%q",
+			got, rec.Messages())
+	}
+}
+
+// TestValidate_sharedDestinationsFindsInterleavedSiblingPrefix is the row a
+// sorted single-pass scan would silently pass. Plain lexicographic order does
+// not make an ancestor adjacent to its descendants: both '-' (0x2d) and '.'
+// (0x2e) are legal in a remote_path and sort below '/' (0x2f), so {/data,
+// /data-old, /data/x} orders with the sibling BETWEEN the pair that overlaps.
+// A maintain-root scan then tests /data/x against /data-old and misses that
+// /data contains /data/x, which is the exact data-loss pair the advisory is for.
+func TestValidate_sharedDestinationsFindsInterleavedSiblingPrefix(t *testing.T) {
+	rec := capture.Default(t)
+	key := writeKey(t)
+	paths := []string{"/data", "/data-old", "/data/x"}
+	jobs := make([]job, 0, len(paths))
+	for i, p := range paths {
+		j := validJob(fmt.Sprintf("job-%d", i), key)
+		j.RemotePath, j.Delete = p, true
+		jobs = append(jobs, j)
+	}
+
+	if err := (config{Jobs: jobs}).validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil", err)
+	}
+
+	const warning = "jobs share a remote destination tree and one deletes; each pass may delete the others' files"
+	if got := rec.CountExact(warning); got != 1 {
+		t.Fatalf("validate() with {/data, /data-old, /data/x} emitted %d records, want 1; logs=%q",
+			got, rec.Messages())
+	}
+	if !rec.AttrContains(warning, "outermost_first", "/data/x") {
+		t.Errorf("advisory does not report /data/x with /data; logs=%q", rec.Messages())
+	}
+	if !rec.HasAttr(warning, "jobs", "2") {
+		t.Errorf("advisory jobs count is not 2, so /data-old was folded in; logs=%q", rec.Messages())
+	}
+}
+
+
+// TestLoadTransport pins the opt-in switches' env contract. The unset row is
+// the one that matters: an unset environment must yield the shipped transport,
+// so no existing deployment changes behaviour on an image bump. An unrecognized
+// SYNC_COMPRESS falls back to off, which is this app's settled posture for a
+// malformed env value and the safe direction for an optimisation.
+// Not parallel: t.Setenv is incompatible with t.Parallel.
+func TestLoadTransport(t *testing.T) {
+	tests := []struct {
+		name     string
+		acls     string
+		xattrs   string
+		compress string
+		want     transport
+	}{
+		{name: "unset is the shipped transport", want: transport{}},
+		{name: "off", compress: "off", want: transport{}},
+		{name: "disabled", compress: "disabled", want: transport{}},
+		{name: "no", compress: "no", want: transport{}},
+		{name: "false", compress: "false", want: transport{}},
+		{name: "zero", compress: "0", want: transport{}},
+		{name: "on", compress: "on", want: transport{compress: "auto"}},
+		{name: "yes", compress: "yes", want: transport{compress: "auto"}},
+		{name: "true", compress: "true", want: transport{compress: "auto"}},
+		{name: "one", compress: "1", want: transport{compress: "auto"}},
+		{name: "auto", compress: "auto", want: transport{compress: "auto"}},
+		{name: "zstd", compress: "zstd", want: transport{compress: "zstd"}},
+		{name: "lz4", compress: "lz4", want: transport{compress: "lz4"}},
+		{name: "zlib", compress: "zlib", want: transport{compress: "zlib"}},
+		{name: "padded and mixed case", compress: "  ZSTD ", want: transport{compress: "zstd"}},
+		{name: "unrecognized falls back to off", compress: "brotli", want: transport{}},
+		{name: "acls", acls: "true", want: transport{acls: true}},
+		{name: "xattrs", xattrs: "true", want: transport{xattrs: true}},
+		{
+			name: "all three",
+			acls: "true", xattrs: "true", compress: "lz4",
+			want: transport{compress: "lz4", acls: true, xattrs: true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("SYNC_ACLS", tt.acls)
+			t.Setenv("SYNC_XATTRS", tt.xattrs)
+			t.Setenv("SYNC_COMPRESS", tt.compress)
+
+			if got := loadTransport(hostKeyAcceptNew); got != tt.want {
+				t.Errorf("loadTransport() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestLoadTransport_carriesTheHostKeyPosture pins the field the reshape absorbed:
+// the boot-decided posture is threaded through the transport, so the -e argument
+// still pins when a known_hosts file is mounted.
+func TestLoadTransport_carriesTheHostKeyPosture(t *testing.T) {
+	t.Setenv("SYNC_COMPRESS", "")
+	if got := loadTransport(hostKeyStrict); got.hostKeys != hostKeyStrict {
+		t.Errorf("loadTransport(strict).hostKeys = %v, want strict", got.hostKeys)
 	}
 }

@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -80,36 +82,63 @@ var userRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 // daemon-mode "::" hazard that rsync's host:path parser would misread.
 var hostnameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
-// shellMetaChars are characters that enable command injection or argument
-// splitting in a shell. Jobs are executed with an explicit argument slice
-// (no shell), so these can never be interpreted; rejecting them is
-// defense-in-depth. Glob characters (* ? [ ]) are deliberately absent so
-// rsync exclude patterns remain expressible; remote_path is refused them
-// separately below, since it is a destination rather than a pattern.
+// shellMetaChars are the characters a shell reads as separators or
+// substitutions. Only remote_path is held to them: its value becomes
+// rsync's destination argument, which the REMOTE login shell parses.
+// rsync escapes these in that argument by default, so the refusal is
+// insurance against a layer this app does not own -- --old-args and
+// RSYNC_OLD_ARGS turn that escaping off. Globs (* ? [ ]) are absent
+// because rsync never escapes them: remote_path is refused those
+// separately below, and exclude patterns stay expressible.
 const shellMetaChars = ";|&$`<>(){}\\\"'"
 
-// hasShellMeta reports whether s contains a shell metacharacter or any
-// control character (newline, carriage return, tab, NUL, etc.).
-func hasShellMeta(s string) bool {
+// hasControl reports whether s contains an ASCII control character (C0
+// or DEL). Three have measured consequences: NUL cannot be represented
+// in an argv element at all, a newline in an exclude makes rsync read
+// the rule as one unmatchable pattern -- it exits 0 having excluded
+// nothing, so --delete pushes the file that was meant to stay -- and
+// DEL reaches the log stream unescaped. The rest cost nothing to refuse
+// alongside them. C1 (U+0080-U+009F) is out: those decode from a quoted
+// YAML scalar as ordinary text.
+func hasControl(s string) bool {
 	for _, r := range s {
 		if r < 0x20 || r == 0x7f {
-			return true
-		}
-		if strings.ContainsRune(shellMetaChars, r) {
 			return true
 		}
 	}
 	return false
 }
 
+// hasShellMeta reports whether s contains a shell metacharacter or an
+// ASCII control character. remote_path is the only field held to it.
+func hasShellMeta(s string) bool {
+	return hasControl(s) || strings.ContainsAny(s, shellMetaChars)
+}
+
 // setupLogger installs a slog text handler that emits canonical logfmt
 // (`time=... level=... msg=... k=v`) to stderr for Loki/Alloy collection.
 func setupLogger() {
-	levelStr := strings.TrimSpace(cmp.Or(envx.String("LOG_LEVEL"), "info"))
-	level, recognized := slogx.ParseLevel(levelStr, slog.LevelInfo)
+	raw := envx.String("LOG_LEVEL")
+	// README.md publishes four values, so match the name rather than
+	// filtering slogx.ParseLevel's output: it also accepts slog's offset
+	// syntax ("info+4"), which this app never published and which resolves
+	// to a DIFFERENT published level.
+	var level slog.Level // LevelInfo is the zero value
+	recognized := true
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "info": // unset and "info" both take the zero value
+	case "debug":
+		level = slog.LevelDebug
+	case "warn", "warning":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		recognized = false
+	}
 	slogx.Setup(slogx.Options{Level: level})
 	if !recognized {
-		slog.Warn("unrecognized LOG_LEVEL, using info", "value", levelStr)
+		slog.Warn("unrecognized LOG_LEVEL, using info", "value", raw)
 	}
 }
 
@@ -124,20 +153,15 @@ func configPath() string {
 func loadConfig() (config, error) {
 	path := configPath()
 
-	if _, statErr := os.Stat(path); statErr != nil {
-		slog.Error("config not found", "path", path, "error", statErr,
-			"hint", "mount a config.yaml at this path — see config.example.yaml in the repo")
-		return config{}, fmt.Errorf("stat config %q: %w", path, statErr)
-	}
-
 	data, err := readCappedConfig(path)
+	if errors.Is(err, os.ErrNotExist) {
+		slog.Error("config not found", "path", path, "error", err,
+			"hint", "mount a config.yaml at this path — see config.example.yaml in the repo")
+		return config{}, fmt.Errorf("read config %q: %w", path, err)
+	}
 	if err != nil {
 		slog.Error("config read failed", "path", path, "error", err)
 		return config{}, fmt.Errorf("read config %q: %w", path, err)
-	}
-	if len(data) > configCapBytes {
-		slog.Error("config too large", "path", path, "cap", configCapBytes)
-		return config{}, fmt.Errorf("config %q exceeds %d bytes", path, configCapBytes)
 	}
 
 	cfg, err := parseConfig(data)
@@ -156,10 +180,10 @@ func loadConfig() (config, error) {
 
 // readCappedConfig reads path, refusing a non-regular file and any
 // document over configCapBytes. The kind check runs on the stat, before the
-// open, because opening a fifo blocks; the size bound is enforced on the bytes
-// READ, because os.Stat's size understates a fifo, a character device and a
-// file being appended to. The +1 is what makes "exceeds" decidable once the
-// app has stopped reading.
+// open, because opening a fifo blocks. The size bound is enforced on the
+// bytes READ, because a regular file can grow after the stat, and a larger
+// regular file can be swapped in between the stat and the open. The +1 is
+// what makes "exceeds" decidable once the app has stopped reading.
 func readCappedConfig(path string) ([]byte, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -173,35 +197,26 @@ func readCappedConfig(path string) ([]byte, error) {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
-	return io.ReadAll(io.LimitReader(f, configCapBytes+1))
+	data, err := io.ReadAll(io.LimitReader(f, configCapBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > configCapBytes {
+		return nil, fmt.Errorf("config exceeds %d bytes", configCapBytes)
+	}
+	return data, nil
 }
 
-// parseConfig unmarshals raw YAML into a config without validating it.
-// Kept separate from validate so fuzz/property tests can exercise the
-// parser on arbitrary bytes without needing a real ssh key on disk.
-//
-// Before decoding, the raw bytes pass yamlenv's fail-loud strict checks: a
-// document below a stray "---" separator would be silently ignored by the
-// single-document Unmarshal, and a misspelled or misplaced key (e.g.
-// "max_delet") would be silently dropped while its intended setting stayed
-// at the default. Both run on the raw bytes deliberately -- this app has no
-// env expansion, so the bytes read from disk are exactly what decodes, and
-// the strict-check line numbers point at the file the operator wrote.
+// parseConfig unmarshals raw YAML into a config without validating it. Kept
+// separate from validate so fuzz and property tests can drive the parser on
+// arbitrary bytes with no ssh key on disk. yamlenv's CheckSingleDocument and
+// CheckUnknownKeys run first and own the fail-loud contract; they read the raw
+// bytes because this app expands nothing, so what is on disk is what decodes.
 func parseConfig(data []byte) (config, error) {
 	if err := yamlenv.CheckSingleDocument(data); err != nil {
 		return config{}, fmt.Errorf("parse config: %w", err)
 	}
 	if err := yamlenv.CheckUnknownKeys(data, &config{}); err != nil {
-		// Only a *yaml.TypeError entry can embed document content (the
-		// unknown key, or a wrong-type entry's scalar excerpt), and only
-		// those are what CheckUnknownKeys' doc asks a logging caller to
-		// sanitise. CheckUnknownKeys is also a full strict DECODE, so a
-		// syntax error arrives here too -- sanitising that one would trade
-		// yaml.v3's locator for a withholding message this app cannot mean
-		// (it expands nothing, so a document value is never a secret).
-		if _, ok := errors.AsType[*yaml.TypeError](err); ok {
-			err = yamlenv.SanitizeDecodeError(err, yamlenv.WithUnknownKeyEcho(true))
-		}
 		return config{}, fmt.Errorf("parse config: %w", err)
 	}
 	var cfg config
@@ -241,33 +256,112 @@ func (c config) validate() error {
 	return nil
 }
 
-// warnSharedDestinations warns when two jobs address one remote tree and
-// either deletes: --delete then removes whatever the other job put there,
-// every pass, and the per-job empty-source guard cannot see it because the
-// deletion is not per-job. Advisory, not an error: an exclude rule protects
-// the receiver, so an overlapping pair CAN be correct, and only the operator
-// knows whether theirs is. Identity is host+key+path, because an
-// rrsync-restricted key roots the path remotely.
+// destJob is one job's contribution to the shared-destination advisory: its
+// name, its cleaned remote path, the ssh key reported alongside it, and whether
+// it deletes.
+type destJob struct {
+	name string
+	raw  string
+	path string
+	key  string
+	del  bool
+}
+
+// warnSharedDestinations warns when jobs address one remote tree and any of
+// them deletes: --delete then removes whatever the others put there, every
+// pass, and the per-job empty-source guard cannot see it because the deletion
+// is not per-job. Advisory, not an error: an exclude rule can protect the
+// receiver, so an overlapping set CAN be correct. Identity is host+path,
+// compared on the host COMPONENT and case-insensitively; the ssh keys are
+// reported rather than compared, because a path-rooting wrapper on one of them
+// is what makes a flagged set safe. One record per tree, never one per pair.
 func warnSharedDestinations(jobs []job) {
+	groups := make(map[string][]destJob, len(jobs))
 	for i := range jobs {
-		for k := i + 1; k < len(jobs); k++ {
-			a, b := &jobs[i], &jobs[k]
-			if a.RemoteHost != b.RemoteHost || a.SSHKey != b.SSHKey {
-				continue
-			}
-			if !a.Delete && !b.Delete {
-				continue
-			}
-			pa, pb := filepath.Clean(a.RemotePath), filepath.Clean(b.RemotePath)
-			if pa != pb && !under(pa, pb) && !under(pb, pa) {
-				continue
-			}
-			slog.Warn("two jobs share a remote destination and one deletes; each pass may delete the other's files",
-				"job", a.Name, "other", b.Name, "remote_host", a.RemoteHost,
-				"path", pa, "other_path", pb,
-				"hint", "exclude the sibling's content from the deleting job, or give each job its own remote_path")
+		j := &jobs[i]
+		_, host := splitRemoteHost(j.RemoteHost)
+		key := strings.ToLower(host)
+		groups[key] = append(groups[key], destJob{
+			name: j.Name,
+			raw:  j.RemoteHost,
+			path: filepath.Clean(j.RemotePath),
+			key:  j.SSHKey,
+			del:  j.Delete,
+		})
+	}
+	for _, group := range slices.Sorted(maps.Keys(groups)) {
+		for _, component := range overlapComponents(groups[group]) {
+			warnConflictingTree(component)
 		}
 	}
+}
+
+// overlapComponents partitions one host's jobs into sets closed under "equal or
+// nested". It grows each set pairwise with the containment helper this file
+// already owns, because a sorted single-pass scan is unsound at this app's
+// input set: a sibling prefix sorts between an ancestor and its descendant, so
+// {/data, /data-old, /data/x} would hide that /data contains /data/x.
+func overlapComponents(group []destJob) [][]destJob {
+	var components [][]destJob
+	taken := make([]bool, len(group))
+	for i := range group {
+		if taken[i] {
+			continue
+		}
+		component := []destJob{group[i]}
+		taken[i] = true
+		for grew := true; grew; {
+			grew = false
+			for k := range group {
+				if taken[k] || !overlapsAny(component, group[k].path) {
+					continue
+				}
+				component = append(component, group[k])
+				taken[k] = true
+				grew = true
+			}
+		}
+		components = append(components, component)
+	}
+	return components
+}
+
+// overlapsAny reports whether path is the same tree as any member's path, or is
+// nested under it, or contains it.
+func overlapsAny(members []destJob, path string) bool {
+	for _, m := range members {
+		if m.path == path || under(m.path, path) || under(path, m.path) {
+			return true
+		}
+	}
+	return false
+}
+
+// warnConflictingTree emits the single advisory for one overlap component,
+// bounded to a fixed sample so a thousand mutually-overlapping deleting jobs
+// cost one record rather than half a million. Samples are ordered
+// shortest-path-first, so a containing path precedes the paths it contains. A
+// component of one, and one where nothing deletes, stay silent.
+func warnConflictingTree(members []destJob) {
+	const sampleSize = 3
+	if len(members) < 2 {
+		return
+	}
+	if !slices.ContainsFunc(members, func(m destJob) bool { return m.del }) {
+		return
+	}
+	slices.SortFunc(members, func(a, b destJob) int {
+		return cmp.Or(cmp.Compare(len(a.path), len(b.path)), cmp.Compare(a.path, b.path))
+	})
+	samples := make([]string, 0, sampleSize)
+	for _, m := range members[:min(sampleSize, len(members))] {
+		samples = append(samples,
+			fmt.Sprintf("%s at %s (ssh_key %s, delete %t)", m.name, m.path, m.key, m.del))
+	}
+	slog.Warn("jobs share a remote destination tree and one deletes; each pass may delete the others' files",
+		"remote_host", members[0].raw, "jobs", len(members),
+		"outermost_first", strings.Join(samples, "; "),
+		"hint", "exclude the sibling's content from the deleting job, or give each job its own remote_path")
 }
 
 // under reports whether child is nested below parent. filepath.Clean("/")
@@ -309,9 +403,7 @@ func (j *job) validate() error {
 		return fmt.Errorf("job %q: ssh_key %q not readable: %w", j.Name, j.SSHKey, err)
 	}
 
-	// max_delete, when set, caps how many deletions a single --delete pass may
-	// perform (rsync --max-delete); a negative cap is meaningless. Unset leaves
-	// the pass uncapped, preserving the prior behavior.
+	// A negative cap is meaningless; unset leaves the pass uncapped.
 	if j.MaxDelete != nil && *j.MaxDelete < 0 {
 		return fmt.Errorf("job %q: max_delete must be >= 0", j.Name)
 	}
@@ -321,9 +413,10 @@ func (j *job) validate() error {
 	return nil
 }
 
-// checkRequiredFields confirms the four always-required string fields are
-// present. (Name presence is enforced by (config).validate, which holds the
-// job index needed for its error message.)
+// checkRequiredFields owns the "<field> is required" message for the four
+// always-required string fields. A field added here also needs its own refusal
+// downstream, since presence is all this check judges. (Name presence is
+// enforced by (config).validate, which holds the job index for its message.)
 func (j *job) checkRequiredFields() error {
 	if j.Local == "" {
 		return fmt.Errorf("job %q: local is required", j.Name)
@@ -340,34 +433,31 @@ func (j *job) checkRequiredFields() error {
 	return nil
 }
 
-// checkNoForbiddenChars rejects shell metacharacters and control characters in
-// the job string fields that have no syntax validator of their own, and in
-// every exclude pattern (defense-in-depth: jobs run with an explicit argument
-// slice and no shell, so these can never be interpreted), then applies the
-// stricter no-space rule to the two fields that are word-split downstream.
+// checkNoForbiddenChars applies one refusal per interpreter a value
+// actually crosses: ASCII controls on every field, shell metacharacters
+// on remote_path (the only value a remote shell parses), and the
+// no-space rule on the two fields that are word-split downstream.
 func (j *job) checkNoForbiddenChars() error {
+	if hasShellMeta(j.RemotePath) {
+		return fmt.Errorf("job %q: remote_path contains forbidden characters", j.Name)
+	}
 	for _, f := range []struct{ key, val string }{
 		{"name", j.Name},
 		{"local", j.Local},
-		{"remote_path", j.RemotePath},
 		{"ssh_key", j.SSHKey},
 	} {
-		if hasShellMeta(f.val) {
-			return fmt.Errorf("job %q: %s contains forbidden characters", j.Name, f.key)
+		if hasControl(f.val) {
+			return fmt.Errorf("job %q: %s contains control characters", j.Name, f.key)
 		}
 	}
 	for _, e := range j.Excludes {
-		if hasShellMeta(e) {
-			return fmt.Errorf("job %q: exclude %q contains forbidden characters", j.Name, e)
+		if hasControl(e) {
+			return fmt.Errorf("job %q: exclude %q contains control characters", j.Name, e)
 		}
 	}
 
-	// remote_path reaches the remote as an rsync argument. rsync
-	// backslash-escapes SHELL_CHARS (space included) in a filename arg but
-	// leaves *?[] alone on purpose, and the receiving side expands them
-	// even under --secluded-args -- so a pattern-shaped path silently
-	// picks whichever tree matches, and under --delete that is the wrong
-	// remote tree. Both refusals below keep the field a path.
+	// rsync escapes metacharacters in the remote arg but never *?[], which the
+	// receiver expands -- a pattern-shaped path makes --delete hit another tree.
 	if strings.ContainsRune(j.RemotePath, ' ') {
 		return fmt.Errorf("job %q: remote_path %q must not contain spaces",
 			j.Name, j.RemotePath)
@@ -377,10 +467,7 @@ func (j *job) checkNoForbiddenChars() error {
 			j.Name, j.RemotePath)
 	}
 
-	// ssh_key is embedded in the word-split `-e "ssh -i <key> ..."` string
-	// (sshCommand); a space would split it into separate argv elements and
-	// break the job. hasShellMeta deliberately allows spaces for path
-	// fields, so the key path needs this stricter check of its own.
+	// sshCommand embeds this path in a word-split -e argument.
 	if strings.ContainsRune(j.SSHKey, ' ') {
 		return fmt.Errorf("job %q: ssh_key %q must not contain spaces",
 			j.Name, j.SSHKey)
@@ -433,14 +520,9 @@ func splitRemoteHost(raw string) (user, host string) {
 }
 
 // validateRemoteHost enforces the remote_host contract: an optional "user@"
-// prefix followed by either an IPv4/IPv6 literal or a DNS hostname. IPv6
-// literals are accepted bare ("2001:db8::1") or bracketed ("[2001:db8::1]");
-// the brackets rsync's host:path syntax needs are added automatically when the
-// destination is built (see remoteDest). A bare host that merely contains a
-// colon but is not a valid IP (e.g. "host:" or the incomplete "2001:db8") is
-// rejected, because that colon would otherwise be misread by rsync as the
-// daemon-mode "::" separator. Link-local IPv6 with a zone id ("fe80::1%eth0")
-// is not supported; use a global/ULA address or an ssh_config Host alias.
+// prefix followed by a DNS name or an IPv4/IPv6 literal, bare or bracketed. A
+// colon in a non-IP host is rejected because rsync would read it as its
+// daemon-mode separator; remoteDest adds the IPv6 brackets.
 func validateRemoteHost(j *job) error {
 	user, host := splitRemoteHost(j.RemoteHost)
 	if strings.Contains(j.RemoteHost, "@") && !userRE.MatchString(user) {
@@ -509,15 +591,34 @@ func loadSyncTimeout() time.Duration {
 	return d
 }
 
-// loadInterval parses SYNC_INTERVAL and reports the built-in scheduler
-// cadence and whether the built-in scheduler runs at all. It delegates to
-// scheduler.ParseInterval, the fleet-standard *_INTERVAL parser: a Go
-// duration ("1h", "30m") sets the interval; the sentinels "off"/"disabled"
-// (case-insensitive) or a zero duration ("0", "0s") select external mode
-// (the container idles and syncs are triggered out-of-band via the `sync`
-// subcommand); unset, negative, or unparseable falls back to defaultInterval
-// with the scheduler enabled (a warning is logged for the negative and
-// unparseable cases). scheduleEnabled is true only in built-in mode.
+// loadTransport reads the opt-in rsync transport switches (SYNC_ACLS,
+// SYNC_XATTRS, SYNC_COMPRESS) and combines them with the boot-decided
+// host-key posture. Every switch defaults off, so an unset environment
+// yields the shipped transport. envx.Bool warns on a malformed boolean;
+// an unrecognized SYNC_COMPRESS value warns here and falls back to off.
+func loadTransport(hostKeys hostKeyMode) transport {
+	tr := transport{
+		hostKeys: hostKeys,
+		acls:     envx.Bool("SYNC_ACLS", false),
+		xattrs:   envx.Bool("SYNC_XATTRS", false),
+	}
+	raw := envx.String("SYNC_COMPRESS")
+	switch v := strings.ToLower(strings.TrimSpace(raw)); v {
+	case "", "off", "disabled", "no", "false", "0":
+	case "on", "yes", "true", "1", "auto":
+		tr.compress = "auto"
+	case "zstd", "lz4", "zlib":
+		tr.compress = v
+	default:
+		slog.Warn("unrecognized SYNC_COMPRESS, compression stays off",
+			"value", raw,
+			"accepted", "off|on|auto|zstd|lz4|zlib")
+	}
+	return tr
+}
+
+// loadInterval returns scheduler.ParseInterval's cadence and whether it chose
+// built-in scheduling.
 func loadInterval() (interval time.Duration, scheduleEnabled bool) {
 	s := scheduler.ParseInterval(envx.String("SYNC_INTERVAL"), defaultInterval,
 		scheduler.WithName("SYNC_INTERVAL"))

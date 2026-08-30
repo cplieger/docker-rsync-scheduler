@@ -8,6 +8,10 @@ services:
     environment:
       SYNC_INTERVAL: "6h"  # built-in cadence (Go duration); "off" = external trigger; see README "Scheduling modes"
       SYNC_TIMEOUT: "10m"  # per-job rsync timeout (Go duration)
+      # Opt-in transport switches, all off by default:
+      # SYNC_ACLS: "false"     # true adds rsync -A; the remote rsync must support ACLs
+      # SYNC_XATTRS: "false"   # true adds rsync -X; the remote rsync must support xattrs
+      # SYNC_COMPRESS: "off"   # "on" adds -z and negotiates (safe); a name (zstd|lz4|zlib) fails every pass if the receiver lacks it
 
     volumes:
       - "./config.yaml:/config/config.yaml:ro"

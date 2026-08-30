@@ -20,23 +20,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /docker-rsync-scheduler .
 
-# ---------------------------------------------------------------------------
-# rsync builder stage - compiles rsync from the pinned upstream release
-# tarball. Discarded at the end of the build; only the stripped binary
-# reaches the runtime image below.
-# ---------------------------------------------------------------------------
 FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS rsync-builder
 
 SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 
-# Build deps are build-only (discarded with this stage, absent from the
-# runtime image), so their exact versions never reach the shipped artifact
-# and are intentionally left unpinned; they track whatever the Alpine 3.24
-# repo serves at build time (the digest pins the base image, not the apk
-# index). rsync itself stays version+SHA pinned below, it is the shipped
-# artifact. The set mirrors Alpine 3.24-stable's rsync APKBUILD makedepends
-# (acl/attr/lz4/popt/xxhash/zlib/zstd headers, linux-headers, perl) plus
-# build-base for the toolchain and gpgv for the release-signature check.
+# Alpine's rsync APKBUILD makedepends plus build-base and gpgv; feature parity is asserted at build time by tests/smoke.sh.
 RUN apk add --no-cache \
         acl-dev \
         attr-dev \
@@ -109,11 +97,6 @@ RUN cat > /out/rsync-scheduler.cdx.json <<EOF
 }
 EOF
 
-# ---------------------------------------------------------------------------
-# Runtime stage - same digest-pinned base as before the source-build
-# conversion; only how rsync is obtained changed (COPY from the builder
-# instead of installing the Alpine package).
-# ---------------------------------------------------------------------------
 FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS base
 
 # apk upgrade is load-bearing: a plain `apk add` leaves base packages the pinned

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,7 +47,7 @@ func testSocketPath(t *testing.T) string {
 // Not parallel: sets env.
 func TestRunDaemon_badConfigReturnsError(t *testing.T) {
 	t.Setenv("CONFIG_PATH", filepath.Join(t.TempDir(), "absent.yaml"))
-	err := runDaemon(t.Context(), testSocketPath(t), recordingRunner(t, "true"))
+	err := runDaemon(t.Context(), testSocketPath(t), fixedRunner("true"))
 	if err == nil {
 		t.Fatal("runDaemon() with a missing config = nil, want error")
 	}
@@ -67,7 +68,7 @@ func TestRunDaemon_externalModeReturnsNilOnShutdown(t *testing.T) {
 	// Deliberately pre-cancelled (not t.Context()) to drive the shutdown arm.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := runDaemon(ctx, testSocketPath(t), recordingRunner(t, "true")); err != nil {
+	if err := runDaemon(ctx, testSocketPath(t), fixedRunner("true")); err != nil {
 		t.Fatalf("runDaemon() external-mode cancelled = %v, want nil", err)
 	}
 }
@@ -84,7 +85,7 @@ func TestRunDaemon_builtinModeReturnsNilOnShutdown(t *testing.T) {
 	// Deliberately pre-cancelled (not t.Context()) to drive the shutdown arm.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := runDaemon(ctx, testSocketPath(t), recordingRunner(t, "true")); err != nil {
+	if err := runDaemon(ctx, testSocketPath(t), fixedRunner("true")); err != nil {
 		t.Fatalf("runDaemon() built-in-mode cancelled = %v, want nil", err)
 	}
 }
@@ -162,6 +163,37 @@ func TestProbeOptions_externalAndBrokenConfigDisarm(t *testing.T) {
 	t.Setenv("CONFIG_PATH", filepath.Join(t.TempDir(), "absent.yaml"))
 	if opts := probeOptions(); len(opts) != 0 {
 		t.Errorf("probeOptions() with unreadable config = %d options, want 0 (disarmed)", len(opts))
+	}
+}
+
+// TestProbeOptions_readableInvalidConfigsDisarm pins the two remaining disarm
+// arms, both with a READABLE config: a malformed document (parse error) and a
+// valid one over configCapBytes (size refusal). Both must yield a bare probe
+// rather than a deadline, since a false-unhealthy would restart-loop the
+// container. Not parallel: sets env.
+func TestProbeOptions_readableInvalidConfigsDisarm(t *testing.T) {
+	t.Setenv("SYNC_INTERVAL", "1h")
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "malformed_yaml", data: []byte("jobs: [")},
+		// Stays valid YAML past the cap, so it witnesses the size refusal:
+		// without that guard the document parses to zero jobs and one option
+		// comes back.
+		{name: "over_cap", data: []byte("jobs: []\n#" + strings.Repeat("x", configCapBytes))},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, tt.data, 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			t.Setenv("CONFIG_PATH", path)
+			if opts := probeOptions(); len(opts) != 0 {
+				t.Errorf("probeOptions() with %s config = %d options, want 0 (disarmed)", tt.name, len(opts))
+			}
+		})
 	}
 }
 

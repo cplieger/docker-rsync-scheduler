@@ -34,7 +34,7 @@ func TestBuildRsyncArgs(t *testing.T) {
 
 	t.Run("minimal has no delete or chown", func(t *testing.T) {
 		t.Parallel()
-		got := buildRsyncArgs(argJob(false, nil, nil, nil), hostKeyAcceptNew)
+		got := buildRsyncArgs(argJob(false, nil, nil, nil), transport{})
 
 		if got[0] != "-rlptD" {
 			t.Errorf("first arg = %q, want -rlptD", got[0])
@@ -60,7 +60,7 @@ func TestBuildRsyncArgs(t *testing.T) {
 
 	t.Run("delete adds --delete", func(t *testing.T) {
 		t.Parallel()
-		got := buildRsyncArgs(argJob(true, nil, nil, nil), hostKeyAcceptNew)
+		got := buildRsyncArgs(argJob(true, nil, nil, nil), transport{})
 		if !slices.Contains(got, "--delete") {
 			t.Errorf("--delete absent in %v", got)
 		}
@@ -68,7 +68,7 @@ func TestBuildRsyncArgs(t *testing.T) {
 
 	t.Run("uid and gid add chown", func(t *testing.T) {
 		t.Parallel()
-		got := buildRsyncArgs(argJob(false, new(1000), new(1000), nil), hostKeyAcceptNew)
+		got := buildRsyncArgs(argJob(false, new(1000), new(1000), nil), transport{})
 		if !slices.Contains(got, "--chown=1000:1000") {
 			t.Errorf("--chown=1000:1000 absent in %v", got)
 		}
@@ -76,7 +76,7 @@ func TestBuildRsyncArgs(t *testing.T) {
 
 	t.Run("uid only does not add chown", func(t *testing.T) {
 		t.Parallel()
-		got := buildRsyncArgs(argJob(false, new(1000), nil, nil), hostKeyAcceptNew)
+		got := buildRsyncArgs(argJob(false, new(1000), nil, nil), transport{})
 		if hasChown(got) {
 			t.Errorf("--chown present with gid unset in %v", got)
 		}
@@ -84,7 +84,7 @@ func TestBuildRsyncArgs(t *testing.T) {
 
 	t.Run("gid only does not add chown", func(t *testing.T) {
 		t.Parallel()
-		got := buildRsyncArgs(argJob(false, nil, new(1000), nil), hostKeyAcceptNew)
+		got := buildRsyncArgs(argJob(false, nil, new(1000), nil), transport{})
 		if hasChown(got) {
 			t.Errorf("--chown present with uid unset in %v", got)
 		}
@@ -92,7 +92,7 @@ func TestBuildRsyncArgs(t *testing.T) {
 
 	t.Run("excludes appended after globals", func(t *testing.T) {
 		t.Parallel()
-		got := buildRsyncArgs(argJob(false, nil, nil, []string{"**/*.lock", "logs"}), hostKeyAcceptNew)
+		got := buildRsyncArgs(argJob(false, nil, nil, []string{"**/*.lock", "logs"}), transport{})
 		if !slices.Contains(got, "--filter=- **/*.lock") {
 			t.Errorf("per-job exclude absent in %v", got)
 		}
@@ -113,7 +113,7 @@ func TestBuildRsyncArgs(t *testing.T) {
 	// include that transfers a file the operator asked to exclude.
 	t.Run("rule-prefix and clear patterns stay literal patterns", func(t *testing.T) {
 		t.Parallel()
-		got := buildRsyncArgs(argJob(false, nil, nil, []string{"!", "+ real.conf"}), hostKeyAcceptNew)
+		got := buildRsyncArgs(argJob(false, nil, nil, []string{"!", "+ real.conf"}), transport{})
 		for _, want := range []string{"--filter=- !", "--filter=- + real.conf"} {
 			if !slices.Contains(got, want) {
 				t.Errorf("buildRsyncArgs() = %v, want it to contain %q", got, want)
@@ -128,7 +128,7 @@ func TestBuildRsyncArgs(t *testing.T) {
 
 	t.Run("all knobs together", func(t *testing.T) {
 		t.Parallel()
-		got := buildRsyncArgs(argJob(true, new(0), new(0), []string{"logs"}), hostKeyAcceptNew)
+		got := buildRsyncArgs(argJob(true, new(0), new(0), []string{"logs"}), transport{})
 		want := []string{
 			"-rlptD", "--delete", "--chown=0:0", "--stats", "-e", wantSSHAcceptNew,
 			"--filter=- .stfolder", "--filter=- .stversions",
@@ -195,6 +195,56 @@ func TestClassifyKnownHosts(t *testing.T) {
 			t.Errorf("classifyKnownHosts(directory) error = %v, want a not-a-regular-file refusal", err)
 		}
 	})
+
+	t.Run("over-long comment then a key is strict", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "known_hosts")
+		doc := "# " + strings.Repeat("x", 70<<10) + "\n192.0.2.10 ssh-ed25519 AAAAC3Nz\n"
+		if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+			t.Fatalf("write known_hosts: %v", err)
+		}
+		mode, err := classifyKnownHosts(path)
+		if err != nil || mode != hostKeyStrict {
+			t.Errorf("classifyKnownHosts(long comment + key) = (%v, %v), want (strict, nil)", mode, err)
+		}
+	})
+
+	t.Run("only an over-long comment is refused as empty", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "known_hosts")
+		doc := "# " + strings.Repeat("x", 70<<10) + "\n"
+		if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+			t.Fatalf("write known_hosts: %v", err)
+		}
+		_, err := classifyKnownHosts(path)
+		if err == nil || !strings.Contains(err.Error(), "no entries") {
+			t.Errorf("classifyKnownHosts(long comment only) error = %v, want a no-entries refusal", err)
+		}
+	})
+
+	t.Run("indented key is strict", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "known_hosts")
+		if err := os.WriteFile(path, []byte("  \t192.0.2.10 ssh-ed25519 AAAAC3Nz\n"), 0o600); err != nil {
+			t.Fatalf("write known_hosts: %v", err)
+		}
+		mode, err := classifyKnownHosts(path)
+		if err != nil || mode != hostKeyStrict {
+			t.Errorf("classifyKnownHosts(indented key) = (%v, %v), want (strict, nil)", mode, err)
+		}
+	})
+
+	t.Run("non-ASCII space before a comment is refused as empty", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "known_hosts")
+		if err := os.WriteFile(path, []byte("\u00a0# nothing here\n"), 0o600); err != nil {
+			t.Fatalf("write known_hosts: %v", err)
+		}
+		_, err := classifyKnownHosts(path)
+		if err == nil || !strings.Contains(err.Error(), "no entries") {
+			t.Errorf("classifyKnownHosts(NBSP then comment) error = %v, want a no-entries refusal", err)
+		}
+	})
 }
 
 // TestHostKeyMode_String pins the two operator-visible spellings the startup
@@ -211,7 +261,7 @@ func TestHostKeyMode_String(t *testing.T) {
 
 func TestBuildRsyncArgs_KnownHostsPresent(t *testing.T) {
 	t.Parallel()
-	got := buildRsyncArgs(argJob(false, nil, nil, nil), hostKeyStrict)
+	got := buildRsyncArgs(argJob(false, nil, nil, nil), transport{hostKeys: hostKeyStrict})
 	i := slices.Index(got, "-e")
 	if i == -1 || i+1 >= len(got) {
 		t.Fatalf("-e argument missing in %v", got)
@@ -233,7 +283,7 @@ func TestBuildRsyncArgs_maxDelete(t *testing.T) {
 		t.Parallel()
 		j := argJob(true, nil, nil, nil)
 		j.MaxDelete = new(100)
-		got := buildRsyncArgs(j, hostKeyAcceptNew)
+		got := buildRsyncArgs(j, transport{})
 		if !slices.Contains(got, "--max-delete=100") {
 			t.Errorf("--max-delete=100 absent in %v", got)
 		}
@@ -241,7 +291,7 @@ func TestBuildRsyncArgs_maxDelete(t *testing.T) {
 
 	t.Run("delete without max_delete omits the flag", func(t *testing.T) {
 		t.Parallel()
-		got := buildRsyncArgs(argJob(true, nil, nil, nil), hostKeyAcceptNew)
+		got := buildRsyncArgs(argJob(true, nil, nil, nil), transport{})
 		if slices.ContainsFunc(got, func(a string) bool { return strings.HasPrefix(a, "--max-delete=") }) {
 			t.Errorf("--max-delete present with max_delete unset in %v", got)
 		}
@@ -251,7 +301,7 @@ func TestBuildRsyncArgs_maxDelete(t *testing.T) {
 		t.Parallel()
 		j := argJob(false, nil, nil, nil)
 		j.MaxDelete = new(100)
-		got := buildRsyncArgs(j, hostKeyAcceptNew)
+		got := buildRsyncArgs(j, transport{})
 		if slices.ContainsFunc(got, func(a string) bool { return strings.HasPrefix(a, "--max-delete=") }) {
 			t.Errorf("--max-delete present without delete in %v", got)
 		}
@@ -351,6 +401,113 @@ func TestRemoteDest_bracketedIPv4Normalized(t *testing.T) {
 			j := &job{RemoteHost: tt.host, RemotePath: "/srv/x"}
 			if got := remoteDest(j); got != tt.want {
 				t.Errorf("remoteDest(host=%q) = %q, want %q", tt.host, got, tt.want)
+			}
+		})
+	}
+}
+
+
+// TestBuildRsyncArgs_transportSwitches pins the three opt-in transport
+// switches. The zero-value row is the important one: transport{} must append
+// none of -A/-X/-z, so no existing deployment changes behaviour on an image
+// bump. The named-algorithm rows also pin the argument ORDER, since
+// --compress-choice is meaningless without the -z that precedes it.
+func TestBuildRsyncArgs_transportSwitches(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		tr      transport
+		want    []string
+		notWant []string
+	}{
+		{
+			name:    "zero value appends nothing",
+			tr:      transport{},
+			notWant: []string{"-A", "-X", "-z"},
+		},
+		{
+			name:    "acls appends -A",
+			tr:      transport{acls: true},
+			want:    []string{"-A"},
+			notWant: []string{"-X", "-z"},
+		},
+		{
+			name:    "xattrs appends -X",
+			tr:      transport{xattrs: true},
+			want:    []string{"-X"},
+			notWant: []string{"-A", "-z"},
+		},
+		{
+			name:    "auto appends -z alone",
+			tr:      transport{compress: "auto"},
+			want:    []string{"-z"},
+			notWant: []string{"--compress-choice=auto"},
+		},
+		{
+			name: "zstd appends -z and the choice",
+			tr:   transport{compress: "zstd"},
+			want: []string{"-z", "--compress-choice=zstd"},
+		},
+		{
+			name: "lz4 appends -z and the choice",
+			tr:   transport{compress: "lz4"},
+			want: []string{"-z", "--compress-choice=lz4"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := buildRsyncArgs(argJob(false, nil, nil, nil), tt.tr)
+			if got[0] != "-rlptD" {
+				t.Errorf("buildRsyncArgs(%+v) first arg = %q, want -rlptD", tt.tr, got[0])
+			}
+			for _, flag := range tt.want {
+				if !slices.Contains(got, flag) {
+					t.Errorf("buildRsyncArgs(%+v) = %v, want it to contain %q", tt.tr, got, flag)
+				}
+			}
+			for _, flag := range tt.notWant {
+				if slices.Contains(got, flag) {
+					t.Errorf("buildRsyncArgs(%+v) = %v, want it NOT to contain %q", tt.tr, got, flag)
+				}
+			}
+			if i := slices.Index(got, "--compress-choice="+tt.tr.compress); i > 0 && got[i-1] != "-z" {
+				t.Errorf("buildRsyncArgs(%+v) = %v, want --compress-choice preceded by -z", tt.tr, got)
+			}
+		})
+	}
+}
+
+// TestTransport_extras pins the startup banner's rsync_extras attribute: an
+// operator cannot otherwise confirm a switch took effect, because the argument
+// slice is never logged.
+func TestTransport_extras(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		tr   transport
+		want string
+	}{
+		{name: "zero value", tr: transport{}, want: "none"},
+		{name: "strict posture alone is still none", tr: transport{hostKeys: hostKeyStrict}, want: "none"},
+		{name: "acls only", tr: transport{acls: true}, want: "acls"},
+		{name: "xattrs only", tr: transport{xattrs: true}, want: "xattrs"},
+		{name: "compress only", tr: transport{compress: "zstd"}, want: "compress=zstd"},
+		{
+			name: "all three",
+			tr:   transport{acls: true, xattrs: true, compress: "auto"},
+			want: "acls,xattrs,compress=auto",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.tr.extras(); got != tt.want {
+				t.Errorf("transport%+v.extras() = %q, want %q", tt.tr, got, tt.want)
 			}
 		})
 	}
