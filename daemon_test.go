@@ -14,6 +14,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/cplieger/health"
 	"github.com/cplieger/scheduler/v4/trigger"
 	"github.com/cplieger/slogx/capture"
 )
@@ -74,6 +75,55 @@ func TestExecutor_ConfigReloadFailureFailsRequestAndMarker(t *testing.T) {
 	}
 }
 
+// TestExecutor_ValidConfigReloadUsesReplacementJobs pins the other half of
+// the per-pass reload: an operator who edits the mounted CONFIG_PATH between
+// triggers gets the REPLACEMENT job set on the next pass. The oracle is the
+// rsync invocation the daemon hands to the unmanaged child, not an internal
+// loadConfig call. Not parallel: sets env.
+func TestExecutor_ValidConfigReloadUsesReplacementJobs(t *testing.T) {
+	firstSource := newRunJobSource(t)
+	cfgPath := writeValidCfg(t, firstSource)
+	key := filepath.Join(filepath.Dir(cfgPath), "id_ed25519")
+
+	var mu sync.Mutex
+	var sources []string
+	runner := func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		mu.Lock()
+		sources = append(sources, args[len(args)-2])
+		mu.Unlock()
+		return exec.CommandContext(ctx, "true")
+	}
+	d, _, _, _ := newTestDaemon(t, runner)
+
+	if out := submitWait(t, d, newRequest("external")); !out.OK {
+		t.Fatal("first pass reported ok=false")
+	}
+
+	secondSource := newRunJobSource(t)
+	replacement := "jobs:\n  - name: replacement\n    local: " + secondSource + "\n" +
+		"    remote_host: root@192.0.2.10\n    remote_path: /srv/replacement\n" +
+		"    ssh_key: " + key + "\n"
+	if err := os.WriteFile(cfgPath, []byte(replacement), 0o600); err != nil {
+		t.Fatalf("replace config: %v", err)
+	}
+
+	if out := submitWait(t, d, newRequest("external")); !out.OK {
+		t.Fatal("second pass reported ok=false")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sources) != 2 {
+		t.Fatalf("rsync invocation sources = %v, want exactly two", sources)
+	}
+	if sources[0] != firstSource+"/" {
+		t.Errorf("first rsync source = %q, want %q", sources[0], firstSource+"/")
+	}
+	if sources[1] != secondSource+"/" {
+		t.Errorf("second rsync source = %q, want replacement %q", sources[1], secondSource+"/")
+	}
+}
+
 // TestExecutor_ShutdownCancelsQueuedButResolvesInFlight pins the drain
 // contract: SIGTERM interrupts the in-flight pass (which resolves as an
 // interrupted-clean drain, ok=true, per the pass semantics the pre-rewrite
@@ -130,16 +180,44 @@ func TestExecutor_ShutdownCancelsQueuedButResolvesInFlight(t *testing.T) {
 
 // TestTick_SkipsWhenQueueRejects pins the ticker's degradation: a rejected
 // submission (queue full) is logged and skipped — the tick must not panic or
-// block; the next interval provides freshness.
+// block, and the warning is the only record of a scheduled pass that produced
+// neither a request nor a result, so it must name the trigger and a reason.
+// Not parallel: capture.Default swaps the global slog default.
 func TestTick_SkipsWhenQueueRejects(t *testing.T) {
-	t.Parallel()
+	rec := capture.Default(t)
 	d := &daemon{queue: trigger.NewQueue[struct{}](0)} // zero capacity: every submit is rejected
 	done := make(chan struct{})
-	go func() { defer close(done); d.tick("interval") }()
+	go func() {
+		defer close(done)
+		d.tick("interval")
+	}()
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("tick() blocked on a rejected submission; it must skip")
+	}
+
+	const message = "scheduled sync skipped"
+	if got := rec.CountLevel(slog.LevelWarn, message); got != 1 {
+		t.Errorf("tick() warning count = %d, want 1; logs = %q", got, rec.Messages())
+	}
+	if !rec.HasAttr(message, "trigger", "interval") {
+		t.Errorf("tick() warning missing trigger=interval; logs = %q", rec.Messages())
+	}
+	reason := ""
+	for _, record := range rec.Records() {
+		if record.Message != message {
+			continue
+		}
+		record.Attrs(func(attr slog.Attr) bool {
+			if attr.Key == "reason" {
+				reason = attr.Value.String()
+			}
+			return true
+		})
+	}
+	if reason == "" {
+		t.Errorf("tick() warning reason is empty; logs = %q", rec.Messages())
 	}
 }
 
@@ -250,7 +328,7 @@ func TestRunDaemon_ExternalModeBootsHealthyServesAndShutsDownCleanly(t *testing.
 		return err == nil
 	}, "daemon did not bind the trigger socket")
 
-	if code := runClient(sock); code != 0 {
+	if code := runClient(t.Context(), sock); code != 0 {
 		t.Errorf("runClient() = %d, want 0 (clean triggered pass)", code)
 	}
 
@@ -268,5 +346,52 @@ func TestRunDaemon_ExternalModeBootsHealthyServesAndShutsDownCleanly(t *testing.
 	}
 	if _, err := os.Stat(sock); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("socket file not removed on shutdown; stat err = %v, want not-exist", err)
+	}
+}
+
+
+// TestRunDaemon_BuiltinModeStartsUnhealthyUntilStartupPassCompletes pins the
+// built-in arm of hc.markInitial(!cfg.ScheduleEnabled): the container reports
+// unhealthy until the startup pass proves rsync can run. The runner blocks
+// command construction, so the marker is sampled after built-in
+// initialization but before the startup pass can flip it. Not parallel: it
+// uses the package-global healthMarkerPath and env.
+func TestRunDaemon_BuiltinModeStartsUnhealthyUntilStartupPassCompletes(t *testing.T) {
+	writeValidCfg(t, newRunJobSource(t))
+	t.Setenv("SYNC_INTERVAL", "6h")
+	marker := health.NewMarker(healthMarkerPath)
+	marker.Cleanup()
+	t.Cleanup(marker.Cleanup)
+
+	entered := make(chan struct{})
+	proceed := make(chan struct{})
+	runner := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		close(entered)
+		<-proceed
+		return exec.CommandContext(ctx, "true")
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- runDaemon(ctx, testSocketPath(t), runner) }()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("startup pass did not begin")
+	}
+	if _, err := os.Stat(healthMarkerPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("built-in marker before startup completion: stat error = %v, want not-exist", err)
+	}
+
+	cancel()
+	close(proceed)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("runDaemon() = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runDaemon did not return after shutdown")
 	}
 }

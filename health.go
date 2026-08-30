@@ -1,7 +1,7 @@
 package main
 
 import (
-	"os"
+	"math"
 	"sync"
 	"time"
 
@@ -15,36 +15,43 @@ import (
 // marker's single writer.
 const healthMarkerPath = health.DefaultPath
 
-// probeOptions returns the healthcheck probe's freshness policy. Built-in
-// mode arms a max-age deadline: the executor refreshes the marker after
-// every pass, so a marker present but never refreshed means the interval
-// loop is wedged and the container should probe unhealthy and restart. Two
-// intervals plus the worst-case pass duration (every configured job hitting
-// its full per-job SYNC_TIMEOUT) is generous headroom for a slow-but-
-// progressing loop. External mode keeps no deadline: an idle container
-// between sparse triggers is healthy, and a trigger-written marker must not
-// expire. The config read is quiet and best-effort — an unreadable or
-// invalid config disarms the deadline (bare marker probe, the pre-rewrite
-// behavior) rather than risking a false-unhealthy restart loop.
+// probeOptions returns the healthcheck probe's freshness policy. Built-in mode
+// arms a max-age deadline (two intervals plus every job's full SYNC_TIMEOUT) so
+// a marker never refreshed eventually probes unhealthy; external mode stays
+// unbounded, because a marker between sparse triggers must not expire. An
+// unreadable or unparseable config disarms rather than risking a restart loop.
 func probeOptions() []health.ProbeOption {
 	interval, scheduleEnabled := loadInterval()
 	if !scheduleEnabled {
 		return nil
 	}
-	info, err := os.Stat(configPath())
-	if err != nil || info.Size() > configCapBytes {
-		return nil
-	}
-	data, err := os.ReadFile(configPath()) // #nosec G304 -- trusted, operator-mounted config path
-	if err != nil {
+	data, err := readCappedConfig(configPath())
+	if err != nil || len(data) > configCapBytes {
 		return nil
 	}
 	cfg, err := parseConfig(data)
 	if err != nil {
 		return nil
 	}
-	maxAge := 2*interval + time.Duration(len(cfg.Jobs))*loadSyncTimeout()
+	maxAge := maxAgeFor(interval, loadSyncTimeout(), len(cfg.Jobs))
 	return []health.ProbeOption{health.WithMaxAge(maxAge)}
+}
+
+// maxAgeFor returns the freshness lease for the given number of jobs at this
+// interval and per-job timeout. It saturates instead of wrapping: a lease
+// longer than a time.Duration can hold means "never expires", where an int64
+// wrap would turn it into seconds and restart a healthy container on every
+// poll.
+func maxAgeFor(interval, timeout time.Duration, jobs int) time.Duration {
+	const maxDur = time.Duration(math.MaxInt64)
+	if interval > maxDur/2 {
+		return maxDur
+	}
+	lease := 2 * interval
+	if jobs > 0 && timeout > (maxDur-lease)/time.Duration(jobs) {
+		return maxDur
+	}
+	return lease + timeout*time.Duration(jobs)
 }
 
 // healthMarker is the marker behaviour healthController depends on.
@@ -74,14 +81,10 @@ func newHealthController(marker healthMarker) *healthController {
 
 // markInitial sets the pre-pass state: unhealthy for the built-in scheduler
 // (no pass has run yet, so the first completed pass flips it) and healthy for
-// the idle external-trigger container (nothing has failed). It is a no-op once
-// draining.
+// the idle external-trigger container (nothing has failed).
 func (h *healthController) markInitial(healthy bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.draining {
-		return
-	}
 	h.marker.Set(healthy)
 }
 
@@ -104,8 +107,8 @@ func (h *healthController) apply(r *passResult) {
 }
 
 // beginDrain latches shutdown and marks unhealthy immediately, so observers
-// see the draining signal before in-flight work finishes. After it, apply and
-// markInitial can never restore healthy.
+// see the draining signal before in-flight work finishes. After it, apply can
+// never restore healthy.
 func (h *healthController) beginDrain() {
 	h.mu.Lock()
 	defer h.mu.Unlock()

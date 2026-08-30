@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -293,27 +294,6 @@ func TestValidate_sshKeyWithSpaceRejected(t *testing.T) {
 	}
 }
 
-func TestSplitRemoteHost_direct(t *testing.T) {
-	t.Parallel()
-	tests := []struct{ raw, wantUser, wantHost string }{
-		{"host", "", "host"},
-		{"user@host", "user", "host"},
-		{"2001:db8::1", "", "2001:db8::1"},
-		{"[2001:db8::1]", "", "2001:db8::1"},
-		{"user@[2001:db8::1]", "user", "2001:db8::1"},
-		{"[192.0.2.10]", "", "192.0.2.10"},
-		{"[name]", "", "[name]"},
-		{"[]", "", "[]"},
-	}
-	for _, tt := range tests {
-		u, h := splitRemoteHost(tt.raw)
-		if u != tt.wantUser || h != tt.wantHost {
-			t.Errorf("splitRemoteHost(%q) = (%q,%q), want (%q,%q)",
-				tt.raw, u, h, tt.wantUser, tt.wantHost)
-		}
-	}
-}
-
 func TestHasShellMeta(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -409,7 +389,9 @@ func TestParseConfigInvalidYAML(t *testing.T) {
 // TestParseConfigUnknownKeyRejected pins the fail-loud unknown-key contract
 // from yamlenv.CheckUnknownKeys: a misspelled optional job key (max_delet
 // for max_delete) is a parse error naming the key, not a silently ignored
-// setting that leaves the intended cap unset.
+// setting that leaves the intended cap unset. The entry arrives sanitised
+// (`line N: unknown configuration key "max_delet"`), so the operator keeps the
+// line and the key without the Go type name the raw yaml.v3 message leaks.
 func TestParseConfigUnknownKeyRejected(t *testing.T) {
 	t.Parallel()
 	doc := `
@@ -483,19 +465,6 @@ func TestLoadConfigEndToEnd(t *testing.T) {
 	}
 	if len(cfg.Jobs) != 1 || cfg.Jobs[0].Name != "caddy" {
 		t.Errorf("loadConfig = %+v, want one caddy job", cfg.Jobs)
-	}
-	// With SYNC_INTERVAL unset the built-in scheduler is enabled at the
-	// default cadence.
-	t.Setenv("SYNC_INTERVAL", "")
-	cfg, err = loadConfig()
-	if err != nil {
-		t.Fatalf("loadConfig: %v", err)
-	}
-	if !cfg.ScheduleEnabled {
-		t.Error("ScheduleEnabled = false, want true by default")
-	}
-	if cfg.Interval != defaultInterval {
-		t.Errorf("Interval = %v, want default %v", cfg.Interval, defaultInterval)
 	}
 }
 
@@ -617,6 +586,20 @@ func TestCheckReadable(t *testing.T) {
 			t.Errorf("checkReadable(%q) = %v, want an os.ErrNotExist", path, err)
 		}
 	})
+
+	// A directory opens successfully and can never be a private key, so the
+	// kind check is what stops boot validation certifying a config ssh cannot
+	// authenticate with — and in external mode ssh's own complaint is up to
+	// SYNC_INTERVAL away.
+	t.Run("directory is refused", func(t *testing.T) {
+		dir := t.TempDir()
+
+		err := checkReadable(dir)
+
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Errorf("checkReadable(%q) = %v, want a not-a-regular-file refusal", dir, err)
+		}
+	})
 }
 
 // TestLoadConfig_acceptsExactlyCapBytes pins the upper boundary of the size
@@ -677,6 +660,30 @@ func TestLoadConfig_rejectsOverCapBytes(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "exceeds") {
 		t.Errorf("loadConfig over cap error = %q, want to contain 'exceeds'", err)
+	}
+}
+
+// TestConfigReaders_refuseNonRegularConfig pins the kind check both config
+// readers now run on the STAT, before the open: a FIFO at CONFIG_PATH is
+// refused rather than opened, so neither reader can block in open(2) waiting
+// for a writer, and neither can consume a stream whose stat size (0) says
+// nothing about what it will deliver. The byte bound behind it is defence in
+// depth for the one residue the kind check cannot remove — a regular file
+// appended to between the stat and the read — whose oracle is a race no
+// deterministic test can stage.
+func TestConfigReaders_refuseNonRegularConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.fifo")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatalf("Mkfifo: %v", err)
+	}
+	t.Setenv("CONFIG_PATH", path)
+	t.Setenv("SYNC_INTERVAL", "1h")
+	if _, err := loadConfig(); err == nil ||
+		!strings.Contains(err.Error(), "not a regular file") {
+		t.Errorf("loadConfig() error = %v, want a not-a-regular-file refusal", err)
+	}
+	if opts := probeOptions(); len(opts) != 0 {
+		t.Errorf("probeOptions() = %d options, want 0 (disarmed)", len(opts))
 	}
 }
 
@@ -763,8 +770,53 @@ func TestSetupLogger_levelMapping(t *testing.T) {
 	}
 }
 
+// TestSetupLogger_warnsOnUnrecognizedLevel pins the rejected-value warning on
+// the REAL production handler: setupLogger installs its own handler over
+// slog.Default(), so capture.Default cannot see this record — the operator
+// reads it off the container's stderr, which is what this redirects.
+// Not parallel: sets env and swaps os.Stderr plus the global slog default.
+func TestSetupLogger_warnsOnUnrecognizedLevel(t *testing.T) {
+	originalLogger := slog.Default()
+	originalStderr := os.Stderr
+	stderrPath := filepath.Join(t.TempDir(), "stderr")
+	stderr, err := os.Create(stderrPath)
+	if err != nil {
+		t.Fatalf("create stderr capture: %v", err)
+	}
+	os.Stderr = stderr
+	t.Cleanup(func() {
+		os.Stderr = originalStderr
+		slog.SetDefault(originalLogger)
+		_ = stderr.Close()
+	})
+	t.Setenv("LOG_LEVEL", "bogus")
+
+	setupLogger()
+
+	if err := stderr.Close(); err != nil {
+		t.Fatalf("close stderr capture: %v", err)
+	}
+	os.Stderr = originalStderr
+	slog.SetDefault(originalLogger)
+	out, err := os.ReadFile(stderrPath)
+	if err != nil {
+		t.Fatalf("read stderr capture: %v", err)
+	}
+	logs := string(out)
+	const message = `msg="unrecognized LOG_LEVEL, using info"`
+	if got := strings.Count(logs, message); got != 1 {
+		t.Errorf("setupLogger() warning count = %d, want 1; stderr = %q", got, logs)
+	}
+	if !strings.Contains(logs, "level=WARN") {
+		t.Errorf("setupLogger() stderr = %q, want level=WARN", logs)
+	}
+	if !strings.Contains(logs, "value=bogus") {
+		t.Errorf("setupLogger() stderr = %q, want value=bogus", logs)
+	}
+}
+
 func TestLoadConfig_readErrorWhenPathIsDir(t *testing.T) {
-	dir := t.TempDir() // a directory: os.Stat succeeds, os.ReadFile fails
+	dir := t.TempDir() // a directory: refused by the regular-file check
 
 	t.Setenv("CONFIG_PATH", dir)
 
@@ -962,5 +1014,69 @@ func TestValidate_remotePathWithSpaceRejected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "must not contain spaces") {
 		t.Errorf("validate() error = %q, want to contain 'must not contain spaces'", err)
+	}
+}
+
+// TestValidate_remotePathWithGlobRejected pins the remote_path glob guard:
+// rsync leaves *?[] alone in a filename argument and the receiving side expands
+// them, so a pattern-shaped path silently resolves to whichever sibling tree
+// matches — and under --delete that deletes in a tree the operator never named.
+// The trigger is time rather than typing: a literal directory named `lit[2026]`
+// delivers correctly until a sibling named `lit2` appears.
+func TestValidate_remotePathWithGlobRejected(t *testing.T) {
+	key := writeKey(t)
+	for _, path := range []string{"/srv/cont*", "/srv/c?nt", "/srv/lit[2026]", "/srv/lit]"} {
+		j := validJob("globbed", key)
+		j.RemotePath = path
+		err := config{Jobs: []job{j}}.validate()
+		if err == nil {
+			t.Errorf("validate() with remote_path %q = nil, want error", path)
+			continue
+		}
+		if !strings.Contains(err.Error(), "must not contain glob characters") {
+			t.Errorf("validate() with remote_path %q error = %q, want a glob refusal", path, err)
+		}
+	}
+}
+
+// TestValidate_warnsSharedDestinations pins the cross-job advisory: two jobs
+// addressing one remote tree with either deleting is accepted (an rsync exclude
+// can protect the receiver, so the pair CAN be correct) but warned about,
+// because otherwise each pass silently deletes the other's files while the
+// heartbeat still reports failed=0. Identity is host+key+path, so a different
+// host, a disjoint path, or neither job deleting stays silent.
+func TestValidate_warnsSharedDestinations(t *testing.T) {
+	// Not parallel: capture.Default swaps the global slog default.
+	key := writeKey(t)
+	const warning = "two jobs share a remote destination and one deletes"
+
+	tests := []struct {
+		name             string
+		pathA, pathB     string
+		hostB            string
+		deleteA, deleteB bool
+		wantWarn         bool
+	}{
+		{"same path with delete warns", "/srv/x", "/srv/x", "root@192.0.2.87", true, false, true},
+		{"nested path with delete warns", "/srv", "/srv/x", "root@192.0.2.87", true, false, true},
+		{"rrsync-rooted parent with delete warns", "/", "/srv/x", "root@192.0.2.87", true, false, true},
+		{"same path without delete is silent", "/srv/x", "/srv/x", "root@192.0.2.87", false, false, false},
+		{"sibling paths are silent", "/srv/x", "/srv/xy", "root@192.0.2.87", true, true, false},
+		{"different host is silent", "/srv/x", "/srv/x", "root@192.0.2.88", true, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := capture.Default(t)
+			a, b := validJob("a", key), validJob("b", key)
+			a.RemotePath, a.Delete = tt.pathA, tt.deleteA
+			b.RemotePath, b.Delete, b.RemoteHost = tt.pathB, tt.deleteB, tt.hostB
+			if err := (config{Jobs: []job{a, b}}).validate(); err != nil {
+				t.Fatalf("validate() = %v, want nil", err)
+			}
+			if got := rec.Contains(warning); got != tt.wantWarn {
+				t.Errorf("validate(%q vs %q on %q) warned=%v, want %v; logs=%q",
+					tt.pathA, tt.pathB, tt.hostB, got, tt.wantWarn, rec.Messages())
+			}
+		})
 	}
 }

@@ -3,9 +3,6 @@ package main
 import (
 	"context"
 	"log/slog"
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/cplieger/health"
@@ -15,18 +12,7 @@ import (
 
 // --- Daemon: the single owner of sync execution ---
 //
-// PID 1 owns every sync pass. Triggers only submit requests: the built-in
-// ticker (built-in mode) and the unix-socket clients (`sync` subcommand,
-// both modes) all feed one FIFO queue served by one executor goroutine.
-// That single-ownership is the design: mutual exclusion is the executor loop
-// (nothing else may run a pass), shutdown cancels the in-flight pass's
-// context so rsync drains under the existing SIGTERM-then-grace machinery,
-// and every pass's log lines land on the container log stream because the
-// pass executes in the daemon — in external mode too, which the previous
-// exec-child design could not offer. The broker itself — bounded FIFO queue,
-// socket server, wire protocol — is the scheduler library's trigger
-// subpackage; this file owns the policy (what a pass does, health mapping,
-// drain-versus-cancel, log wording).
+// The executor goroutine is the only in-process caller of d.run.
 
 // queueCapacity bounds pending requests in the trigger broker's FIFO. The
 // realistic trigger set is one periodic job (Ofelia) plus a manual exec, so
@@ -47,40 +33,38 @@ type daemon struct {
 	queue *trigger.Queue[struct{}]
 	// hc is the single writer of the health marker; every pass outcome
 	// funnels through it (drain latch, interrupted-clean carve-out).
-	hc      *healthController
-	newCmd  scheduler.CommandRunner
-	timeout time.Duration
+	hc       *healthController
+	newCmd   scheduler.CommandRunner
+	timeout  time.Duration
+	hostKeys hostKeyMode
 }
 
-// runDaemon is the composition root for the long-running container (the
-// `daemon` subcommand and the default no-arg command). It configures logging,
-// fail-fast loads and validates the config, binds the trigger socket, wires
-// the health controller, starts the executor, and — in built-in mode —
-// drives the interval ticker. newCmd builds each rsync child
-// (defaultCommandRunner in production; injected by tests). Returning an
-// error exits non-zero.
+// runDaemon runs the long-running container (the `daemon` subcommand): it
+// fail-fast loads and validates the config, decides the ssh host-key posture,
+// binds the trigger socket, wires the health controller, starts the executor,
+// and — in built-in mode — drives the interval ticker. It expects an already
+// signal-bound context and a configured logger from dispatch. newCmd builds
+// each rsync child (defaultCommandRunner in production; injected by tests).
+// Returning an error exits non-zero.
 func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandRunner) error {
-	setupLogger()
-
-	// Boot-time fail-fast: a missing or invalid config refuses to start the
-	// container, exactly as before the single-owner rewrite. The executor
-	// re-loads the config per pass (see execute), so this cfg's job list is
-	// only the boot snapshot; its Interval/ScheduleEnabled select the mode.
 	cfg, err := loadConfig()
 	if err != nil {
 		return err
 	}
 	timeout := loadSyncTimeout()
-
-	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	interval, scheduleEnabled := loadInterval()
+	hostKeys, err := classifyKnownHosts(knownHostsPath)
+	if err != nil {
+		slog.Error("cannot determine the ssh host-key posture", "error", err,
+			"hint", "mount a non-empty known_hosts file at "+knownHostsPath+", or omit the mount for accept-new")
+		return err
+	}
 
 	ln, err := trigger.Listen(socketPath)
 	if err != nil {
 		slog.Error("cannot bind trigger socket", "path", socketPath, "error", err)
 		return err
 	}
-	defer func() { _ = os.Remove(socketPath) }()
 
 	marker := health.NewMarker(healthMarkerPath)
 	defer marker.Cleanup()
@@ -88,13 +72,14 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 	// Built-in mode starts unhealthy until the first pass proves the setup
 	// (the startup pass flips it); external mode starts healthy — idle,
 	// nothing has failed — and each triggered pass updates it.
-	hc.markInitial(!cfg.ScheduleEnabled)
+	hc.markInitial(!scheduleEnabled)
 
 	d := &daemon{
-		queue:   trigger.NewQueue[struct{}](queueCapacity),
-		hc:      hc,
-		newCmd:  newCmd,
-		timeout: timeout,
+		queue:    trigger.NewQueue[struct{}](queueCapacity),
+		hc:       hc,
+		newCmd:   newCmd,
+		timeout:  timeout,
+		hostKeys: hostKeys,
 	}
 
 	executorDone := make(chan struct{})
@@ -113,15 +98,15 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 	}
 	srv.Serve(ln)
 
-	tickerDone := startTicker(ctx, d, cfg.Interval, cfg.ScheduleEnabled)
+	tickerDone := startTicker(ctx, d, interval, scheduleEnabled)
 
-	mode := "external"
-	if cfg.ScheduleEnabled {
-		mode = "built-in"
+	mode, intervalAttr := "external", "none"
+	if scheduleEnabled {
+		mode, intervalAttr = "built-in", interval.String()
 	}
 	slog.Info("container started ("+mode+" scheduling)",
-		"jobs", len(cfg.Jobs), "config", configPath(), "interval", cfg.Interval,
-		"ssh_hostkey_mode", sshHostKeyMode(), "socket", socketPath)
+		"jobs", len(cfg.Jobs), "config", configPath(), "interval", intervalAttr,
+		"ssh_hostkey_mode", hostKeys.String(), "socket", socketPath)
 
 	<-ctx.Done()
 	slog.Info("shutting down", "cause", context.Cause(ctx))
@@ -185,23 +170,10 @@ func (d *daemon) tick(trig string) {
 	<-r.Result()
 }
 
-// run performs one request: reload the config (the old external `sync`
-// process re-read it on every trigger, so a config edit takes effect on the
-// next pass without a restart — per-pass reload keeps that contract in both
-// modes, and a config mount that degrades after boot fails the pass loudly
-// instead of syncing from a stale snapshot), run the pass, route the outcome
-// through the reporter and the health controller, and return the result. The
-// job lifecycle around it belongs to trigger.Execute — the daemon's single
-// executor loop — which checks the shutdown ctx before each start (queued
-// requests behind a stop are cancelled with an explicit result, never run)
-// and guarantees exactly one delivered result per accepted request, even if
-// this callback panics.
-//
-// The pass runs under the shutdown-cancellable ctx on purpose: SIGTERM
-// interrupts an in-flight rsync (SIGTERM-then-grace via the command runner),
-// and the interrupted-clean machinery in passResult keeps that drain from
-// registering as a failure — the same drain semantics the pre-rewrite design
-// pinned in its tests.
+// run performs one request. It reloads the config, which is what makes a
+// config edit take effect on the next trigger without a restart, and runs the
+// pass under the shutdown-cancellable ctx: SIGTERM interrupts an in-flight
+// rsync, and passResult preserves an interrupted clean pass as a clean drain.
 func (d *daemon) run(ctx context.Context, trig string, _ struct{}) trigger.Outcome {
 	start := time.Now()
 
@@ -211,7 +183,7 @@ func (d *daemon) run(ctx context.Context, trig string, _ struct{}) trigger.Outco
 		return trigger.Outcome{OK: false, Duration: time.Since(start), Reason: "config reload failed"}
 	}
 
-	res := runPass(ctx, cfg, d.timeout, trig, d.newCmd)
+	res := runPass(ctx, cfg, d.timeout, d.hostKeys, trig, d.newCmd)
 	reportPass(&res)
 	d.hc.apply(&res)
 	return trigger.Outcome{OK: res.exitStatus() == 0, Duration: res.duration}

@@ -46,7 +46,7 @@ services:
 ## Architecture
 
 - _Single-owner daemon._ One long-lived process executes every pass, whatever triggered it: two passes can never overlap, and every pass's logs reach the container log stream in both scheduling modes.
-- _Subcommands._ `daemon` (the default command), `sync` (submits one pass to the daemon and exits with that pass's result: 0 if all jobs succeed, 1 if any fail), and `health` (the Docker probe).
+- _Subcommands._ `daemon` (what the image's `CMD` runs), `sync` (submits one pass to the daemon and exits with that pass's result: 0 if all jobs succeed, 1 if any fail), and `health` (the Docker probe).
 - _No shell, validated config._ Each job runs with an explicit argument slice (no shell), and every config field is validated at startup. See [Security](#security).
 - _Bounded resources._ Per-job timeout (default 10m, override with `SYNC_TIMEOUT`); captured rsync stderr is capped at 1 MB.
 
@@ -121,10 +121,12 @@ Each entry under `jobs:` takes these keys:
 | `remote_uid` | _(unset)_ | With `remote_gid`, adds `--chown=uid:gid` |
 | `remote_gid` | _(unset)_ | With `remote_uid`, adds `--chown=uid:gid` |
 | `delete` | `false` | Adds `--delete` when `true` |
-| `max_delete` | _(unset)_ | With `delete`, adds `--max-delete=N` (abort a pass that would delete more than N files); unset leaves deletions uncapped |
+| `max_delete` | _(unset)_ | With `delete`, adds `--max-delete=N` (rsync deletes at most N, then skips the rest and FAILS the pass: exit 25, `sync failed`, unhealthy; `0` refuses every deletion and fails the pass whenever anything would have been deleted); unset leaves deletions uncapped |
 | `excludes` | _(unset)_ | Per-job rsync exclude patterns, added to the built-in globals |
 
 Write IPv6 `remote_host` literals as the bare address (`2001:db8::1` or `user@2001:db8::1`); the brackets rsync's `host:path` syntax needs are added for you. A host containing a colon that is not a valid IP (a trailing colon, or an incomplete address) is rejected at startup so it can't be misread as rsync's daemon-mode `::` separator. Link-local IPv6 with a zone id (`fe80::1%eth0`) is not supported; use a global or ULA address, or define an `ssh_config` `Host` alias and reference the alias name.
+
+Two jobs that point at one remote tree with `delete` set warn at startup: each pass can delete what the other put there. rsync excludes are what make such a pair safe, and the container does not try to decide whether yours is.
 
 Every job also receives a fixed set of global excludes: `.stfolder`, `.stversions`, `.DS_Store`, `Thumbs.db`. Each job is pushed with `rsync -rlptD` (archive minus owner/group/ACL/xattr) plus `--stats`, the per-job and global excludes, and the `-e "ssh -i <key> -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10"` transport (strict host-key pinning replaces `accept-new` when a `known_hosts` file is mounted; see [SSH host-key verification](#ssh-host-key-verification)).
 
@@ -139,7 +141,7 @@ Every job also receives a fixed set of global excludes: `.stfolder`, `.stversion
 
 ## Healthcheck
 
-The built-in healthcheck (`docker-rsync-scheduler health`) checks for a marker file that is set after each sync pass: healthy when the most recent pass had zero failed jobs, unhealthy when any job failed. Empty-source skips count as success. The container recovers automatically on the next clean pass, no restart required. In built-in mode it begins unhealthy and flips after the startup pass, so size `healthcheck.start_period` for the time the initial pass may take (the baked default is 120s); built-in mode also arms a freshness deadline of `2×SYNC_INTERVAL + jobs×SYNC_TIMEOUT`, so a wedged interval loop (marker present but never refreshed) eventually probes unhealthy and is restarted. In external mode the container starts healthy (idle, nothing has failed), each triggered `sync` updates the marker, and no deadline is armed (a marker between sparse triggers must not expire).
+The built-in healthcheck (`docker-rsync-scheduler health`) checks for a marker file that is set after each sync pass: healthy when the most recent pass had zero failed jobs, unhealthy when any job failed. Empty-source skips count as success. A pass whose rsync ends with the vanished-files warning (exit 24) also counts as success: it logs `level=WARN msg="sync completed with vanished source files"` with the exit code and the byte counts, and leaves the marker healthy. The container recovers automatically on the next clean pass, no restart required. In built-in mode it begins unhealthy and flips after the startup pass, so size `healthcheck.start_period` for the time the initial pass may take (the baked default is 120s); built-in mode also arms a freshness deadline of `2×SYNC_INTERVAL + jobs×SYNC_TIMEOUT`, so a wedged interval loop (marker present but never refreshed) eventually probes unhealthy and is restarted. In external mode the container starts healthy (idle, nothing has failed), each triggered `sync` updates the marker, and no deadline is armed (a marker between sparse triggers must not expire).
 
 > An empty source is skipped as a success, so a job whose source silently becomes empty (for example a read-only bind mount that failed to mount and Docker materialised as an empty directory) keeps the container healthy and never logs at `level=ERROR`; it is invisible to both the error-level and heartbeat-absence alerts. Each skip emits a `level=WARN msg="skip empty source"` line and the `sync cycle complete` heartbeat carries a `skipped` count. Alert on a persistently non-zero `skipped` (or `skipped == jobs`) across several consecutive passes, or on the recurring warning, to catch a vanished source before the remote mirror goes stale.
 
@@ -202,10 +204,11 @@ Thresholds and the `severity` label are starting points: size the stall window
 to your pass cadence (`SYNC_INTERVAL` in built-in mode, your external
 scheduler's period otherwise; the 8h default assumes 6h), adjust the
 `container` selector (or `job` / `service`, depending on your log collector) to
-your deployment, and route by whatever labels your Alertmanager uses. To also
-catch a source that has silently gone empty (skipped as a success, so it never
-trips the fault rule), see the `skipped` / `skip empty source` note under
-[Healthcheck](#healthcheck).
+your deployment, and route by whatever labels your Alertmanager uses. Two
+classes count as a success and so never trip the fault rule: a source that has
+silently gone empty, and a pass whose rsync reports vanished source files
+(grep `sync completed with vanished source files`). See the `skipped` /
+`skip empty source` note under [Healthcheck](#healthcheck).
 
 ## Security
 
@@ -229,6 +232,8 @@ Then mount it into the container:
 volumes:
   - ./known_hosts:/config/known_hosts:ro
 ```
+
+Confirm the file is not empty before you mount it: `ssh-keyscan` writes nothing and exits non-zero for a host it cannot reach, and a `known_hosts` that pins nothing cannot be used. The container refuses to start when the mounted path is not a regular file or carries no entries.
 
 _Why it runs as root._ The container runs as root by design: it must read host-owned source files (e.g. a host UID like 1000) across multiple bind mounts. A fixed non-root `USER` would break this. Mount sources read-only and use a dedicated, least-privilege SSH key on the remote.
 

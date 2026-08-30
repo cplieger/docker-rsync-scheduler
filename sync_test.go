@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -41,7 +40,7 @@ func TestRunJob_successParsesStatsAndMarksSuccess(t *testing.T) {
 		return exec.CommandContext(ctx, "sh", "-c",
 			"printf 'Number of regular files transferred: 5\\nTotal transferred file size: 2048 bytes\\n'; exit 0")
 	}
-	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), time.Minute, newCmd)
+	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), time.Minute, hostKeyAcceptNew, newCmd)
 	if !res.success {
 		t.Errorf("success = false, want true")
 	}
@@ -64,7 +63,7 @@ func TestRunJob_failureCapturesExitCodeAndStderr(t *testing.T) {
 		return exec.CommandContext(ctx, "sh", "-c",
 			"printf 'rsync error: link_stat failed\\n' >&2; exit 23")
 	}
-	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), time.Minute, newCmd)
+	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), time.Minute, hostKeyAcceptNew, newCmd)
 	if res.success {
 		t.Errorf("success = true, want false")
 	}
@@ -76,12 +75,93 @@ func TestRunJob_failureCapturesExitCodeAndStderr(t *testing.T) {
 	}
 }
 
+// TestRunJob_failureRetainsFinalStderrDiagnostic drives more than
+// outputCapBytes through the captured stderr and asserts the terminal
+// diagnostic -- normally the actionable summary -- survives the cap, and that
+// the same bounded value reaches the published failure record.
+func TestRunJob_failureRetainsFinalStderrDiagnostic(t *testing.T) {
+	rec := capture.Default(t)
+	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c",
+			"dd if=/dev/zero bs=1048576 count=2 1>&2 2>/dev/null; printf 'terminal-diagnostic\\n' >&2; exit 23")
+	}
+
+	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), time.Minute, hostKeyAcceptNew, newCmd)
+
+	if !strings.HasSuffix(res.stderrTail, "terminal-diagnostic\n") {
+		t.Errorf("stderrTail suffix = %q, want terminal diagnostic", res.stderrTail)
+	}
+	if !strings.HasPrefix(res.stderrTail, truncMarker) {
+		t.Errorf("stderrTail = %q, want truncation marker", res.stderrTail)
+	}
+	if len(res.stderrTail) > len(truncMarker)+logStderrTailBytes {
+		t.Errorf("len(stderrTail) = %d, want <= %d", len(res.stderrTail), len(truncMarker)+logStderrTailBytes)
+	}
+	if !rec.HasAttr("sync failed", "stderr", res.stderrTail) {
+		t.Errorf("sync failed record does not carry stderrTail %q; logs = %q", res.stderrTail, rec.Messages())
+	}
+}
+
+// TestRunJob_vanishedFilesIsSuccessWithWarning pins rsync's exit 24: upstream
+// routes it to its warning channel and only reports it when nothing else
+// failed, so the transfer succeeded for every file that still existed. The job
+// must count as a success and log at WARN, never at ERROR.
+func TestRunJob_vanishedFilesIsSuccessWithWarning(t *testing.T) {
+	rec := capture.Default(t) // process-global handler: no t.Parallel
+	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c",
+			"printf 'Number of regular files transferred: 3\\nTotal transferred file size: 1024 bytes\\n'; "+
+				"printf 'file has vanished: \"/src/gone\"\\n' >&2; exit 24")
+	}
+	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), time.Minute, hostKeyAcceptNew, newCmd)
+	if !res.success || res.exitCode != rsyncVanishedExit {
+		t.Errorf("runJob(exit 24) = success:%v exitCode:%d, want true 24", res.success, res.exitCode)
+	}
+	const message = "sync completed with vanished source files"
+	if got := rec.CountLevel(slog.LevelWarn, message); got != 1 {
+		t.Errorf("%q WARN records = %d, want 1; logs = %q", message, got, rec.Messages())
+	}
+	if got := rec.CountExact("sync failed"); got != 0 {
+		t.Errorf("%q emitted %d time(s), want 0; logs = %q", "sync failed", got, rec.Messages())
+	}
+	for key, value := range map[string]string{"rsync_exit": "24", "files": "3", "bytes": "1024"} {
+		if !rec.HasAttr(message, key, value) {
+			t.Errorf("%q missing attr %s=%q; logs = %q", message, key, value, rec.Messages())
+		}
+	}
+	if !rec.AttrContains(message, "stderr", "vanished") {
+		t.Errorf("%q stderr attr does not name the vanished file; logs = %q", message, rec.Messages())
+	}
+}
+
+// TestRunPass_vanishedFilesPassStaysHealthyAndExitsZero pins the two contract
+// surfaces a stranger's program observes for the same case: the health marker
+// value and the `sync` client's exit code.
+func TestRunPass_vanishedFilesPassStaysHealthyAndExitsZero(t *testing.T) {
+	t.Parallel()
+	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", "exit 24")
+	}
+	src := newRunJobSource(t)
+	r := runPass(t.Context(), config{Jobs: []job{*runJobJob(src)}}, time.Minute, hostKeyAcceptNew, "test", newCmd)
+	if r.failed != 0 || r.ok != 1 {
+		t.Errorf("runPass(exit 24) = failed:%d ok:%d, want 0 1", r.failed, r.ok)
+	}
+	set, healthy := r.healthSignal()
+	if !set || !healthy {
+		t.Errorf("healthSignal() = set:%v healthy:%v, want true true", set, healthy)
+	}
+	if got := r.exitStatus(); got != 0 {
+		t.Errorf("exitStatus() = %d, want 0 (a vanished-files pass is a success)", got)
+	}
+}
+
 func TestRunJob_emptySourceSkipsWithoutRunning(t *testing.T) {
 	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 		t.Error("runner invoked for empty source; want skip")
 		return exec.CommandContext(ctx, "true")
 	}
-	res := runJob(t.Context(), runJobJob(t.TempDir()), time.Minute, newCmd)
+	res := runJob(t.Context(), runJobJob(t.TempDir()), time.Minute, hostKeyAcceptNew, newCmd)
 	if !res.skipped {
 		t.Errorf("skipped = false, want true")
 	}
@@ -102,7 +182,7 @@ func TestRunPass_aggregatesFailures(t *testing.T) {
 	}
 	src := newRunJobSource(t)
 	cfg := config{Jobs: []job{*runJobJob(src), *runJobJob(src)}}
-	r := runPass(t.Context(), cfg, time.Minute, "test", newCmd)
+	r := runPass(t.Context(), cfg, time.Minute, hostKeyAcceptNew, "test", newCmd)
 	if r.failed != 1 {
 		t.Errorf("failed = %d, want 1", r.failed)
 	}
@@ -137,7 +217,7 @@ func TestRunJob_parentCancellationLogsShutdownNotFailure(t *testing.T) {
 	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 		return exec.CommandContext(ctx, "sh", "-c", "exit 1")
 	}
-	res := runJob(ctx, runJobJob(newRunJobSource(t)), time.Minute, newCmd)
+	res := runJob(ctx, runJobJob(newRunJobSource(t)), time.Minute, hostKeyAcceptNew, newCmd)
 
 	if res.success {
 		t.Errorf("runJob success = true, want false when parent context cancelled")
@@ -147,6 +227,39 @@ func TestRunJob_parentCancellationLogsShutdownNotFailure(t *testing.T) {
 	}
 	if got := rec.CountLevel(slog.LevelError, ""); got != 0 {
 		t.Errorf("runJob emitted %d ERROR record(s), want none on graceful shutdown; logs = %q", got, rec.Messages())
+	}
+}
+
+// TestRunJob_jobTimeoutIsReportedAsFailure pins the other side of the same arm
+// selection: a per-job deadline expiring under a LIVE parent context is a real
+// failure, logged at ERROR with the timeout state and the signal-terminated
+// exit code, not a graceful drain.
+func TestRunJob_jobTimeoutIsReportedAsFailure(t *testing.T) {
+	rec := capture.Default(t)
+	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "sleep", "30")
+	}
+
+	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), 20*time.Millisecond, hostKeyAcceptNew, newCmd)
+
+	if res.success || res.interrupted {
+		t.Errorf("runJob timeout = success:%v interrupted:%v, want false false", res.success, res.interrupted)
+	}
+	const message = "sync failed"
+	if got := rec.CountExact(message); got != 1 {
+		t.Fatalf("%q emitted %d time(s), want 1; logs = %q", message, got, rec.Messages())
+	}
+	if got := rec.CountLevel(slog.LevelError, message); got != 1 {
+		t.Errorf("%q ERROR records = %d, want 1; logs = %q", message, got, rec.Messages())
+	}
+	for key, value := range map[string]string{
+		"timed_out":  "true",
+		"rsync_exit": "-1",
+		"stderr":     "",
+	} {
+		if !rec.HasAttr(message, key, value) {
+			t.Errorf("%q missing attr %s=%q; logs = %q", message, key, value, rec.Messages())
+		}
 	}
 }
 
@@ -163,7 +276,7 @@ func TestRunPass_emptySourceSkippedNotCountedAsFailure(t *testing.T) {
 	}
 	cfg := config{Jobs: []job{*runJobJob(t.TempDir())}}
 
-	r := runPass(t.Context(), cfg, time.Minute, "test", newCmd)
+	r := runPass(t.Context(), cfg, time.Minute, hostKeyAcceptNew, "test", newCmd)
 
 	if r.failed != 0 {
 		t.Errorf("failed = %d, want 0 (an empty-source skip is not a failure)", r.failed)
@@ -199,7 +312,7 @@ func TestRunPass_shutdownInterruptedJobIsNotCountedAsFailure(t *testing.T) {
 	src := newRunJobSource(t)
 	cfg := config{Jobs: []job{*runJobJob(src), *runJobJob(src)}}
 
-	r := runPass(ctx, cfg, time.Minute, "test", newCmd)
+	r := runPass(ctx, cfg, time.Minute, hostKeyAcceptNew, "test", newCmd)
 
 	if calls != 1 {
 		t.Errorf("commandRunner calls = %d, want 1 (the second job must be skipped under the cancelled context)", calls)
@@ -215,23 +328,6 @@ func TestRunPass_shutdownInterruptedJobIsNotCountedAsFailure(t *testing.T) {
 	}
 	if got := r.exitStatus(); got != 0 {
 		t.Errorf("exitStatus() = %d, want 0 (interrupted-clean exits success)", got)
-	}
-}
-
-// TestDefaultCommandRunner_structural pins the graceful-shutdown construction
-// of the real commandRunner that every runJob/runPass test bypasses via a fake:
-// a 5s WaitDelay before SIGKILL, a non-nil SIGTERM Cancel closure, and the
-// verbatim arg slice. Mutating WaitDelay (e.g. 5s -> 9s) fails this test.
-func TestDefaultCommandRunner_structural(t *testing.T) {
-	cmd := defaultCommandRunner(t.Context(), "echo", "hi", "there")
-	if cmd.WaitDelay != 5*time.Second {
-		t.Errorf("WaitDelay = %v, want 5s", cmd.WaitDelay)
-	}
-	if cmd.Cancel == nil {
-		t.Error("Cancel = nil, want a SIGTERM closure")
-	}
-	if want := []string{"echo", "hi", "there"}; !slices.Equal(cmd.Args, want) {
-		t.Errorf("Args = %v, want %v", cmd.Args, want)
 	}
 }
 
@@ -267,7 +363,7 @@ func TestRunPass_realFailureDuringShutdownStillUnhealthy(t *testing.T) {
 	}
 	src := newRunJobSource(t)
 	cfg := config{Jobs: []job{*runJobJob(src), *runJobJob(src)}}
-	r := runPass(ctx, cfg, time.Minute, "test", newCmd)
+	r := runPass(ctx, cfg, time.Minute, hostKeyAcceptNew, "test", newCmd)
 	if r.failed != 1 {
 		t.Errorf("failed = %d, want 1", r.failed)
 	}

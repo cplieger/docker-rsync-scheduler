@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -23,27 +24,12 @@ import (
 // --- Configuration ---
 
 // config is the top-level YAML document: a list of one-way sync jobs.
-// Interval and ScheduleEnabled are populated from SYNC_INTERVAL after the
-// YAML is parsed (hence the yaml:"-" tags); they are not part of the
-// on-disk schema. Fields are ordered largest-first for fieldalignment.
 type config struct {
 	Jobs []job `yaml:"jobs"`
-
-	// Interval is the built-in scheduler cadence (the startup pass fires
-	// immediately, then every Interval). Only consulted when
-	// ScheduleEnabled is true.
-	Interval time.Duration `yaml:"-"`
-
-	// ScheduleEnabled reports whether the built-in interval scheduler runs.
-	// When false (SYNC_INTERVAL=off/disabled/0), the container idles and
-	// syncs are triggered out-of-band via the `sync` subcommand (e.g. an
-	// external scheduler such as Ofelia running `docker exec`).
-	ScheduleEnabled bool `yaml:"-"`
 }
 
 // job describes a single rsync-over-ssh push of a local directory to a
-// remote host. Fields are ordered largest-first to satisfy the
-// fieldalignment vet check.
+// remote host.
 type job struct {
 	RemoteUID  *int     `yaml:"remote_uid"`
 	RemoteGID  *int     `yaml:"remote_gid"`
@@ -98,7 +84,8 @@ var hostnameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 // splitting in a shell. Jobs are executed with an explicit argument slice
 // (no shell), so these can never be interpreted; rejecting them is
 // defense-in-depth. Glob characters (* ? [ ]) are deliberately absent so
-// rsync exclude patterns remain expressible.
+// rsync exclude patterns remain expressible; remote_path is refused them
+// separately below, since it is a destination rather than a pattern.
 const shellMetaChars = ";|&$`<>(){}\\\"'"
 
 // hasShellMeta reports whether s contains a shell metacharacter or any
@@ -133,25 +120,24 @@ func configPath() string {
 
 // loadConfig reads, parses, and validates the YAML config. On any
 // failure it logs a structured error and returns it so the caller
-// (daemon/sync) can exit non-zero.
+// can exit non-zero.
 func loadConfig() (config, error) {
 	path := configPath()
 
-	info, statErr := os.Stat(path)
-	if statErr != nil {
+	if _, statErr := os.Stat(path); statErr != nil {
 		slog.Error("config not found", "path", path, "error", statErr,
 			"hint", "mount a config.yaml at this path — see config.example.yaml in the repo")
 		return config{}, fmt.Errorf("stat config %q: %w", path, statErr)
 	}
-	if info.Size() > configCapBytes {
-		slog.Error("config too large", "path", path, "size", info.Size(), "cap", configCapBytes)
-		return config{}, fmt.Errorf("config %q exceeds %d bytes", path, configCapBytes)
-	}
 
-	data, err := os.ReadFile(path) // #nosec G304 -- trusted, operator-mounted config path
+	data, err := readCappedConfig(path)
 	if err != nil {
 		slog.Error("config read failed", "path", path, "error", err)
 		return config{}, fmt.Errorf("read config %q: %w", path, err)
+	}
+	if len(data) > configCapBytes {
+		slog.Error("config too large", "path", path, "cap", configCapBytes)
+		return config{}, fmt.Errorf("config %q exceeds %d bytes", path, configCapBytes)
 	}
 
 	cfg, err := parseConfig(data)
@@ -165,12 +151,29 @@ func loadConfig() (config, error) {
 		return config{}, err
 	}
 
-	// SYNC_INTERVAL selects the scheduling mode and built-in cadence. It is
-	// read after parse+validate because it comes from the environment, not
-	// the YAML document.
-	cfg.Interval, cfg.ScheduleEnabled = loadInterval()
-
 	return cfg, nil
+}
+
+// readCappedConfig reads path, refusing a non-regular file and any
+// document over configCapBytes. The kind check runs on the stat, before the
+// open, because opening a fifo blocks; the size bound is enforced on the bytes
+// READ, because os.Stat's size understates a fifo, a character device and a
+// file being appended to. The +1 is what makes "exceeds" decidable once the
+// app has stopped reading.
+func readCappedConfig(path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("not a regular file")
+	}
+	f, err := os.Open(path) // #nosec G304 -- trusted, operator-mounted config path
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	return io.ReadAll(io.LimitReader(f, configCapBytes+1))
 }
 
 // parseConfig unmarshals raw YAML into a config without validating it.
@@ -189,6 +192,16 @@ func parseConfig(data []byte) (config, error) {
 		return config{}, fmt.Errorf("parse config: %w", err)
 	}
 	if err := yamlenv.CheckUnknownKeys(data, &config{}); err != nil {
+		// Only a *yaml.TypeError entry can embed document content (the
+		// unknown key, or a wrong-type entry's scalar excerpt), and only
+		// those are what CheckUnknownKeys' doc asks a logging caller to
+		// sanitise. CheckUnknownKeys is also a full strict DECODE, so a
+		// syntax error arrives here too -- sanitising that one would trade
+		// yaml.v3's locator for a withholding message this app cannot mean
+		// (it expands nothing, so a document value is never a secret).
+		if _, ok := errors.AsType[*yaml.TypeError](err); ok {
+			err = yamlenv.SanitizeDecodeError(err, yamlenv.WithUnknownKeyEcho(true))
+		}
 		return config{}, fmt.Errorf("parse config: %w", err)
 	}
 	var cfg config
@@ -199,7 +212,8 @@ func parseConfig(data []byte) (config, error) {
 }
 
 // validate enforces the config contract: a non-empty job list with unique
-// names, delegating each job's per-field contract to (job).validate.
+// names, delegating each job's per-field contract to (job).validate. It also
+// warns when two jobs address one remote tree and either deletes.
 func (c config) validate() error {
 	if len(c.Jobs) == 0 {
 		return errors.New("config: jobs list is empty")
@@ -222,12 +236,53 @@ func (c config) validate() error {
 		}
 	}
 
+	warnSharedDestinations(c.Jobs)
+
 	return nil
+}
+
+// warnSharedDestinations warns when two jobs address one remote tree and
+// either deletes: --delete then removes whatever the other job put there,
+// every pass, and the per-job empty-source guard cannot see it because the
+// deletion is not per-job. Advisory, not an error: an exclude rule protects
+// the receiver, so an overlapping pair CAN be correct, and only the operator
+// knows whether theirs is. Identity is host+key+path, because an
+// rrsync-restricted key roots the path remotely.
+func warnSharedDestinations(jobs []job) {
+	for i := range jobs {
+		for k := i + 1; k < len(jobs); k++ {
+			a, b := &jobs[i], &jobs[k]
+			if a.RemoteHost != b.RemoteHost || a.SSHKey != b.SSHKey {
+				continue
+			}
+			if !a.Delete && !b.Delete {
+				continue
+			}
+			pa, pb := filepath.Clean(a.RemotePath), filepath.Clean(b.RemotePath)
+			if pa != pb && !under(pa, pb) && !under(pb, pa) {
+				continue
+			}
+			slog.Warn("two jobs share a remote destination and one deletes; each pass may delete the other's files",
+				"job", a.Name, "other", b.Name, "remote_host", a.RemoteHost,
+				"path", pa, "other_path", pb,
+				"hint", "exclude the sibling's content from the deleting job, or give each job its own remote_path")
+		}
+	}
+}
+
+// under reports whether child is nested below parent. filepath.Clean("/")
+// returns "/", so the bare parent+"/" prefix idiom would build "//" and miss
+// every nesting under an rrsync-rooted remote_path of "/".
+func under(parent, child string) bool {
+	if parent == "/" {
+		return child != "/"
+	}
+	return strings.HasPrefix(child, parent+"/")
 }
 
 // validate enforces one job's field contract: required fields present,
 // absolute local/remote paths, a sane remote host, no injection characters
-// anywhere, and a readable ssh key. Name presence and cross-job uniqueness
+// anywhere, and a readable ssh key file. Name presence and cross-job uniqueness
 // are enforced by (config).validate. The per-concern checks live in helpers
 // (checkRequiredFields, checkNoForbiddenChars) so this stays readable and
 // under the complexity threshold.
@@ -286,15 +341,14 @@ func (j *job) checkRequiredFields() error {
 }
 
 // checkNoForbiddenChars rejects shell metacharacters and control characters in
-// every job string field and exclude pattern (defense-in-depth: jobs run with
-// an explicit argument slice and no shell, so these can never be interpreted),
-// then applies the stricter no-space rule to the two fields that are word-split
-// downstream.
+// the job string fields that have no syntax validator of their own, and in
+// every exclude pattern (defense-in-depth: jobs run with an explicit argument
+// slice and no shell, so these can never be interpreted), then applies the
+// stricter no-space rule to the two fields that are word-split downstream.
 func (j *job) checkNoForbiddenChars() error {
 	for _, f := range []struct{ key, val string }{
 		{"name", j.Name},
 		{"local", j.Local},
-		{"remote_host", j.RemoteHost},
 		{"remote_path", j.RemotePath},
 		{"ssh_key", j.SSHKey},
 	} {
@@ -308,12 +362,18 @@ func (j *job) checkNoForbiddenChars() error {
 		}
 	}
 
-	// remote_path is sent to the remote host as an rsync argument that the
-	// remote login shell word-splits (rsync runs without --secluded-args/-s).
-	// A space splits one path into several remote args -- the dest is then
-	// wrong, and under --delete that can target the wrong remote tree.
+	// remote_path reaches the remote as an rsync argument. rsync
+	// backslash-escapes SHELL_CHARS (space included) in a filename arg but
+	// leaves *?[] alone on purpose, and the receiving side expands them
+	// even under --secluded-args -- so a pattern-shaped path silently
+	// picks whichever tree matches, and under --delete that is the wrong
+	// remote tree. Both refusals below keep the field a path.
 	if strings.ContainsRune(j.RemotePath, ' ') {
 		return fmt.Errorf("job %q: remote_path %q must not contain spaces",
+			j.Name, j.RemotePath)
+	}
+	if strings.ContainsAny(j.RemotePath, "*?[]") {
+		return fmt.Errorf("job %q: remote_path %q must not contain glob characters (*?[])",
 			j.Name, j.RemotePath)
 	}
 
@@ -415,8 +475,18 @@ func remoteDest(j *job) string {
 	return host + ":" + j.RemotePath + "/"
 }
 
-// checkReadable confirms a file exists and can be opened for reading.
+// checkReadable confirms path names a regular file that can be opened
+// for reading. The kind check is the ssh_key contract: a directory or
+// a device opens successfully and can never be a private key, and in
+// external mode ssh's own complaint is up to SYNC_INTERVAL away.
 func checkReadable(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("not a regular file")
+	}
 	f, err := os.Open(path) // #nosec G304 -- trusted, operator-mounted key path
 	if err != nil {
 		return err

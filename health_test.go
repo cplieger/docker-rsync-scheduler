@@ -88,31 +88,10 @@ func TestHealthController_drainLatchBlocksLateHealthy(t *testing.T) {
 	t.Parallel()
 	m := &fakeMarker{}
 	hc := newHealthController(m)
-	hc.beginDrain()                  // value=false, draining latched
-	hc.apply(&passResult{failed: 0}) // a late clean pass
-	if v, _ := m.state(); v {
-		t.Error("value=true after drain, want false (the drain latch must block a late healthy result)")
-	}
-}
-
-func TestHealthController_drainLatchAllowsUnhealthy(t *testing.T) {
-	t.Parallel()
-	m := &fakeMarker{}
-	hc := newHealthController(m)
-	hc.beginDrain()
-	hc.apply(&passResult{failed: 1}) // unhealthy is still allowed while draining
-	if v, _ := m.state(); v {
-		t.Error("value=true, want false")
-	}
-}
-
-func TestHealthController_markInitialIgnoredWhileDraining(t *testing.T) {
-	t.Parallel()
-	m := &fakeMarker{}
-	hc := newHealthController(m)
-	hc.beginDrain()
 	hc.markInitial(true)
-	if v, _ := m.state(); v {
-		t.Error("markInitial(true) flipped to healthy during drain; want false")
+	hc.beginDrain()
+	hc.apply(&passResult{failed: 0})
+	if v, w := m.state(); v || w != 2 {
+		t.Errorf("after drain and late clean pass: value=%v writes=%d, want false 2", v, w)
 	}
 }
