@@ -9,6 +9,7 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cplieger/docker-rsync-scheduler/badge)](https://scorecard.dev/viewer/?uri=github.com/cplieger/docker-rsync-scheduler)
 [![SBOM](https://img.shields.io/badge/SBOM-SPDX-1D4ED8)](https://github.com/cplieger/docker-rsync-scheduler/releases)
 
+<!-- hub-overview BEGIN -->
 Push local directories to a remote host over rsync-and-ssh on a schedule. Structured logs, no metrics, no open ports.
 
 ## What it does
@@ -21,6 +22,7 @@ Reads a YAML config defining _N_ sync jobs. For each job it runs `rsync` over `s
 - Built-in interval scheduler, or hand scheduling to an external scheduler (cron, Ofelia, etc.) via the `sync` subcommand
 - File-marker healthcheck: unhealthy when any job fails, recovers on the next clean pass
 - Logs only: no Prometheus exporter, no HTTP server, no network listener (triggering uses an in-container unix socket)
+<!-- hub-overview END -->
 
 ## Quick start
 
