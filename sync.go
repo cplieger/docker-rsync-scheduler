@@ -427,8 +427,6 @@ func runJob(ctx context.Context, j *job, timeout time.Duration, tr transport, ne
 	}
 	drained := interruptedByShutdown(ctx.Err(), jobCtx.Err(), runErr, ps, res.exitCode, cancelSent.Load())
 	switch {
-	case errors.Is(jobCtx.Err(), context.DeadlineExceeded):
-		// A job deadline is a failure regardless of the child's exit shape.
 	case ps == nil:
 		// No child ran: Start refused on an already-cancelled context, or the
 		// exec itself failed. This is the only state with no exit status.
