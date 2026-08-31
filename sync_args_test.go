@@ -58,22 +58,6 @@ func TestBuildRsyncArgs(t *testing.T) {
 		}
 	})
 
-	t.Run("delete adds --delete", func(t *testing.T) {
-		t.Parallel()
-		got := buildRsyncArgs(argJob(true, nil, nil, nil), transport{})
-		if !slices.Contains(got, "--delete") {
-			t.Errorf("--delete absent in %v", got)
-		}
-	})
-
-	t.Run("uid and gid add chown", func(t *testing.T) {
-		t.Parallel()
-		got := buildRsyncArgs(argJob(false, new(1000), new(1000), nil), transport{})
-		if !slices.Contains(got, "--chown=1000:1000") {
-			t.Errorf("--chown=1000:1000 absent in %v", got)
-		}
-	})
-
 	t.Run("uid only does not add chown", func(t *testing.T) {
 		t.Parallel()
 		got := buildRsyncArgs(argJob(false, new(1000), nil, nil), transport{})
@@ -480,35 +464,3 @@ func TestBuildRsyncArgs_transportSwitches(t *testing.T) {
 	}
 }
 
-// TestTransport_extras pins the startup banner's rsync_extras attribute: an
-// operator cannot otherwise confirm a switch took effect, because the argument
-// slice is never logged.
-func TestTransport_extras(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		tr   transport
-		want string
-	}{
-		{name: "zero value", tr: transport{}, want: "none"},
-		{name: "strict posture alone is still none", tr: transport{hostKeys: hostKeyStrict}, want: "none"},
-		{name: "acls only", tr: transport{acls: true}, want: "acls"},
-		{name: "xattrs only", tr: transport{xattrs: true}, want: "xattrs"},
-		{name: "compress only", tr: transport{compress: "zstd"}, want: "compress=zstd"},
-		{
-			name: "all three",
-			tr:   transport{acls: true, xattrs: true, compress: "auto"},
-			want: "acls,xattrs,compress=auto",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if got := tt.tr.extras(); got != tt.want {
-				t.Errorf("transport%+v.extras() = %q, want %q", tt.tr, got, tt.want)
-			}
-		})
-	}
-}

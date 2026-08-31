@@ -18,7 +18,7 @@ Reads a YAML config defining _N_ sync jobs. For each job it runs `rsync` over `s
 
 - One-way mirror of each configured local directory to a `[user@]host:/path`
 - Per-job `--delete`, `--chown=uid:gid`, and exclude patterns
-- Empty-source guard: a job whose top-level source directory is missing or empty is skipped, so a wholly vanished or unmounted source cannot let `--delete` wipe the matching remote tree. The guard probes the `local` dir against the built-in global excludes only (not per-job `excludes`), so on a `delete: true` job whose own `excludes` could match every entry, set `max_delete` (rsync `--max-delete=N`) as a backstop.
+- Empty-source guard: A job with an empty top-level source directory is skipped. This protects an unmounted source that Docker materialized as an empty directory from an unbounded `--delete` pass. A `local` path that does not exist fails the job. The guard is a preflight snapshot, and rsync rebuilds its file list after the check. It cannot protect a source that becomes empty during a pass; use `max_delete` as the backstop, as the example shows. The guard checks only the built-in global excludes, not per-job `excludes`. For a `delete: true` job whose own `excludes` can match every entry, set `max_delete` to cap the deletions.
 - Built-in interval scheduler, or hand scheduling to an external scheduler (cron, Ofelia, etc.) via the `sync` subcommand
 - File-marker healthcheck: unhealthy when any job fails, recovers on the next clean pass
 - Logs only: no Prometheus exporter, no HTTP server, no network listener (triggering uses an in-container unix socket)
@@ -124,7 +124,7 @@ Each entry under `jobs:` takes these keys:
 | `remote_uid` | _(unset)_ | With `remote_gid`, adds `--chown=uid:gid` |
 | `remote_gid` | _(unset)_ | With `remote_uid`, adds `--chown=uid:gid` |
 | `delete` | `false` | Adds `--delete` when `true` |
-| `max_delete` | _(unset)_ | With `delete`, adds `--max-delete=N` (rsync deletes at most N, then skips the rest and FAILS the pass: exit 25, `sync failed`, unhealthy; `0` refuses every deletion and fails the pass whenever anything would have been deleted); unset leaves deletions uncapped |
+| `max_delete` | _(unset)_ | With `delete`, adds `--max-delete=N` (rsync deletes at most N, then skips the rest and FAILS the pass: exit 25, or 24 if a source file also vanished in the same pass; rsync overwrites 25 with 24, and the app identifies the cap from its stderr line; `sync failed`, unhealthy; `0` refuses every deletion and fails the pass whenever anything would have been deleted); unset leaves deletions uncapped |
 | `excludes` | _(unset)_ | Per-job rsync exclude patterns, added to the built-in globals |
 
 Write IPv6 `remote_host` literals as the bare address (`2001:db8::1` or `user@2001:db8::1`); the brackets rsync's `host:path` syntax needs are added for you. A host containing a colon that is not a valid IP (a trailing colon, or an incomplete address) is rejected at startup so it can't be misread as rsync's daemon-mode `::` separator. Link-local IPv6 with a zone id (`fe80::1%eth0`) is not supported; use a global or ULA address, or define an `ssh_config` `Host` alias and reference the alias name.

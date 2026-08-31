@@ -320,6 +320,23 @@ func TestValidate_sshKeyWithSpaceRejected(t *testing.T) {
 	}
 }
 
+func TestValidate_sshKeyQuotesRejected(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"id'ed25519", `id"ed25519`} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			key := filepath.Join(t.TempDir(), name)
+			if err := os.WriteFile(key, []byte("dummy-key\n"), 0o600); err != nil {
+				t.Fatalf("write key: %v", err)
+			}
+			j := validJob("quoted", key)
+			if err := (config{Jobs: []job{j}}).validate(); err == nil {
+				t.Errorf("validate() with ssh_key %q = nil error, want refusal", key)
+			}
+		})
+	}
+}
+
 func TestHasShellMeta(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -1201,6 +1218,23 @@ func TestValidate_sharedDestinationsIdentityIsTheHostComponent(t *testing.T) {
 				t.Errorf("validate(%q vs %q) did not warn; logs=%q", tt.hostA, tt.hostB, rec.Messages())
 			}
 		})
+	}
+}
+
+func TestValidate_sharedDestinationsNormalizesIPv6Identity(t *testing.T) {
+	rec := capture.Default(t)
+	key := writeKey(t)
+	a, b := validJob("a", key), validJob("b", key)
+	a.RemoteHost, a.RemotePath, a.Delete = "2001:db8::1", "/srv/x", true
+	b.RemoteHost, b.RemotePath = "2001:0db8:0:0:0:0:0:1", "/srv/x"
+
+	if err := (config{Jobs: []job{a, b}}).validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil", err)
+	}
+
+	const warning = "jobs share a remote destination tree"
+	if !rec.Contains(warning) {
+		t.Errorf("validate() with equivalent IPv6 spellings did not warn; logs=%q", rec.Messages())
 	}
 }
 

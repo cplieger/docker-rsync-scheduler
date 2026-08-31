@@ -2,9 +2,7 @@
 
 # renovate: datasource=github-tags depName=RsyncProject/rsync
 ARG RSYNC_VERSION=v3.5.0
-# The URL points at the src/ ARCHIVE directory. Its parent holds only the
-# CURRENT release, so a pin there 404s the moment upstream publishes the next
-# version; that is how the v3.4.4 pin stopped building.
+# The src/ archive path keeps every release; its parent keeps only the current one, so pin from src/.
 # repin: dep=RsyncProject/rsync url=https://download.samba.org/pub/rsync/src/rsync-{version_nov}.tar.gz
 ARG RSYNC_SHA256=c7ffd1ef653e99540f661e47cb00b7f9cad1ee6b972399b16f93d672656e0d33
 
@@ -24,7 +22,6 @@ FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6ee
 
 SHELL ["/bin/ash", "-eo", "pipefail", "-c"]
 
-# Alpine's rsync APKBUILD makedepends plus build-base and gpgv; feature parity is asserted at build time by tests/smoke.sh.
 RUN apk add --no-cache \
         acl-dev \
         attr-dev \
@@ -74,11 +71,9 @@ RUN wget -q --timeout=30 \
     && strip rsync \
     && install -D -m 755 rsync /out/usr/bin/rsync
 
-# ---------------------------------------------------------------------------
 # Syft inventories the final image from APK metadata and Go buildinfo, so the
 # source-built rsync is invisible to the release SBOM. The fragment must land
 # where the release pipeline's sbom-cataloger picks up *.cdx.json files.
-# ---------------------------------------------------------------------------
 RUN cat > /out/rsync-scheduler.cdx.json <<EOF
 {
   "bomFormat": "CycloneDX",
@@ -99,12 +94,6 @@ EOF
 
 FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS base
 
-# apk upgrade is load-bearing: a plain `apk add` leaves base packages the pinned
-# base pre-installs at an older, CVE-affected revision unpatched.
-# The floated set is not pinned or asserted in-image: the advisory Trivy image
-# scan reports matched package findings, and gates nothing during the build.
-# The `echo` is load-bearing: BuildKit keys a RUN on the build args it actually
-# CONSUMES, so a merely-declared ARG would change nothing.
 ARG PKG_REFRESH=static
 RUN echo "OS package refresh: ${PKG_REFRESH}" \
     && apk upgrade --no-cache \
@@ -118,20 +107,10 @@ RUN echo "OS package refresh: ${PKG_REFRESH}" \
         zstd-libs
 
 COPY --chmod=755 --from=rsync-builder /out/usr/bin/rsync /usr/bin/rsync
-# CycloneDX SBOM fragment for the source-built rsync (generated in the builder
-# stage from the Renovate-tracked version ARG). Placed where the release
-# pipeline's sbom-cataloger inventories *.cdx.json, so SBOMs and scanners see
-# rsync alongside the APK packages and the Go buildinfo.
 COPY --from=rsync-builder /out/rsync-scheduler.cdx.json /usr/share/sbom/rsync-scheduler.cdx.json
 COPY --chmod=755 --from=go-builder /docker-rsync-scheduler /usr/local/bin/docker-rsync-scheduler
 
-# ---------------------------------------------------------------------------
-# Test stage - runs the build-time smoke test (the built rsync runs against
-# the runtime stage's libraries, reports exactly the pinned RSYNC_VERSION,
-# and kept feature parity with the Alpine package it replaced; ssh is on
-# PATH). A failure here fails the centralized `ci / validate` docker build
-# gate, because the final stage below depends on this stage's marker.
-# ---------------------------------------------------------------------------
+# The final stage depends on this stage's marker, so the smoke test gates the default target.
 FROM base AS test
 ARG RSYNC_VERSION
 COPY tests/ /tmp/tests/
@@ -140,17 +119,10 @@ COPY tests/ /tmp/tests/
 # leading v is stripped inside smoke.sh).
 RUN RSYNC_EXPECTED_VERSION="${RSYNC_VERSION:?}" sh /tmp/tests/smoke.sh && touch /tests-passed
 
-# ---------------------------------------------------------------------------
-# Final stage - the runtime image. Must remain last so the CI build gate
-# (which builds the default target) produces it; the marker COPY forces the
-# test stage to build and pass first.
-# ---------------------------------------------------------------------------
+# The final stage must remain last so the default target produces the runtime image.
 FROM base AS final
 COPY --from=test /tests-passed /tests-passed
 
-# Runs as root by design: the app must read host-owned source files (e.g. a
-# host UID like 1000) across multiple bind mounts and write ssh known_hosts on
-# first contact (StrictHostKeyChecking=accept-new). A fixed USER would break both.
 # start-period absorbs the first built-in pass (the container is unhealthy until
 # it completes). Size it to your slowest expected initial sync; override
 # per-deploy via compose healthcheck.start_period. See README "Healthcheck".

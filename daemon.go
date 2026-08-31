@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"log/slog"
 	"time"
@@ -14,11 +15,9 @@ import (
 //
 // The executor goroutine is the only in-process caller of d.run.
 
-// queueCapacity bounds pending requests in the trigger broker's FIFO. The
-// realistic trigger set is one periodic job (Ofelia) plus a manual exec, so
-// 16 is generous headroom; a client hitting a full queue is rejected
-// immediately with a clear reason (honest backpressure) rather than queued
-// unboundedly.
+// queueCapacity sizes the trigger broker's FIFO: the realistic trigger
+// set is one periodic job (Ofelia) plus a manual exec, so 16 is generous
+// headroom. Full-queue rejection semantics are trigger.NewQueue's.
 const queueCapacity = 16
 
 // newRequest builds one queued pass request for the given trigger label
@@ -31,8 +30,9 @@ func newRequest(trig string) *trigger.Job[struct{}] {
 // daemon carries the executor's dependencies.
 type daemon struct {
 	queue *trigger.Queue[struct{}]
-	// hc is the single writer of the health marker; every pass outcome
-	// funnels through it (drain latch, interrupted-clean carve-out).
+	// hc owns every health-state write (drain latch, interrupted-clean
+	// carve-out); runDaemon's exit defer also unlinks the marker, safe only
+	// because it runs after <-executorDone.
 	hc        *healthController
 	newCmd    scheduler.CommandRunner
 	timeout   time.Duration
@@ -45,7 +45,8 @@ type daemon struct {
 // and — in built-in mode — drives the interval ticker. It expects an already
 // signal-bound context and a configured logger from dispatch. newCmd builds
 // each rsync child (defaultCommandRunner in production; injected by tests).
-// Returning an error exits non-zero.
+// Returning an error exits non-zero. Every error path logs its diagnostic
+// before returning, so dispatch stays silent to avoid a duplicate record.
 func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandRunner) error {
 	// The marker is created and its removal deferred before the first thing that
 	// can fail: /tmp survives a docker restart, so a boot that fails after a crash
@@ -97,9 +98,10 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 	if scheduleEnabled {
 		mode, intervalAttr = "built-in", interval.String()
 	}
-	slog.Info("container started ("+mode+" scheduling)",
-		"jobs", len(cfg.Jobs), "config", configPath(), "interval", intervalAttr,
-		"ssh_hostkey_mode", hostKeys.String(), "rsync_extras", tr.extras(),
+	slog.Info("container started",
+		"mode", mode, "jobs", len(cfg.Jobs), "config", configPath(),
+		"interval", intervalAttr, "ssh_hostkey_mode", hostKeys.String(),
+		"acls", tr.acls, "xattrs", tr.xattrs, "compress", cmp.Or(tr.compress, "off"),
 		"socket", socketPath)
 
 	// The broker owns the wire (decode, event relay, handler draining); the
@@ -192,5 +194,5 @@ func (d *daemon) run(ctx context.Context, trig string, _ struct{}) trigger.Outco
 	res := runPass(ctx, cfg, d.timeout, d.transport, trig, d.newCmd)
 	reportPass(&res)
 	d.hc.apply(&res)
-	return trigger.Outcome{OK: res.exitStatus() == 0, Duration: res.duration}
+	return trigger.Outcome{OK: res.exitStatus() == 0, Duration: time.Since(start)}
 }

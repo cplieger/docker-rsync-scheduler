@@ -555,6 +555,22 @@ func TestRunDaemon_UnusableKnownHostsRefusesStartupWithDiagnostic(t *testing.T) 
 	}
 }
 
+func TestRunDaemon_PreflightFailureClearsStaleHealthMarker(t *testing.T) {
+	t.Setenv("CONFIG_PATH", filepath.Join(t.TempDir(), "absent.yaml"))
+	marker := health.NewMarker(healthMarkerPath)
+	marker.Set(true)
+	t.Cleanup(marker.Cleanup)
+
+	err := runDaemon(t.Context(), testSocketPath(t), fixedRunner("true"))
+
+	if err == nil {
+		t.Fatal("runDaemon() with a missing config = nil, want error")
+	}
+	if _, statErr := os.Stat(healthMarkerPath); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("health marker after failed boot: stat error = %v, want not-exist", statErr)
+	}
+}
+
 // TestRunDaemon_ShutdownCancelsQueuedClientAfterInFlightDrain pins the shutdown
 // ORDER, which is a property of five statements in runDaemon and can only be
 // observed with work present in BOTH request states at the drain. The executor
@@ -606,6 +622,10 @@ func TestRunDaemon_ShutdownCancelsQueuedClientAfterInFlightDrain(t *testing.T) {
 		_, err := os.Stat(sock)
 		return err == nil
 	}, "daemon did not bind the trigger socket")
+	waitFor(t, 2*time.Second, func() bool {
+		_, err := os.Stat(healthMarkerPath)
+		return err == nil
+	}, "daemon did not write the boot health marker")
 
 	decInFlight, _ := rawRequest(t, sock)
 	select {
@@ -619,6 +639,12 @@ func TestRunDaemon_ShutdownCancelsQueuedClientAfterInFlightDrain(t *testing.T) {
 	}
 
 	cancel()
+	// The drain latch is the first shutdown statement: the marker must already
+	// be gone while the in-flight pass is still held in the runner.
+	waitFor(t, 2*time.Second, func() bool {
+		_, err := os.Stat(healthMarkerPath)
+		return errors.Is(err, fs.ErrNotExist)
+	}, "health marker still present while the in-flight pass was held at the drain")
 	release()
 
 	for {

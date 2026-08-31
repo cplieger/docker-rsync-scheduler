@@ -18,9 +18,11 @@ import (
 // returns the process exit code: 0 on success, 1 on failure (including a
 // rejected or cancelled request, or a daemon that cannot be reached).
 func runClient(ctx context.Context, socketPath string) int {
+	accepted := false
 	final, err := trigger.Submit(ctx, socketPath, struct{}{}, func(ev trigger.Event) {
 		switch ev.Kind {
 		case trigger.EventQueued:
+			accepted = true
 			slog.Info("triggered sync accepted")
 		case trigger.EventStarted:
 			slog.Info("triggered sync started",
@@ -37,7 +39,11 @@ func runClient(ctx context.Context, socketPath string) int {
 		slog.Error("cannot send sync request", "error", err)
 		return 1
 	case errors.Is(err, context.Canceled):
-		slog.Warn("this trigger was interrupted while waiting; the pass continues in the daemon", "error", err)
+		tail := "the request had not been accepted, so no pass is running"
+		if accepted {
+			tail = "the accepted pass continues in the daemon"
+		}
+		slog.Warn("this trigger was interrupted while waiting; "+tail, "error", err)
 		return 1
 	case err != nil:
 		slog.Error("the pass did not report a result", "error", err)

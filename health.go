@@ -60,14 +60,13 @@ type healthMarker interface {
 	Set(healthy bool)
 }
 
-// healthController is the single writer of the health marker. Every write
-// funnels through its mutex, and it enforces one invariant the bare marker
-// cannot: once shutdown begins, health is monotonic toward unhealthy. A pass
-// that finishes right as the container is draining can never flip the marker
-// back to healthy, and an interrupted-clean pass — no job failed, and
-// shutdown coincided with pass-end — never writes at all. These two guarantees
-// are what make the marker reflect the last real pass outcome instead of
-// whichever goroutine happened to write last.
+// healthController owns every health-state write to the marker, funnelled through
+// its mutex, and enforces one invariant the bare marker cannot: once shutdown
+// begins, health is monotonic toward unhealthy — a pass that finishes as the
+// container drains can never flip it back, and an interrupted-clean pass (no job
+// failed) never writes at all. The marker file is also unlinked by runDaemon's exit
+// defer (health.Marker.Cleanup, the same os.Remove) outside this mutex, safe only
+// because that defer runs after <-executorDone.
 type healthController struct {
 	marker   healthMarker
 	mu       sync.Mutex

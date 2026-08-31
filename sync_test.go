@@ -1,15 +1,22 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/cplieger/scheduler/v4"
 	"github.com/cplieger/slogx/capture"
 )
 
@@ -32,6 +39,82 @@ func runJobJob(local string) *job {
 		RemoteHost: "root@192.0.2.87",
 		RemotePath: "/srv/containers/caddy",
 		SSHKey:     "/keys/id_ed25519",
+	}
+}
+
+func newHeldSignalCommand(ctx context.Context, t *testing.T, cancelCalls *atomic.Int32) (*exec.Cmd, *bufio.Reader, func()) {
+	t.Helper()
+	readyR, readyW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("ready pipe: %v", err)
+	}
+	holdR, holdW, err := os.Pipe()
+	if err != nil {
+		_ = readyR.Close()
+		_ = readyW.Close()
+		t.Fatalf("hold pipe: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = readyR.Close()
+		_ = readyW.Close()
+		_ = holdR.Close()
+		_ = holdW.Close()
+	})
+
+	cmd := scheduler.NewCommandRunner(time.Second)(ctx, "sh", "-c",
+		`trap 'printf "exiting\n" >&3; exit 20' TERM; (trap '' TERM; cat <&4) & printf 'ready\n%s\n' "$$" >&3; wait`)
+	cmd.ExtraFiles = []*os.File{readyW, holdR}
+	if cancelCalls != nil {
+		cancelCmd := cmd.Cancel
+		cmd.Cancel = func() error {
+			cancelCalls.Add(1)
+			return cancelCmd()
+		}
+	}
+	return cmd, bufio.NewReader(readyR), func() { _ = holdW.Close() }
+}
+
+func readFixtureLine(r *bufio.Reader, want string) error {
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return err
+	}
+	if got := strings.TrimSpace(line); got != want {
+		return fmt.Errorf("fixture line = %q, want %q", got, want)
+	}
+	return nil
+}
+
+func readFixturePID(r *bufio.Reader) (int, error) {
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return 0, err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil {
+		return 0, fmt.Errorf("parse fixture pid %q: %w", line, err)
+	}
+	return pid, nil
+}
+
+func waitProcessDone(pid int) error {
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		err := syscall.Kill(pid, syscall.Signal(0))
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		select {
+		case <-timer.C:
+			return errors.New("process was not reaped before the deadline")
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -169,6 +252,54 @@ func TestRunJob_emptySourceSkipsWithoutRunning(t *testing.T) {
 	}
 }
 
+func TestRunJob_fifoSourceFailsPromptlyBeforeExec(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source.fifo")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatalf("Mkfifo: %v", err)
+	}
+
+	invoked := false
+	ctx := t.Context()
+	done := make(chan jobResult, 1)
+	go func() {
+		done <- runJob(ctx, runJobJob(path), time.Minute, transport{}, func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+			invoked = true
+			return exec.CommandContext(ctx, "true")
+		})
+	}()
+
+	select {
+	case res := <-done:
+		if res.success || res.skipped {
+			t.Errorf("runJob(FIFO) = success:%v skipped:%v, want false false", res.success, res.skipped)
+		}
+		if invoked {
+			t.Error("rsync runner invoked for FIFO source, want source refusal before exec")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runJob(FIFO) did not refuse the non-directory source within 1s")
+	}
+}
+
+func TestRunJob_perJobExcludesDoNotMakePopulatedSourceEmpty(t *testing.T) {
+	called := false
+	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		called = true
+		return exec.CommandContext(ctx, "true")
+	}
+	j := runJobJob(newRunJobSource(t))
+	j.Excludes = []string{"*"}
+
+	res := runJob(t.Context(), j, time.Minute, transport{}, newCmd)
+
+	if !called {
+		t.Error("rsync runner was not invoked for a populated source whose per-job excludes match every entry")
+	}
+	if res.skipped || !res.success {
+		t.Errorf("runJob(all-matching per-job excludes) = skipped:%v success:%v, want false true", res.skipped, res.success)
+	}
+}
+
 func TestRunPass_aggregatesFailures(t *testing.T) {
 	t.Parallel()
 	var calls int
@@ -200,12 +331,9 @@ func TestRunPass_aggregatesFailures(t *testing.T) {
 }
 
 // TestRunJob_parentCancellationLogsShutdownNotFailure verifies the
-// graceful-shutdown arm of runJob (the `if ctx.Err() != nil` branch): when the
-// PARENT context is cancelled (container shutdown SIGTERM'd the in-flight
-// rsync), the interrupted job must log at INFO ("sync interrupted by shutdown")
-// and never at ERROR ("sync failed"). The shutdown and failure arms return
-// identical jobResult values, so only the emitted log distinguishes them; this
-// protects the no-false-page contract (Loki alerts on level=error).
+// already-cancelled Start arm. The parent context is cancelled before a child
+// starts, so context.Canceled with no process state is a shutdown drain. The
+// job logs at INFO and never emits the ERROR record used by the fault alert.
 func TestRunJob_parentCancellationLogsShutdownNotFailure(t *testing.T) {
 	rec := capture.Default(t)
 
@@ -229,6 +357,36 @@ func TestRunJob_parentCancellationLogsShutdownNotFailure(t *testing.T) {
 	}
 	if got := rec.CountLevel(slog.LevelError, ""); got != 0 {
 		t.Errorf("runJob emitted %d ERROR record(s), want none on graceful shutdown; logs = %q", got, rec.Messages())
+	}
+}
+
+func TestRunPass_execFailureUnderLiveContextIsUnhealthy(t *testing.T) {
+	rec := capture.Default(t)
+	missing := filepath.Join(t.TempDir(), "missing-rsync")
+	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, missing)
+	}
+
+	r := runPass(t.Context(), config{Jobs: []job{*runJobJob(newRunJobSource(t))}}, time.Minute, transport{}, "test", newCmd)
+
+	if r.failed != 1 || r.interrupted {
+		t.Errorf("runPass(exec start failure) = failed:%d interrupted:%v, want 1 false", r.failed, r.interrupted)
+	}
+	if r.healthy() {
+		t.Error("healthy() = true after exec start failure, want false")
+	}
+	if got := r.exitStatus(); got != 1 {
+		t.Errorf("exitStatus() = %d after exec start failure, want 1", got)
+	}
+	const message = "sync failed"
+	if got := rec.CountLevel(slog.LevelError, message); got != 1 {
+		t.Errorf("%q ERROR records = %d, want 1; logs = %q", message, got, rec.Messages())
+	}
+	if !rec.HasAttr(message, "rsync_exit", "-1") {
+		t.Errorf("%q missing rsync_exit=-1; logs = %q", message, rec.Messages())
+	}
+	if got := rec.CountExact("sync interrupted by shutdown"); got != 0 {
+		t.Errorf("shutdown records = %d after live-context exec failure, want 0; logs = %q", got, rec.Messages())
 	}
 }
 
@@ -333,22 +491,6 @@ func TestRunPass_shutdownInterruptedJobIsNotCountedAsFailure(t *testing.T) {
 	}
 }
 
-// TestDefaultCommandRunner_cancelSignalsProcess exercises the Cancel closure
-// body at sync.go:44: a real subprocess is started, its context cancelled, and
-// Wait must return a termination error proving the SIGTERM closure ran (the
-// closure is otherwise invisible to the fake-injecting unit tests).
-func TestDefaultCommandRunner_cancelSignalsProcess(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	cmd := defaultCommandRunner(ctx, "sleep", "30")
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	cancel()
-	if err := cmd.Wait(); err == nil {
-		t.Errorf("Wait() = nil, want a termination error from the cancelled process")
-	}
-}
-
 // TestRunPass_realFailureDuringShutdownStillUnhealthy pins the failed>0 half of
 // the interrupted carve-out in apply, at the runPass integration level.
 func TestRunPass_realFailureDuringShutdownStillUnhealthy(t *testing.T) {
@@ -380,15 +522,11 @@ func TestRunPass_realFailureDuringShutdownStillUnhealthy(t *testing.T) {
 	}
 }
 
-
-// TestRunPass_childFailureUnderCancelledParentStillFails pins the race the
-// classifier exists for: a child that reports a concrete non-zero exit of its
-// own while the parent context is ALREADY cancelled. os/exec substitutes
-// ctx.Err() only for a nil error, so that report reaches runJob intact and must
-// be classified as a failure, not swallowed as a drain. A ctx-first read makes
-// this row go red. The runner deliberately builds a context-free command so the
-// child runs to completion under the cancelled parent, which is the state the
-// census measured.
+// TestRunPass_childFailureUnderCancelledParentStillFails pins a child that
+// reports a concrete non-zero exit while the parent context is already
+// cancelled. os/exec substitutes ctx.Err() only for a nil error, so that report
+// reaches runJob intact and must remain a failure. The runner uses a
+// context-free command so the child completes under the cancelled parent.
 func TestRunPass_childFailureUnderCancelledParentStillFails(t *testing.T) {
 	rec := capture.Default(t) // process-global handler: no t.Parallel
 	ctx, cancel := context.WithCancel(t.Context())
@@ -419,37 +557,56 @@ func TestRunPass_childFailureUnderCancelledParentStillFails(t *testing.T) {
 	}
 }
 
-// TestRunPass_signalExitUnderCancelledParentIsInterruptedClean pins the
-// complement: rsync exits 20 (RERR_SIGNAL) when it is signalled, which is what
-// a graceful drain of a mid-transfer pass looks like. Under a cancelled parent
-// that stays interrupted-clean — exit 0 for the triggering client and no marker
-// write at all — which is the drain contract a bare ctx-first-to-child-first
-// swap would destroy.
-func TestRunPass_signalExitUnderCancelledParentIsInterruptedClean(t *testing.T) {
+// TestRunPass_signalExitAfterAppCancellationIsInterruptedClean pins a genuine
+// drain: the parent cancellation invokes this app's Cancel hook, which signals
+// a live child. rsync's signal-shaped exit is interrupted-clean only with that
+// positive evidence.
+func TestRunPass_signalExitAfterAppCancellationIsInterruptedClean(t *testing.T) {
 	rec := capture.Default(t) // process-global handler: no t.Parallel
 	ctx, cancel := context.WithCancel(t.Context())
+	orchestrated := make(chan error, 1)
 
-	newCmd := func(context.Context, string, ...string) *exec.Cmd {
-		cancel()
-		return exec.Command("sh", "-c", "exit 20")
+	newCmd := func(cmdCtx context.Context, _ string, _ ...string) *exec.Cmd {
+		cmd, ready, release := newHeldSignalCommand(cmdCtx, t, nil)
+		go func() {
+			fail := func(err error) {
+				cancel()
+				release()
+				orchestrated <- err
+			}
+			if err := readFixtureLine(ready, "ready"); err != nil {
+				fail(err)
+				return
+			}
+			if _, err := readFixturePID(ready); err != nil {
+				fail(err)
+				return
+			}
+			cancel()
+			if err := readFixtureLine(ready, "exiting"); err != nil {
+				fail(err)
+				return
+			}
+			release()
+			orchestrated <- nil
+		}()
+		return cmd
 	}
 	src := newRunJobSource(t)
 
 	r := runPass(ctx, config{Jobs: []job{*runJobJob(src)}}, time.Minute, transport{}, "test", newCmd)
+	if err := <-orchestrated; err != nil {
+		t.Fatalf("signal fixture: %v", err)
+	}
 
 	if !r.interrupted {
 		t.Error("interrupted = false, want true")
 	}
 	if r.failed != 0 {
-		t.Errorf("failed = %d, want 0 (exit 20 under a cancelled parent is a drain)", r.failed)
+		t.Errorf("failed = %d, want 0 (an app-signalled exit 20 is a drain)", r.failed)
 	}
 	if got := r.exitStatus(); got != 0 {
 		t.Errorf("exitStatus() = %d, want 0", got)
-	}
-	m := &fakeMarker{}
-	newHealthController(m).apply(&r)
-	if _, writes := m.state(); writes != 0 {
-		t.Errorf("marker writes = %d, want 0 (an interrupted-clean drain writes nothing)", writes)
 	}
 	if got := rec.CountExact("sync failed"); got != 0 {
 		t.Errorf("%q emitted %d time(s), want 0; logs = %q", "sync failed", got, rec.Messages())
@@ -490,5 +647,162 @@ func TestRunPass_vanishedWithDeleteLimitIsFailure(t *testing.T) {
 	if got := rec.CountExact("sync completed with vanished source files"); got != 0 {
 		t.Errorf("%q emitted %d time(s), want 0; logs = %q",
 			"sync completed with vanished source files", got, rec.Messages())
+	}
+}
+
+func TestInterruptedByShutdown_withoutProcessState(t *testing.T) {
+	t.Parallel()
+	execFailure := errors.New("exec failed")
+	tests := []struct {
+		name      string
+		parentErr error
+		jobErr    error
+		runErr    error
+		want      bool
+	}{
+		{name: "already_cancelled_start_is_a_drain", parentErr: context.Canceled, jobErr: context.Canceled, runErr: context.Canceled, want: true},
+		{name: "exec_failure_followed_by_cancellation_fails", parentErr: context.Canceled, jobErr: context.Canceled, runErr: execFailure},
+		{name: "cancel_error_under_live_parent_fails", runErr: context.Canceled},
+		{name: "deadline_always_fails", parentErr: context.Canceled, jobErr: context.DeadlineExceeded, runErr: context.Canceled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := interruptedByShutdown(tt.parentErr, tt.jobErr, tt.runErr, nil, -1, false)
+			if got != tt.want {
+				t.Errorf("interruptedByShutdown(parent=%v, job=%v, run=%v) = %v, want %v",
+					tt.parentErr, tt.jobErr, tt.runErr, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRunPass_timeoutRemainsFailureAfterParentCancellation reproduces a child
+// that reports rsync exit 20 on the job deadline while an inherited output pipe
+// delays Run. A later parent cancellation cannot turn that timeout into a drain.
+func TestRunPass_timeoutRemainsFailureAfterParentCancellation(t *testing.T) {
+	rec := capture.Default(t) // process-global handler: no t.Parallel
+	ctx, cancel := context.WithCancel(t.Context())
+	orchestrated := make(chan error, 1)
+	var cancelCalls atomic.Int32
+
+	newCmd := func(cmdCtx context.Context, _ string, _ ...string) *exec.Cmd {
+		cmd, ready, release := newHeldSignalCommand(cmdCtx, t, &cancelCalls)
+		go func() {
+			if err := readFixtureLine(ready, "ready"); err != nil {
+				cancel()
+				release()
+				orchestrated <- err
+				return
+			}
+			if _, err := readFixturePID(ready); err != nil {
+				cancel()
+				release()
+				orchestrated <- err
+				return
+			}
+			if err := readFixtureLine(ready, "exiting"); err != nil {
+				cancel()
+				release()
+				orchestrated <- err
+				return
+			}
+			cancel()
+			release()
+			orchestrated <- nil
+		}()
+		return cmd
+	}
+	src := newRunJobSource(t)
+
+	r := runPass(ctx, config{Jobs: []job{*runJobJob(src)}}, 50*time.Millisecond, transport{}, "test", newCmd)
+	if err := <-orchestrated; err != nil {
+		t.Fatalf("timeout fixture: %v", err)
+	}
+
+	if got := cancelCalls.Load(); got != 1 {
+		t.Errorf("Cancel calls = %d, want 1", got)
+	}
+	if r.failed != 1 {
+		t.Errorf("failed = %d, want 1", r.failed)
+	}
+	if got := r.exitStatus(); got != 1 {
+		t.Errorf("exitStatus() = %d, want 1", got)
+	}
+	if !rec.HasAttr("sync failed", "timed_out", "true") {
+		t.Errorf("sync failed record missing timed_out=true; logs = %q", rec.Messages())
+	}
+	m := &fakeMarker{}
+	newHealthController(m).apply(&r)
+	if value, writes := m.state(); value || writes != 1 {
+		t.Errorf("marker state = (%v, %d writes), want (false, 1 write)", value, writes)
+	}
+}
+
+// TestRunPass_externalSignalFollowedByCancellationFails reproduces a child
+// that exits 20 from an external SIGTERM while a descendant holds its output
+// pipe. Cancellation after the child is reaped must not become app causality.
+func TestRunPass_externalSignalFollowedByCancellationFails(t *testing.T) {
+	rec := capture.Default(t) // process-global handler: no t.Parallel
+	ctx, cancel := context.WithCancel(t.Context())
+	orchestrated := make(chan error, 1)
+	var cancelCalls atomic.Int32
+
+	newCmd := func(cmdCtx context.Context, _ string, _ ...string) *exec.Cmd {
+		cmd, ready, release := newHeldSignalCommand(cmdCtx, t, &cancelCalls)
+		go func() {
+			fail := func(err error) {
+				cancel()
+				release()
+				orchestrated <- err
+			}
+			if err := readFixtureLine(ready, "ready"); err != nil {
+				fail(err)
+				return
+			}
+			pid, err := readFixturePID(ready)
+			if err != nil {
+				fail(err)
+				return
+			}
+			if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+				fail(fmt.Errorf("external SIGTERM: %w", err))
+				return
+			}
+			if err := readFixtureLine(ready, "exiting"); err != nil {
+				fail(err)
+				return
+			}
+			if err := waitProcessDone(pid); err != nil {
+				fail(err)
+				return
+			}
+			cancel()
+			release()
+			orchestrated <- nil
+		}()
+		return cmd
+	}
+	src := newRunJobSource(t)
+
+	r := runPass(ctx, config{Jobs: []job{*runJobJob(src)}}, time.Minute, transport{}, "test", newCmd)
+	if err := <-orchestrated; err != nil {
+		t.Fatalf("external-signal fixture: %v", err)
+	}
+
+	if got := cancelCalls.Load(); got != 0 {
+		t.Errorf("app Cancel calls = %d, want 0", got)
+	}
+	if r.failed != 1 {
+		t.Errorf("failed = %d, want 1", r.failed)
+	}
+	if got := r.exitStatus(); got != 1 {
+		t.Errorf("exitStatus() = %d, want 1", got)
+	}
+	if got := rec.CountLevel(slog.LevelError, "sync failed"); got != 1 {
+		t.Errorf("sync failed ERROR records = %d, want 1; logs = %q", got, rec.Messages())
+	}
+	if got := rec.CountExact("sync interrupted by shutdown"); got != 0 {
+		t.Errorf("sync interrupted records = %d, want 0; logs = %q", got, rec.Messages())
 	}
 }

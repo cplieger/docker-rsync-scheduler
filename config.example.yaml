@@ -5,8 +5,9 @@
 # error if the config is missing or invalid.
 #
 # Each job pushes <local>/ to <remote_host>:<remote_path>/ one-way over
-# rsync+ssh. A missing or empty <local> directory skips that job rather than
-# letting --delete wipe the remote. Scheduling is controlled by the
+# rsync+ssh. An empty <local> directory skips that job rather than letting
+# --delete wipe the remote; a <local> path that does not exist fails the job.
+# Scheduling is controlled by the
 # SYNC_INTERVAL env var (default 6h built-in; set SYNC_INTERVAL=off to disable
 # the built-in loop and trigger passes externally via `docker-rsync-scheduler sync`).
 #
@@ -22,7 +23,9 @@ jobs:
     ssh_key: /keys/id_ed25519            # required, private key path inside the container (host file mode 0600)
     delete: true                         # optional (default false) -> rsync --delete when true
     max_delete: 100                      # optional; with delete -> rsync --max-delete=N: deletes at
-                                         # most N, then skips the rest and FAILS the pass (exit 25 -> sync failed + unhealthy).
+                                         # most N, then skips the rest and FAILS the pass (exit 25 ->
+                                         # sync failed + unhealthy; exit 24 instead if a source file
+                                         # also vanished in that pass).
                                          # 0 refuses all deletions and fails the pass if anything would have been deleted.
                                          # Unset -> uncapped
     excludes:                            # optional, per-job exclude patterns (plus the built-in globals)

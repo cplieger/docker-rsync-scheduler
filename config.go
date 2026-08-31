@@ -18,6 +18,7 @@ import (
 
 	"github.com/cplieger/envx/v2"
 	"github.com/cplieger/envx/yamlenv/v2"
+	"github.com/cplieger/pathinside/v2"
 	"github.com/cplieger/scheduler/v4"
 	"github.com/cplieger/slogx"
 	"go.yaml.in/yaml/v3"
@@ -271,16 +272,26 @@ type destJob struct {
 // them deletes: --delete then removes whatever the others put there, every
 // pass, and the per-job empty-source guard cannot see it because the deletion
 // is not per-job. Advisory, not an error: an exclude rule can protect the
-// receiver, so an overlapping set CAN be correct. Identity is host+path,
-// compared on the host COMPONENT and case-insensitively; the ssh keys are
-// reported rather than compared, because a path-rooting wrapper on one of them
-// is what makes a flagged set safe. One record per tree, never one per pair.
+// receiver, so an overlapping set CAN be correct. Identity is host+path: IP
+// literals are compared as parsed addresses, multi-label DNS names are
+// case-folded and normalized across a trailing root dot, and other names use
+// their raw case-folded spelling. The ssh keys are reported rather than
+// compared, because a path-rooting wrapper on one of them is what makes a
+// flagged set safe. One record per tree, never one per pair.
 func warnSharedDestinations(jobs []job) {
 	groups := make(map[string][]destJob, len(jobs))
 	for i := range jobs {
 		j := &jobs[i]
 		_, host := splitRemoteHost(j.RemoteHost)
 		key := strings.ToLower(host)
+		if ip := net.ParseIP(host); ip != nil {
+			key = ip.String() // one endpoint, one group: 2001:db8::1 == 2001:0db8:0:0:0:0:0:1
+		} else if trimmed := strings.TrimSuffix(key, "."); strings.Contains(trimmed, ".") {
+			// At the resolver's default ndots:1 a single label is absolute with the
+			// dot and search-list-expanded without it, so only a multi-label name is
+			// the same host either way (resolv.conf(5), ndots).
+			key = trimmed
+		}
 		groups[key] = append(groups[key], destJob{
 			name: j.Name,
 			raw:  j.RemoteHost,
@@ -327,21 +338,23 @@ func overlapComponents(group []destJob) [][]destJob {
 }
 
 // overlapsAny reports whether path is the same tree as any member's path, or is
-// nested under it, or contains it.
+// nested under it, or contains it. Root.Contains admits the root itself, which
+// is the answer this predicate wants: equality is overlap.
 func overlapsAny(members []destJob, path string) bool {
 	for _, m := range members {
-		if m.path == path || under(m.path, path) || under(path, m.path) {
+		if pathinside.Root(m.path).Contains(path) ||
+			pathinside.Root(path).Contains(m.path) {
 			return true
 		}
 	}
 	return false
 }
 
-// warnConflictingTree emits the single advisory for one overlap component,
-// bounded to a fixed sample so a thousand mutually-overlapping deleting jobs
-// cost one record rather than half a million. Samples are ordered
-// shortest-path-first, so a containing path precedes the paths it contains. A
-// component of one, and one where nothing deletes, stay silent.
+// warnConflictingTree emits one advisory per overlap component, listing only
+// members reachable by a deleting job's subtree; siblings connected only through
+// a non-deleting ancestor are excluded. Deleters and shortest-path-first member
+// samples are capped at three so a thousand mutually overlapping jobs still
+// cost one bounded record. Single-member and non-deleting components stay silent.
 func warnConflictingTree(members []destJob) {
 	const sampleSize = 3
 	if len(members) < 2 {
@@ -350,28 +363,37 @@ func warnConflictingTree(members []destJob) {
 	if !slices.ContainsFunc(members, func(m destJob) bool { return m.del }) {
 		return
 	}
-	slices.SortFunc(members, func(a, b destJob) int {
+	atRisk := make([]destJob, 0, len(members))
+	deleters := make([]string, 0, sampleSize)
+	for _, m := range members {
+		reachable := m.del || slices.ContainsFunc(members, func(o destJob) bool {
+			return o.del && (pathinside.Root(o.path).Contains(m.path) || pathinside.Root(m.path).Contains(o.path))
+		})
+		if !reachable {
+			continue
+		}
+		atRisk = append(atRisk, m)
+		if m.del && len(deleters) < sampleSize {
+			deleters = append(deleters, m.name)
+		}
+	}
+	if len(atRisk) < 2 {
+		return
+	}
+
+	slices.SortFunc(atRisk, func(a, b destJob) int {
 		return cmp.Or(cmp.Compare(len(a.path), len(b.path)), cmp.Compare(a.path, b.path))
 	})
 	samples := make([]string, 0, sampleSize)
-	for _, m := range members[:min(sampleSize, len(members))] {
+	for _, m := range atRisk[:min(sampleSize, len(atRisk))] {
 		samples = append(samples,
 			fmt.Sprintf("%s at %s (ssh_key %s, delete %t)", m.name, m.path, m.key, m.del))
 	}
 	slog.Warn("jobs share a remote destination tree and one deletes; each pass may delete the others' files",
-		"remote_host", members[0].raw, "jobs", len(members),
+		"remote_host", atRisk[0].raw, "jobs", len(atRisk),
 		"outermost_first", strings.Join(samples, "; "),
+		"deletes", strings.Join(deleters, ", "),
 		"hint", "exclude the sibling's content from the deleting job, or give each job its own remote_path")
-}
-
-// under reports whether child is nested below parent. filepath.Clean("/")
-// returns "/", so the bare parent+"/" prefix idiom would build "//" and miss
-// every nesting under an rrsync-rooted remote_path of "/".
-func under(parent, child string) bool {
-	if parent == "/" {
-		return child != "/"
-	}
-	return strings.HasPrefix(child, parent+"/")
 }
 
 // validate enforces one job's field contract: required fields present,
@@ -403,7 +425,8 @@ func (j *job) validate() error {
 		return fmt.Errorf("job %q: ssh_key %q not readable: %w", j.Name, j.SSHKey, err)
 	}
 
-	// A negative cap is meaningless; unset leaves the pass uncapped.
+	// 0 already means "allow no deletions" (measured: rsync applies -1 the same
+	// way), so the config publishes one spelling; unset leaves the pass uncapped.
 	if j.MaxDelete != nil && *j.MaxDelete < 0 {
 		return fmt.Errorf("job %q: max_delete must be >= 0", j.Name)
 	}
@@ -456,20 +479,22 @@ func (j *job) checkNoForbiddenChars() error {
 		}
 	}
 
-	// rsync escapes metacharacters in the remote arg but never *?[], which the
-	// receiver expands -- a pattern-shaped path makes --delete hit another tree.
 	if strings.ContainsRune(j.RemotePath, ' ') {
 		return fmt.Errorf("job %q: remote_path %q must not contain spaces",
 			j.Name, j.RemotePath)
 	}
+	// rsync escapes metacharacters in the remote arg but never *?[], which the
+	// receiver expands -- a pattern-shaped path makes --delete hit another tree.
 	if strings.ContainsAny(j.RemotePath, "*?[]") {
 		return fmt.Errorf("job %q: remote_path %q must not contain glob characters (*?[])",
 			j.Name, j.RemotePath)
 	}
 
-	// sshCommand embeds this path in a word-split -e argument.
-	if strings.ContainsRune(j.SSHKey, ' ') {
-		return fmt.Errorf("job %q: ssh_key %q must not contain spaces",
+	// sshCommand embeds this path in rsync's single -e string, which rsync
+	// word-splits itself: a space ends the argument and a quote opens one
+	// rsync never closes ("Missing trailing-' in remote-shell command").
+	if strings.ContainsAny(j.SSHKey, " '\"") {
+		return fmt.Errorf("job %q: ssh_key %q must not contain spaces or quotes",
 			j.Name, j.SSHKey)
 	}
 	return nil

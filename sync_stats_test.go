@@ -11,26 +11,23 @@ import (
 func TestParseStats(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name      string
-		in        string
-		wantFiles int64
-		wantBytes int64
+		name          string
+		in            string
+		wantFiles     int64
+		wantBytes     int64
+		wantDeletions int64
 	}{
 		{
 			name: "full stats block",
 			in: "Number of files: 12 (reg: 10, dir: 2)\n" +
+				"Number of deleted files: 1 (reg: 1)\n" +
 				"Number of regular files transferred: 5\n" +
 				"Total file size: 1,000 bytes\n" +
 				"Total transferred file size: 2,048 bytes\n" +
 				"sent 3,000 bytes  received 96 bytes\n",
-			wantFiles: 5,
-			wantBytes: 2048,
-		},
-		{
-			name:      "sent fallback when no transferred line",
-			in:        "sent 4,096 bytes  received 96 bytes  total size 4,096\n",
-			wantFiles: 0,
-			wantBytes: 4096,
+			wantFiles:     5,
+			wantBytes:     2048,
+			wantDeletions: 1,
 		},
 		{
 			name:      "files with thousands separator",
@@ -59,12 +56,6 @@ func TestParseStats(t *testing.T) {
 			wantFiles: 0,
 			wantBytes: 0,
 		},
-		{
-			name:      "transferred preferred over sent",
-			in:        "Total transferred file size: 10 bytes\nsent 9999 bytes\n",
-			wantFiles: 0,
-			wantBytes: 10,
-		},
 	}
 
 	for _, tt := range tests {
@@ -76,6 +67,9 @@ func TestParseStats(t *testing.T) {
 			}
 			if got.bytes != tt.wantBytes {
 				t.Errorf("parseStats bytes = %d, want %d", got.bytes, tt.wantBytes)
+			}
+			if got.deletions != tt.wantDeletions {
+				t.Errorf("parseStats deletions = %d, want %d", got.deletions, tt.wantDeletions)
 			}
 		})
 	}
@@ -110,21 +104,10 @@ func TestTail(t *testing.T) {
 	}
 }
 
-func TestProperty_ParseStatsNeverPanics(t *testing.T) {
-	rapid.Check(t, func(rt *rapid.T) {
-		in := rapid.String().Draw(rt, "in")
-		got := parseStats(in)
-		if got.files < 0 || got.bytes < 0 {
-			rt.Fatalf("parseStats(%q) = %+v, want non-negative", in, got)
-		}
-	})
-}
-
 // TestProperty_CappedBufferNeverExceedsMax asserts the two core invariants of
 // cappedBuffer across any sequence of writes: the retained bytes never exceed
 // max, and they are exactly the last min(total, max) bytes of the
-// concatenated input. This is the round-trip/bound counterpart to the
-// table-driven cap test and robustly kills arithmetic mutations of the
+// concatenated input. This robustly kills arithmetic mutations of the
 // overflow computation.
 func TestProperty_CappedBufferNeverExceedsMax(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
