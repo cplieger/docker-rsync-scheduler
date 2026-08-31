@@ -41,18 +41,6 @@ func testSocketPath(t *testing.T) string {
 	return filepath.Join(t.TempDir(), "s.sock")
 }
 
-// TestRunDaemon_badConfigReturnsError pins the composition-root error arm: an
-// unreadable/missing config must propagate a non-nil error (which main turns
-// into a non-zero exit) rather than starting a daemon on empty config.
-// Not parallel: sets env.
-func TestRunDaemon_badConfigReturnsError(t *testing.T) {
-	t.Setenv("CONFIG_PATH", filepath.Join(t.TempDir(), "absent.yaml"))
-	err := runDaemon(t.Context(), testSocketPath(t), fixedRunner("true"))
-	if err == nil {
-		t.Fatal("runDaemon() with a missing config = nil, want error")
-	}
-}
-
 // TestRunDaemon_externalModeReturnsNilOnShutdown pins the SYNC_INTERVAL=off
 // dispatch: runDaemon must select external mode (idle until ctx.Done), so an
 // already-cancelled parent returns nil cleanly after the drain rather than
@@ -150,8 +138,8 @@ func TestProbeOptions_builtinArmsMaxAgeFromJobs(t *testing.T) {
 
 // TestProbeOptions_externalAndBrokenConfigDisarm pins the two no-deadline
 // arms: external mode never arms a deadline, and an unreadable config in
-// built-in mode disarms it (bare probe) rather than risking a false-unhealthy
-// restart loop. Not parallel: sets env.
+// built-in mode disarms it (bare probe) rather than risking a permanent
+// false-unhealthy report. Not parallel: sets env.
 func TestProbeOptions_externalAndBrokenConfigDisarm(t *testing.T) {
 	writeValidCfg(t, t.TempDir())
 	t.Setenv("SYNC_INTERVAL", "off")
@@ -169,8 +157,8 @@ func TestProbeOptions_externalAndBrokenConfigDisarm(t *testing.T) {
 // TestProbeOptions_readableInvalidConfigsDisarm pins the two remaining disarm
 // arms, both with a READABLE config: a malformed document (parse error) and a
 // valid one over configCapBytes (size refusal). Both must yield a bare probe
-// rather than a deadline, since a false-unhealthy would restart-loop the
-// container. Not parallel: sets env.
+// rather than a deadline, since a false-unhealthy would stand until the next
+// clean pass. Not parallel: sets env.
 func TestProbeOptions_readableInvalidConfigsDisarm(t *testing.T) {
 	t.Setenv("SYNC_INTERVAL", "1h")
 	tests := []struct {

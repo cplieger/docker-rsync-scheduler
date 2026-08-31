@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
+	"net"
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/cplieger/scheduler/v4/trigger"
 	"github.com/cplieger/slogx/capture"
@@ -77,6 +80,53 @@ func TestRunClient_LogsLifecycleOverRealSocket(t *testing.T) {
 	}
 }
 
+func TestRunClient_ConnectionLostReportsMissingResult(t *testing.T) {
+	rec := capture.Default(t)
+	sock := filepath.Join(t.TempDir(), "s.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("net.Listen() = %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			serverDone <- acceptErr
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		var request struct{}
+		if decodeErr := json.NewDecoder(conn).Decode(&request); decodeErr != nil {
+			serverDone <- decodeErr
+			return
+		}
+		serverDone <- json.NewEncoder(conn).Encode(trigger.Event{Kind: trigger.EventQueued})
+	}()
+
+	// No deadline: a DeadlineExceeded reaches the same catch-all arm and
+	// would satisfy the assertion below, so the truncated stream must be
+	// the only route to it.
+	if code := runClient(t.Context(), sock); code != 1 {
+		t.Errorf("runClient() after a truncated event stream = %d, want 1", code)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("scripted trigger peer: %v", err)
+	}
+
+	var failures []string
+	for _, record := range rec.Records() {
+		if record.Level == slog.LevelError {
+			failures = append(failures, record.Message)
+		}
+	}
+	want := []string{"the pass did not report a result"}
+	if !slices.Equal(failures, want) {
+		t.Errorf("runClient() ERROR messages = %v, want %v; logs = %q", failures, want, rec.Messages())
+	}
+}
+
 // TestRunClient_CancelledWaitWarnsWithoutPaging pins the arm split off from the
 // catch-all: an operator interrupting the `docker exec` cancels the wait, not
 // the pass, so the record is a WARN saying the pass continues in the daemon —
@@ -104,9 +154,77 @@ func TestRunClient_CancelledWaitWarnsWithoutPaging(t *testing.T) {
 	}
 }
 
+func TestRunClient_CancelledAfterSendReportsAcceptanceUnknown(t *testing.T) {
+	rec := capture.Default(t)
+	sock := filepath.Join(t.TempDir(), "s.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("net.Listen() = %v", err)
+	}
+
+	requestRead := make(chan error, 1)
+	release := make(chan struct{})
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, acceptErr := ln.Accept()
+		if acceptErr != nil {
+			requestRead <- acceptErr
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		var request struct{}
+		decodeErr := json.NewDecoder(conn).Decode(&request)
+		requestRead <- decodeErr
+		if decodeErr == nil {
+			<-release
+		}
+	}()
+	t.Cleanup(func() {
+		close(release)
+		_ = ln.Close()
+		<-serverDone
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	clientDone := make(chan int, 1)
+	go func() { clientDone <- runClient(ctx, sock) }()
+
+	select {
+	case err := <-requestRead:
+		if err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("client did not send its request")
+	}
+	cancel()
+
+	select {
+	case code := <-clientDone:
+		if code != 1 {
+			t.Errorf("runClient() after cancellation = %d, want 1", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runClient() did not return after cancellation")
+	}
+
+	const message = "this trigger was interrupted while waiting"
+	records := rec.Records()
+	if len(records) != 1 {
+		t.Fatalf("runClient() logged %d records, want 1; logs = %q", len(records), rec.Messages())
+	}
+	if records[0].Level != slog.LevelWarn || records[0].Message != message {
+		t.Errorf("runClient() record = (%q, %s), want (%q, WARN)", records[0].Message, records[0].Level, message)
+	}
+	if state, ok := rec.AttrValueExact(message, "acceptance"); !ok || state != "unknown" {
+		t.Errorf("runClient() acceptance = %q, %v, want unknown, true", state, ok)
+	}
+}
+
 // TestFinishResult_LogsOutcome characterizes every final-result shape without a
-// transport double: successful completion, a daemon-supplied failure reason,
-// and the empty reason an ordinary failed pass produces.
+// transport double: ordinary and caveated success, a daemon-supplied failure
+// reason, and the empty reason an ordinary failed pass produces.
 func TestFinishResult_LogsOutcome(t *testing.T) {
 	tests := []struct {
 		name, message, reason string
@@ -115,6 +233,7 @@ func TestFinishResult_LogsOutcome(t *testing.T) {
 		level                 slog.Level
 	}{
 		{"success", "triggered sync complete", "", trigger.Event{OK: true, DurationMs: 37}, 0, slog.LevelInfo},
+		{"interrupted_clean", "triggered sync ended with a caveat", "pass cut short by shutdown; remaining jobs did not run", trigger.Event{OK: true, DurationMs: 37, Reason: "pass cut short by shutdown; remaining jobs did not run"}, 0, slog.LevelWarn},
 		{"daemon_reason", "triggered sync failed", "config reload failed", trigger.Event{DurationMs: 37, Reason: "config reload failed"}, 1, slog.LevelError},
 		{"plain_failure", "triggered sync failed", "a sync job failed (see the container log stream)", trigger.Event{DurationMs: 37}, 1, slog.LevelError},
 	}

@@ -39,11 +39,14 @@ func runClient(ctx context.Context, socketPath string) int {
 		slog.Error("cannot send sync request", "error", err)
 		return 1
 	case errors.Is(err, context.Canceled):
-		tail := "the request had not been accepted, so no pass is running"
+		// accepted records the queued event, not the daemon's decision: the
+		// request can cross the socket before this client reads the event back.
+		acceptance := "unknown"
 		if accepted {
-			tail = "the accepted pass continues in the daemon"
+			acceptance = "observed"
 		}
-		slog.Warn("this trigger was interrupted while waiting; "+tail, "error", err)
+		slog.Warn("this trigger was interrupted while waiting",
+			"acceptance", acceptance, "error", err)
 		return 1
 	case err != nil:
 		slog.Error("the pass did not report a result", "error", err)
@@ -55,6 +58,10 @@ func runClient(ctx context.Context, socketPath string) int {
 // finishResult logs the final outcome and maps it to the exit code.
 func finishResult(ev trigger.Event) int {
 	if ev.OK {
+		if ev.Reason != "" {
+			slog.Warn("triggered sync ended with a caveat", "duration_ms", ev.DurationMs, "reason", ev.Reason)
+			return 0
+		}
 		slog.Info("triggered sync complete", "duration_ms", ev.DurationMs)
 		return 0
 	}

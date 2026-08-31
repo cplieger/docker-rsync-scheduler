@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cplieger/envx/yamlenv/v2"
+	"github.com/cplieger/health"
 	"github.com/cplieger/slogx/capture"
 )
 
@@ -58,8 +59,8 @@ func TestValidate(t *testing.T) {
 				RemoteHost: "root@192.0.2.87",
 				RemotePath: "/srv/containers/caddy",
 				SSHKey:     key,
-				RemoteUID:  new(1000),
-				RemoteGID:  new(1000),
+				RemoteUID:  new(uint32(1000)),
+				RemoteGID:  new(uint32(1000)),
 				Delete:     true,
 				Excludes:   []string{"**/locks", "**/*.lock", "logs"},
 			}}},
@@ -274,6 +275,38 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+func TestValidate_excludeControlsRejected(t *testing.T) {
+	key := writeKey(t)
+	tests := []struct {
+		name    string
+		exclude string
+		wantErr bool
+	}{
+		{name: "newline", exclude: "keep\nme", wantErr: true},
+		{name: "del", exclude: "keep\x7fme", wantErr: true},
+		{name: "printable", exclude: "keepme", wantErr: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			j := validJob("excluded", key)
+			j.Excludes = []string{tt.exclude}
+			err := (config{Jobs: []job{j}}).validate()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("validate() with exclude %q = nil, want error", tt.exclude)
+				}
+				if !strings.Contains(err.Error(), "exclude") || !strings.Contains(err.Error(), "control characters") {
+					t.Errorf("validate() with exclude %q error = %q, want an exclude control-character refusal", tt.exclude, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("validate() with exclude %q = %v, want nil", tt.exclude, err)
+			}
+		})
+	}
+}
+
 // TestValidate_sshKeyMissingIsNotExist pins the missing-key CAUSE at the frame
 // an operator's `config validation failed` record carries. job.validate wraps
 // checkReadable's error with %w, and errors.Is traverses that chain, so this is
@@ -418,6 +451,32 @@ jobs:
 	}
 }
 
+func TestParseConfig_rejectsRemoteOwnershipOutsideUint32(t *testing.T) {
+	key := writeKey(t)
+	for _, value := range []string{"-1", "4294967296"} {
+		t.Run(value, func(t *testing.T) {
+			doc := fmt.Sprintf(`
+jobs:
+  - name: caddy
+    local: /sources/caddy
+    remote_host: root@192.0.2.87
+    remote_path: /srv/containers/caddy
+    remote_uid: %s
+    remote_gid: 1000
+    ssh_key: %s
+`, value, key)
+
+			_, err := parseConfig([]byte(doc))
+			if err == nil {
+				t.Fatalf("parseConfig(remote_uid=%s) = nil, want decode error", value)
+			}
+			if !strings.Contains(err.Error(), "cannot unmarshal") || !strings.Contains(err.Error(), "uint32") {
+				t.Errorf("parseConfig(remote_uid=%s) error = %q, want uint32 decode error", value, err)
+			}
+		})
+	}
+}
+
 func TestParseConfigInvalidYAML(t *testing.T) {
 	t.Parallel()
 	_, err := parseConfig([]byte("jobs: [unterminated"))
@@ -486,27 +545,38 @@ jobs:
 	}
 }
 
-func TestLoadConfigEndToEnd(t *testing.T) {
-	dir := t.TempDir()
-	key := filepath.Join(dir, "id_ed25519")
-	if err := os.WriteFile(key, []byte("k\n"), 0o600); err != nil {
-		t.Fatalf("write key: %v", err)
+func TestParseConfig_rejectsAliasExpansionDocuments(t *testing.T) {
+	t.Parallel()
+	tests := map[string]string{
+		"aliases_in_unknown_top_level_fields": `
+a0: &a0 [x,x,x,x,x,x,x,x,x]
+a1: &a1 [*a0,*a0,*a0,*a0,*a0,*a0,*a0,*a0,*a0]
+a2: &a2 [*a1,*a1,*a1,*a1,*a1,*a1,*a1,*a1,*a1]
+a3: &a3 [*a2,*a2,*a2,*a2,*a2,*a2,*a2,*a2,*a2]
+a4: &a4 [*a3,*a3,*a3,*a3,*a3,*a3,*a3,*a3,*a3]
+jobs: []
+`,
+		"nested_aliases_in_known_field": `
+jobs:
+  - name: a0
+    excludes: &a0 [x,x,x,x,x,x,x,x,x]
+  - name: a1
+    excludes: &a1 [*a0,*a0,*a0,*a0,*a0,*a0,*a0,*a0,*a0]
+  - name: a2
+    excludes: &a2 [*a1,*a1,*a1,*a1,*a1,*a1,*a1,*a1,*a1]
+  - name: a3
+    excludes: &a3 [*a2,*a2,*a2,*a2,*a2,*a2,*a2,*a2,*a2]
+  - name: a4
+    excludes: &a4 [*a3,*a3,*a3,*a3,*a3,*a3,*a3,*a3,*a3]
+`,
 	}
-	cfgPath := filepath.Join(dir, "config.yaml")
-	doc := "jobs:\n  - name: caddy\n    local: /sources/caddy\n" +
-		"    remote_host: root@host\n    remote_path: /srv/caddy\n" +
-		"    ssh_key: " + key + "\n"
-	if err := os.WriteFile(cfgPath, []byte(doc), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	t.Setenv("CONFIG_PATH", cfgPath)
 
-	cfg, err := loadConfig()
-	if err != nil {
-		t.Fatalf("loadConfig: %v", err)
-	}
-	if len(cfg.Jobs) != 1 || cfg.Jobs[0].Name != "caddy" {
-		t.Errorf("loadConfig = %+v, want one caddy job", cfg.Jobs)
+	for name, doc := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseConfig([]byte(doc)); err == nil {
+				t.Error("parseConfig(alias expansion document) = nil, want error")
+			}
+		})
 	}
 }
 
@@ -561,61 +631,98 @@ func TestLoadInterval_negativeDurationFallsBackToDefaultEnabled(t *testing.T) {
 	}
 }
 
-func TestLoadConfig_parseErrorMsg(t *testing.T) {
-	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "config.yaml")
-	if err := os.WriteFile(cfgPath, []byte("jobs: [unterminated"), 0o600); err != nil {
-		t.Fatalf("write: %v", err)
+// TestRunDaemon_ConfigFailureLogsOneActionableRecord pins the boot boundary:
+// each load stage produces one error record with the failed path and the mount hint.
+func TestRunDaemon_ConfigFailureLogsOneActionableRecord(t *testing.T) {
+	tests := []struct {
+		name      string
+		doc       string
+		stage     string
+		directory bool
+	}{
+		{name: "missing", stage: "read"},
+		{name: "not_regular", stage: "read", directory: true},
+		{name: "unparseable", doc: "jobs: [\n", stage: "parse"},
+		{name: "invalid", doc: "jobs: []\n", stage: "validate"},
 	}
-	t.Setenv("CONFIG_PATH", cfgPath)
-	_, err := loadConfig()
-	if err == nil {
-		t.Fatal("loadConfig with malformed YAML = nil, want error")
-	}
-	if !strings.Contains(err.Error(), "parse config") {
-		t.Errorf("loadConfig error = %q, want to contain 'parse config'", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := capture.Default(t)
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if tt.directory {
+				path = t.TempDir()
+			} else if tt.doc != "" {
+				if err := os.WriteFile(path, []byte(tt.doc), 0o600); err != nil {
+					t.Fatalf("write config: %v", err)
+				}
+			}
+			t.Setenv("CONFIG_PATH", path)
+
+			if err := runDaemon(t.Context(), testSocketPath(t), fixedRunner("true")); err == nil {
+				t.Fatal("runDaemon() with broken config = nil, want error")
+			}
+
+			const message = "cannot load config"
+			if got := rec.CountLevel(slog.LevelError, ""); got != 1 {
+				t.Errorf("runDaemon() ERROR records = %d, want 1; logs = %q", got, rec.Messages())
+			}
+			if !rec.HasAttr(message, "path", path) {
+				t.Errorf("%q missing path=%q; logs = %q", message, path, rec.Messages())
+			}
+			if !rec.HasAttr(message, "stage", tt.stage) {
+				t.Errorf("%q missing stage=%q; logs = %q", message, tt.stage, rec.Messages())
+			}
+			const hint = "mount a config.yaml at this path — see config.example.yaml in the repo"
+			if !rec.HasAttr(message, "hint", hint) {
+				t.Errorf("%q missing hint=%q; logs = %q", message, hint, rec.Messages())
+			}
+		})
 	}
 }
 
-func TestLoadConfig_validateErrorMsg(t *testing.T) {
-	dir := t.TempDir()
-	cfgPath := filepath.Join(dir, "config.yaml")
-	if err := os.WriteFile(cfgPath, []byte("jobs:\n  - name: x\n"), 0o600); err != nil {
-		t.Fatalf("write: %v", err)
+// TestDaemonRun_ConfigFailureLogsOneActionableRecord pins the reload boundary:
+// the same load stages retain their path and identify the request that triggered them.
+func TestDaemonRun_ConfigFailureLogsOneActionableRecord(t *testing.T) {
+	tests := []struct {
+		name      string
+		doc       string
+		stage     string
+		directory bool
+	}{
+		{name: "missing", stage: "read"},
+		{name: "not_regular", stage: "read", directory: true},
+		{name: "unparseable", doc: "jobs: [\n", stage: "parse"},
+		{name: "invalid", doc: "jobs: []\n", stage: "validate"},
 	}
-	t.Setenv("CONFIG_PATH", cfgPath)
-	_, err := loadConfig()
-	if err == nil {
-		t.Fatal("loadConfig with invalid config = nil, want error")
-	}
-	if !strings.Contains(err.Error(), "local is required") {
-		t.Errorf("loadConfig error = %q, want to contain 'local is required'", err)
-	}
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := capture.Default(t)
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if tt.directory {
+				path = t.TempDir()
+			} else if tt.doc != "" {
+				if err := os.WriteFile(path, []byte(tt.doc), 0o600); err != nil {
+					t.Fatalf("write config: %v", err)
+				}
+			}
+			t.Setenv("CONFIG_PATH", path)
+			d := &daemon{hc: newHealthController(health.NewMarker(filepath.Join(t.TempDir(), "marker")))}
 
-// TestLoadConfigMissingFile pins the only actionable record an operator with an
-// empty /config sees: loadConfig emits it before returning its error, and
-// dispatch exits 1 without printing that error. Deleting the record, lowering
-// its level, or dropping its path or hint leaves an err != nil assertion green.
-func TestLoadConfigMissingFile(t *testing.T) {
-	rec := capture.Default(t)
-	path := filepath.Join(t.TempDir(), "absent.yaml")
-	t.Setenv("CONFIG_PATH", path)
+			out := d.run(t.Context(), "external", struct{}{})
+			if out.OK || out.Reason != "config reload failed" {
+				t.Errorf("daemon.run() = ok:%v reason:%q, want false %q", out.OK, out.Reason, "config reload failed")
+			}
 
-	if _, err := loadConfig(); err == nil {
-		t.Fatal("loadConfig on missing file: want error")
-	}
-
-	const message = "config not found"
-	if got := rec.CountLevel(slog.LevelError, message); got != 1 {
-		t.Errorf("%q ERROR records = %d, want 1; logs = %q", message, got, rec.Messages())
-	}
-	if !rec.HasAttr(message, "path", path) {
-		t.Errorf("%q missing path=%q; logs = %q", message, path, rec.Messages())
-	}
-	const hint = "mount a config.yaml at this path — see config.example.yaml in the repo"
-	if !rec.HasAttr(message, "hint", hint) {
-		t.Errorf("%q missing hint=%q; logs = %q", message, hint, rec.Messages())
+			const message = "config reload failed"
+			if got := rec.CountLevel(slog.LevelError, ""); got != 1 {
+				t.Errorf("daemon.run() ERROR records = %d, want 1; logs = %q", got, rec.Messages())
+			}
+			for key, value := range map[string]string{"path": path, "stage": tt.stage, "trigger": "external"} {
+				if !rec.HasAttr(message, key, value) {
+					t.Errorf("%q missing %s=%q; logs = %q", message, key, value, rec.Messages())
+				}
+			}
+		})
 	}
 }
 
@@ -650,7 +757,7 @@ func TestLoadConfig_acceptsExactlyCapBytes(t *testing.T) {
 	t.Setenv("CONFIG_PATH", cfgPath)
 	t.Setenv("SYNC_INTERVAL", "")
 
-	cfg, err := loadConfig()
+	cfg, _, err := loadConfig()
 	if err != nil {
 		t.Fatalf("loadConfig at exactly cap (%d bytes) = %v, want success", configCapBytes, err)
 	}
@@ -670,7 +777,7 @@ func TestLoadConfig_rejectsOverCapBytes(t *testing.T) {
 	}
 	t.Setenv("CONFIG_PATH", cfgPath)
 
-	_, err := loadConfig()
+	_, _, err := loadConfig()
 
 	if err == nil {
 		t.Fatal("loadConfig one byte over cap = nil, want error")
@@ -681,13 +788,9 @@ func TestLoadConfig_rejectsOverCapBytes(t *testing.T) {
 }
 
 // TestConfigReaders_refuseNonRegularConfig pins the kind check both config
-// readers now run on the STAT, before the open: a FIFO at CONFIG_PATH is
-// refused rather than opened, so neither reader can block in open(2) waiting
-// for a writer, and neither can consume a stream whose stat size (0) says
-// nothing about what it will deliver. The byte bound behind it is defence in
-// depth for the one residue the kind check cannot remove — a regular file
-// appended to between the stat and the read — whose oracle is a race no
-// deterministic test can stage.
+// readers run on the opened object: a nonblocking open cannot wait on a FIFO,
+// and fstat ensures neither reader consumes a non-regular stream. The byte
+// bound also covers a regular file that grows while it is being read.
 func TestConfigReaders_refuseNonRegularConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.fifo")
 	if err := syscall.Mkfifo(path, 0o600); err != nil {
@@ -695,7 +798,7 @@ func TestConfigReaders_refuseNonRegularConfig(t *testing.T) {
 	}
 	t.Setenv("CONFIG_PATH", path)
 	t.Setenv("SYNC_INTERVAL", "1h")
-	if _, err := loadConfig(); err == nil ||
+	if _, _, err := loadConfig(); err == nil ||
 		!strings.Contains(err.Error(), "not a regular file") {
 		t.Errorf("loadConfig() error = %v, want a not-a-regular-file refusal", err)
 	}
@@ -917,24 +1020,17 @@ func TestSetupLogger_warningFiresOnlyForUnpublishedValues(t *testing.T) {
 }
 
 func TestLoadConfig_readErrorWhenPathIsDir(t *testing.T) {
-	rec := capture.Default(t)
 	dir := t.TempDir() // a directory: refused by the regular-file check
 
 	t.Setenv("CONFIG_PATH", dir)
 
-	_, err := loadConfig()
+	_, _, err := loadConfig()
 
 	if err == nil {
 		t.Fatalf("loadConfig() with CONFIG_PATH=%q (a directory) = nil, want a read error", dir)
 	}
 	if !strings.Contains(err.Error(), "read config") {
 		t.Errorf("loadConfig() dir error = %q, want to contain 'read config'", err)
-	}
-	// The complement of TestLoadConfigMissingFile: a read refusal that is not
-	// os.ErrNotExist must not be reported as an absent config.
-	const notFound = "config not found"
-	if got := rec.CountLevel(slog.LevelError, notFound); got != 0 {
-		t.Errorf("%q ERROR records = %d, want 0; logs = %q", notFound, got, rec.Messages())
 	}
 }
 
@@ -1062,13 +1158,13 @@ func TestValidate_warnsLoneRemoteOwnership(t *testing.T) {
 
 	tests := []struct {
 		name       string
-		uid, gid   *int
+		uid, gid   *uint32
 		wantWarn   bool
 		wantFields map[string]string // structured attrs the advisory must carry when it fires
 	}{
-		{"both set is silent", new(1000), new(1000), false, nil},
-		{"uid only warns", new(1000), nil, true, map[string]string{"remote_uid_set": "true", "remote_gid_set": "false"}},
-		{"gid only warns", nil, new(1000), true, map[string]string{"remote_uid_set": "false", "remote_gid_set": "true"}},
+		{"both set is silent", new(uint32(1000)), new(uint32(1000)), false, nil},
+		{"uid only warns", new(uint32(1000)), nil, true, map[string]string{"remote_uid_set": "true", "remote_gid_set": "false"}},
+		{"gid only warns", nil, new(uint32(1000)), true, map[string]string{"remote_uid_set": "false", "remote_gid_set": "true"}},
 		{"neither set is silent", nil, nil, false, nil},
 	}
 	for _, tt := range tests {
@@ -1188,7 +1284,6 @@ func TestValidate_warnsSharedDestinations(t *testing.T) {
 		})
 	}
 }
-
 
 // TestValidate_sharedDestinationsIdentityIsTheHostComponent pins the identity
 // the advisory compares. A bare host and the same host with a login prefix
@@ -1346,7 +1441,6 @@ func TestValidate_sharedDestinationsFindsInterleavedSiblingPrefix(t *testing.T) 
 		t.Errorf("advisory jobs count is not 2, so /data-old was folded in; logs=%q", rec.Messages())
 	}
 }
-
 
 // TestLoadTransport pins the opt-in switches' env contract. The unset row is
 // the one that matters: an unset environment must yield the shipped transport,

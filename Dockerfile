@@ -26,6 +26,7 @@ RUN apk add --no-cache \
         acl-dev \
         attr-dev \
         build-base \
+        curl \
         gpgv \
         linux-headers \
         lz4-dev \
@@ -46,9 +47,11 @@ COPY rsync-release.gpg /usr/local/share/rsync-release.gpg
 # The dist tarball, not the auto-generated GitHub tag archive. Both gates are
 # fail-closed and the order matters: a bad signature stops the build before the
 # pinned digest is consulted at all.
-RUN wget -q --timeout=30 \
+RUN curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 5 \
+      -o "rsync-${RSYNC_VERSION#v}.tar.gz" \
       "https://download.samba.org/pub/rsync/src/rsync-${RSYNC_VERSION#v}.tar.gz" \
-    && wget -q --timeout=30 \
+    && curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 5 \
+      -o "rsync-${RSYNC_VERSION#v}.tar.gz.asc" \
       "https://download.samba.org/pub/rsync/src/rsync-${RSYNC_VERSION#v}.tar.gz.asc" \
     && gpgv --keyring /usr/local/share/rsync-release.gpg \
         "rsync-${RSYNC_VERSION#v}.tar.gz.asc" "rsync-${RSYNC_VERSION#v}.tar.gz" \
@@ -95,6 +98,7 @@ EOF
 FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS base
 
 ARG PKG_REFRESH=static
+# The echo consumes PKG_REFRESH so a changed value invalidates the cached upgrade layer.
 RUN echo "OS package refresh: ${PKG_REFRESH}" \
     && apk upgrade --no-cache \
     && apk add --no-cache \
@@ -113,7 +117,7 @@ COPY --chmod=755 --from=go-builder /docker-rsync-scheduler /usr/local/bin/docker
 # The final stage depends on this stage's marker, so the smoke test gates the default target.
 FROM base AS test
 ARG RSYNC_VERSION
-COPY tests/ /tmp/tests/
+COPY tests/smoke.sh /tmp/tests/smoke.sh
 # ${RSYNC_VERSION:?} fails the build if the ARG wiring ever breaks, so the
 # smoke test's exact-version assertion can never be skipped in-image (the
 # leading v is stripped inside smoke.sh).

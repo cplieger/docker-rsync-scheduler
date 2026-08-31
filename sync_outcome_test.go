@@ -28,6 +28,22 @@ func TestReportPass_ranEmitsHeartbeat(t *testing.T) {
 	}
 }
 
+func TestReportPass_failedEmitsHeartbeat(t *testing.T) {
+	rec := capture.Default(t)
+	reportPass(&passResult{
+		trigger: "external",
+		total:   2, ok: 1, failed: 1, duration: 5 * time.Millisecond,
+	})
+
+	const heartbeat = "sync cycle complete"
+	if got := rec.CountLevel(slog.LevelInfo, heartbeat); got != 1 {
+		t.Errorf("failed-pass heartbeat count = %d, want 1; logs = %q", got, rec.Messages())
+	}
+	if !rec.HasAttr(heartbeat, "failed", "1") {
+		t.Errorf("failed-pass heartbeat missing failed=1; logs = %q", rec.Messages())
+	}
+}
+
 // TestReportPass_interruptedDoesNotEmitHeartbeat verifies a shutdown-interrupted
 // pass logs a distinct warn line and NOT the "sync cycle complete" heartbeat
 // (so a drain never registers as a healthy completion) and never at error.

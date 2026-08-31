@@ -30,8 +30,8 @@ const (
 	// subprocess cannot OOM the container.
 	outputCapBytes = 1 << 20 // 1 MB
 
-	// logStderrTailBytes bounds the stderr tail attached to a failure log
-	// line so a single failure cannot flood Loki.
+	// logStderrTailBytes bounds the stderr tail attached to terminal job
+	// records so one command cannot flood Loki.
 	logStderrTailBytes = 2048
 
 	// truncMarker prefixes a cut stderr tail. Deliberately louder than a bare
@@ -141,20 +141,21 @@ type transport struct {
 // (@cert-authority, @revoked) or hashed (|1|) line counts. Lines are read in
 // bounded pieces, so a wrongly-mounted large file cannot exhaust boot memory.
 func classifyKnownHosts(path string) (hostKeyMode, error) {
-	info, err := os.Stat(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0) // #nosec G304 -- operator-mounted known_hosts path
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return hostKeyAcceptNew, nil
 	case err != nil:
 		return hostKeyAcceptNew, fmt.Errorf("known_hosts: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	switch {
+	case err != nil:
+		return hostKeyAcceptNew, fmt.Errorf("known_hosts: %w", err)
 	case !info.Mode().IsRegular():
 		return hostKeyAcceptNew, fmt.Errorf("known_hosts %q is not a regular file", path)
 	}
-	f, err := os.Open(path) // #nosec G304 -- operator-mounted known_hosts path
-	if err != nil {
-		return hostKeyAcceptNew, fmt.Errorf("known_hosts: %w", err)
-	}
-	defer func() { _ = f.Close() }()
 	br := bufio.NewReader(f)
 	inComment := false
 	for {
@@ -339,16 +340,25 @@ func tail(s string, n int) string {
 	return truncMarker + s[i:]
 }
 
+type drainSignals struct {
+	parentErr  error
+	jobErr     error
+	runErr     error
+	ps         *os.ProcessState
+	cancelSent bool
+}
+
 // interruptedByShutdown reports whether this app interrupted the command as
 // part of a parent-context drain. A job deadline is always a job failure.
-func interruptedByShutdown(parentErr, jobErr, runErr error, ps *os.ProcessState, exitCode int, cancelSent bool) bool {
-	if errors.Is(jobErr, context.DeadlineExceeded) || parentErr == nil {
+func interruptedByShutdown(signals drainSignals) bool {
+	if errors.Is(signals.jobErr, context.DeadlineExceeded) || signals.parentErr == nil {
 		return false
 	}
-	if ps == nil {
-		return errors.Is(runErr, context.Canceled)
+	if signals.ps == nil {
+		return errors.Is(signals.runErr, context.Canceled)
 	}
-	return (exitCode < 0 || exitCode == rsyncSignalExit) && cancelSent
+	exitCode := signals.ps.ExitCode()
+	return (exitCode < 0 || exitCode == rsyncSignalExit) && signals.cancelSent
 }
 
 // runJob executes one sync job and returns its result. A source that cannot be
@@ -409,6 +419,12 @@ func runJob(ctx context.Context, j *job, timeout time.Duration, tr transport, ne
 	if ps != nil {
 		res.exitCode = ps.ExitCode()
 	}
+	stderrAll := errBuf.String()
+	res.stderrTail = tail(stderrAll, logStderrTailBytes)
+	// rsync emits this warning on its own line and escapes control bytes in
+	// filenames, so a filename cannot forge the line boundary.
+	delLimited := strings.HasPrefix(stderrAll, rsyncDelLimitWarn) ||
+		strings.Contains(stderrAll, "\n"+rsyncDelLimitWarn)
 
 	if runErr == nil {
 		res.success = true
@@ -417,15 +433,21 @@ func runJob(ctx context.Context, j *job, timeout time.Duration, tr transport, ne
 			"files", res.files,
 			"bytes", res.bytes,
 			"deletions", stats.deletions,
-			"duration_ms", res.duration.Milliseconds())
+			"duration_ms", res.duration.Milliseconds(),
+			"stderr", res.stderrTail)
 		return res
 	}
 
-	res.stderrTail = tail(errBuf.String(), logStderrTailBytes)
 	if ps == nil {
 		res.exitCode = -1
 	}
-	drained := interruptedByShutdown(ctx.Err(), jobCtx.Err(), runErr, ps, res.exitCode, cancelSent.Load())
+	drained := interruptedByShutdown(drainSignals{
+		parentErr:  ctx.Err(),
+		jobErr:     jobCtx.Err(),
+		runErr:     runErr,
+		ps:         ps,
+		cancelSent: cancelSent.Load(),
+	})
 	switch {
 	case ps == nil:
 		// No child ran: Start refused on an already-cancelled context, or the
@@ -441,9 +463,10 @@ func runJob(ctx context.Context, j *job, timeout time.Duration, tr transport, ne
 			"bytes", res.bytes,
 			"deletions", stats.deletions,
 			"duration_ms", res.duration.Milliseconds(),
-			"error", runErr)
+			"error", runErr,
+			"stderr", res.stderrTail)
 		return res
-	case res.exitCode == rsyncVanishedExit && !strings.Contains(errBuf.String(), rsyncDelLimitWarn):
+	case res.exitCode == rsyncVanishedExit && !delLimited:
 		res.success = true
 		slog.Warn("sync completed with vanished source files",
 			"job", j.Name,
@@ -474,8 +497,7 @@ func runJob(ctx context.Context, j *job, timeout time.Duration, tr transport, ne
 }
 
 // passResult is the structured outcome of one sync pass. The health
-// controller, the reporter, and the pass exit status each derive their action
-// from this single value.
+// controller and reporter derive their actions from this single value.
 type passResult struct {
 	trigger      string        // startup | interval | external
 	total        int           // jobs configured
@@ -483,7 +505,7 @@ type passResult struct {
 	emptySkipped int           // jobs skipped because their source was empty
 	failed       int           // jobs that failed
 	duration     time.Duration // wall-clock of the pass
-	interrupted  bool          // ctx cancelled mid-pass (graceful shutdown drain)
+	interrupted  bool          // shutdown interruption observed during the pass
 }
 
 // healthy reports the marker value this pass implies: a pass is healthy iff no
@@ -491,26 +513,11 @@ type passResult struct {
 // short by shutdown with every started job succeeding is healthy.
 func (r *passResult) healthy() bool { return r.failed == 0 }
 
-// exitStatus is the pass's process-level status, delivered to a triggering
-// `sync` client as its exit code: 1 on any job failure, 0 on a clean pass.
-//
-// An interrupted-clean pass exits 0 — no job failed, and interrupted or
-// unstarted jobs are not counted as failures. The health controller declines
-// to write the marker in the same case, so neither reports a failure: exit 0,
-// and no healthy write lands once the shutdown context is done. An
-// interrupted pass with a real failure exits 1.
-func (r *passResult) exitStatus() int {
-	if r.failed > 0 {
-		return 1
-	}
-	return 0
-}
-
 // runPass runs every job once and returns their aggregate result. The daemon's
 // single executor is the only caller and owns serialization; reportPass and the
 // health controller own the pass-level side effects.
-func runPass(ctx context.Context, cfg config, timeout time.Duration, tr transport, trigger string, newCmd scheduler.CommandRunner) passResult {
-	res := passResult{trigger: trigger, total: len(cfg.Jobs)}
+func runPass(ctx context.Context, cfg config, timeout time.Duration, tr transport, trig string, newCmd scheduler.CommandRunner) passResult {
+	res := passResult{trigger: trig, total: len(cfg.Jobs)}
 	start := time.Now()
 	for i := range cfg.Jobs {
 		if ctx.Err() != nil {
@@ -518,7 +525,7 @@ func runPass(ctx context.Context, cfg config, timeout time.Duration, tr transpor
 			// cancelled parent classifies as interrupted, never failed, but each
 			// unstarted job would still log its own line — or count as an ok skip if
 			// its source is empty — claiming outcomes the drain never considered.
-			// res.interrupted is recorded after the loop so the pass reports the drain.
+			res.interrupted = true
 			break
 		}
 		jr := runJob(ctx, &cfg.Jobs[i], timeout, tr, newCmd)
@@ -534,12 +541,12 @@ func runPass(ctx context.Context, cfg config, timeout time.Duration, tr transpor
 			// clean pass keeps failed==0, so it exits 0 and the health controller
 			// writes no marker for it. A genuine rsync failure still lands in the
 			// default arm and sets failed>0.
+			res.interrupted = true
 		default:
 			res.failed++
 		}
 	}
 	res.duration = time.Since(start)
-	res.interrupted = ctx.Err() != nil
 	return res
 }
 
@@ -580,8 +587,6 @@ type cappedBuffer struct {
 
 func (c *cappedBuffer) Write(p []byte) (int, error) {
 	switch {
-	case c.max <= 0:
-		// sink: retain nothing
 	case len(p) >= c.max:
 		c.buf.Reset()
 		c.buf.Write(p[len(p)-c.max:])

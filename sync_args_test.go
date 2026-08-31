@@ -10,7 +10,7 @@ import (
 
 // argJob returns a job with the given knobs set, using a fixed key path
 // (buildRsyncArgs does no filesystem access, so the path need not exist).
-func argJob(delete bool, uid, gid *int, excludes []string) *job {
+func argJob(delete bool, uid, gid *uint32, excludes []string) *job {
 	return &job{
 		Name:       "caddy",
 		Local:      "/sources/caddy",
@@ -60,7 +60,7 @@ func TestBuildRsyncArgs(t *testing.T) {
 
 	t.Run("uid only does not add chown", func(t *testing.T) {
 		t.Parallel()
-		got := buildRsyncArgs(argJob(false, new(1000), nil, nil), transport{})
+		got := buildRsyncArgs(argJob(false, new(uint32(1000)), nil, nil), transport{})
 		if hasChown(got) {
 			t.Errorf("--chown present with gid unset in %v", got)
 		}
@@ -68,7 +68,7 @@ func TestBuildRsyncArgs(t *testing.T) {
 
 	t.Run("gid only does not add chown", func(t *testing.T) {
 		t.Parallel()
-		got := buildRsyncArgs(argJob(false, nil, new(1000), nil), transport{})
+		got := buildRsyncArgs(argJob(false, nil, new(uint32(1000)), nil), transport{})
 		if hasChown(got) {
 			t.Errorf("--chown present with uid unset in %v", got)
 		}
@@ -112,7 +112,7 @@ func TestBuildRsyncArgs(t *testing.T) {
 
 	t.Run("all knobs together", func(t *testing.T) {
 		t.Parallel()
-		got := buildRsyncArgs(argJob(true, new(0), new(0), []string{"logs"}), transport{})
+		got := buildRsyncArgs(argJob(true, new(uint32(0)), new(uint32(0)), []string{"logs"}), transport{})
 		want := []string{
 			"-rlptD", "--delete", "--chown=0:0", "--stats", "-e", wantSSHAcceptNew,
 			"--filter=- .stfolder", "--filter=- .stversions",
@@ -390,7 +390,6 @@ func TestRemoteDest_bracketedIPv4Normalized(t *testing.T) {
 	}
 }
 
-
 // TestBuildRsyncArgs_transportSwitches pins the three opt-in transport
 // switches. The zero-value row is the important one: transport{} must append
 // none of -A/-X/-z, so no existing deployment changes behaviour on an image
@@ -463,4 +462,3 @@ func TestBuildRsyncArgs_transportSwitches(t *testing.T) {
 		})
 	}
 }
-

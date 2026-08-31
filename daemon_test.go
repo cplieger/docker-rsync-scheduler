@@ -265,6 +265,10 @@ func TestExecutor_ShutdownCancelsQueuedButResolvesInFlight(t *testing.T) {
 		if !out.OK {
 			t.Errorf("in-flight pass outcome ok=false, want true (interrupted-clean drains as success)")
 		}
+		const reason = "pass cut short by shutdown; remaining jobs did not run"
+		if out.Reason != reason {
+			t.Errorf("in-flight pass reason = %q, want %q", out.Reason, reason)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("in-flight result not delivered")
 	}
@@ -371,6 +375,46 @@ func TestStartTicker_FiresStartupThenInterval(t *testing.T) {
 	}
 }
 
+func TestStartTicker_WaitsForLongPassBeforeNextTick(t *testing.T) {
+	writeValidCfg(t, newRunJobSource(t))
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	runner := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+		return exec.CommandContext(ctx, "true")
+	}
+	d, _, _, _ := newTestDaemon(t, runner)
+	tickCtx, stopTicker := context.WithCancel(t.Context())
+	tickerDone := startTicker(tickCtx, d, 10*time.Millisecond, true)
+	var releaseOnce sync.Once
+	releasePass := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		stopTicker()
+		releasePass()
+		<-tickerDone
+	})
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("startup pass did not enter the runner")
+	}
+	select {
+	case <-time.After(60 * time.Millisecond):
+	case <-tickerDone:
+		t.Fatal("ticker stopped while the startup pass was held")
+	}
+	if queued := len(d.queue.Jobs()); queued != 0 {
+		t.Errorf("queued scheduled requests during one unresolved pass = %d, want 0", queued)
+	}
+
+	stopTicker()
+	releasePass()
+	<-tickerDone
+}
+
 // TestStartTicker_DisabledInExternalMode pins that external mode runs no
 // ticker: the returned channel is already closed and nothing is submitted.
 // Runs in a synctest bubble so the "no tick fired" half is exact rather than
@@ -399,6 +443,66 @@ func TestStartTicker_DisabledInExternalMode(t *testing.T) {
 	})
 }
 
+func TestRunDaemon_StartupRecordPublishesResolvedPolicy(t *testing.T) {
+	originalKnownHostsPath := knownHostsPath
+	knownHostsPath = filepath.Join(t.TempDir(), "absent-known-hosts")
+	t.Cleanup(func() { knownHostsPath = originalKnownHostsPath })
+
+	tests := []struct {
+		name, interval, mode, intervalAttr string
+	}{
+		{name: "built_in", interval: "1h", mode: "built-in", intervalAttr: "1h0m0s"},
+		{name: "external", interval: "off", mode: "external", intervalAttr: "none"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfgPath := writeValidCfg(t, t.TempDir())
+			t.Setenv("SYNC_INTERVAL", tt.interval)
+			t.Setenv("SYNC_TIMEOUT", "10m")
+			t.Setenv("SYNC_ACLS", "false")
+			t.Setenv("SYNC_XATTRS", "false")
+			t.Setenv("SYNC_COMPRESS", "off")
+			rec := capture.Default(t)
+			sock := testSocketPath(t)
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan struct{})
+			var runErr error
+			go func() {
+				defer close(done)
+				runErr = runDaemon(ctx, sock, fixedRunner("true"))
+			}()
+			t.Cleanup(func() {
+				cancel()
+				<-done
+			})
+
+			waitFor(t, 2*time.Second, func() bool {
+				return rec.CountExact("container started") == 1
+			}, "daemon did not emit its startup record")
+			cancel()
+			<-done
+			if runErr != nil {
+				t.Fatalf("runDaemon() = %v, want nil", runErr)
+			}
+
+			const message = "container started"
+			if got := rec.CountLevel(slog.LevelInfo, message); got != 1 {
+				t.Errorf("%q INFO records = %d, want 1; logs = %q", message, got, rec.Messages())
+			}
+			wantAttrs := map[string]string{
+				"mode": tt.mode, "jobs": "1", "config": cfgPath,
+				"interval": tt.intervalAttr, "timeout": "10m0s", "ssh_hostkey_mode": "accept-new",
+				"acls": "false", "xattrs": "false", "compress": "off", "socket": sock,
+			}
+			for key, want := range wantAttrs {
+				if !rec.HasAttr(message, key, want) {
+					t.Errorf("%q missing %s=%q; logs = %q", message, key, want, rec.Messages())
+				}
+			}
+		})
+	}
+}
+
 // TestRunDaemon_ExternalModeBootsHealthyServesAndShutsDownCleanly is the
 // composition-root integration test: external mode boots healthy (idle),
 // serves a triggered pass over the real socket, and on shutdown removes the
@@ -408,8 +512,7 @@ func TestRunDaemon_ExternalModeBootsHealthyServesAndShutsDownCleanly(t *testing.
 	writeValidCfg(t, t.TempDir()) // empty source: the triggered pass is a clean skip
 	t.Setenv("SYNC_INTERVAL", "off")
 	t.Cleanup(func() { _ = os.Remove(healthMarkerPath) })
-	prev := slog.Default()
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	rec := capture.Default(t)
 
 	sock := testSocketPath(t)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -434,6 +537,10 @@ func TestRunDaemon_ExternalModeBootsHealthyServesAndShutsDownCleanly(t *testing.
 	if code := runClient(t.Context(), sock); code != 0 {
 		t.Errorf("runClient() = %d, want 0 (clean triggered pass)", code)
 	}
+	const message = "triggered sync queued"
+	if got := rec.CountLevel(slog.LevelInfo, message); got != 1 {
+		t.Errorf("%q INFO records = %d, want 1; logs = %q", message, got, rec.Messages())
+	}
 
 	cancel()
 	select {
@@ -451,7 +558,6 @@ func TestRunDaemon_ExternalModeBootsHealthyServesAndShutsDownCleanly(t *testing.
 		t.Errorf("socket file not removed on shutdown; stat err = %v, want not-exist", err)
 	}
 }
-
 
 // TestRunDaemon_BuiltinModeStartsUnhealthyUntilStartupPassCompletes pins the
 // built-in arm of hc.markInitial(!cfg.ScheduleEnabled): the container reports
@@ -498,7 +604,6 @@ func TestRunDaemon_BuiltinModeStartsUnhealthyUntilStartupPassCompletes(t *testin
 		t.Fatal("runDaemon did not return after shutdown")
 	}
 }
-
 
 // TestRunDaemon_UnusableKnownHostsRefusesStartupWithDiagnostic pins the
 // published refusal: a mounted known_hosts the app cannot read a host key out

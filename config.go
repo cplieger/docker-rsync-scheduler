@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cplieger/envx/v2"
@@ -34,8 +35,8 @@ type config struct {
 // job describes a single rsync-over-ssh push of a local directory to a
 // remote host.
 type job struct {
-	RemoteUID  *int     `yaml:"remote_uid"`
-	RemoteGID  *int     `yaml:"remote_gid"`
+	RemoteUID  *uint32  `yaml:"remote_uid"`
+	RemoteGID  *uint32  `yaml:"remote_gid"`
 	MaxDelete  *int     `yaml:"max_delete"`
 	Name       string   `yaml:"name"`
 	Local      string   `yaml:"local"`
@@ -120,10 +121,8 @@ func hasShellMeta(s string) bool {
 // (`time=... level=... msg=... k=v`) to stderr for Loki/Alloy collection.
 func setupLogger() {
 	raw := envx.String("LOG_LEVEL")
-	// README.md publishes four values, so match the name rather than
-	// filtering slogx.ParseLevel's output: it also accepts slog's offset
-	// syntax ("info+4"), which this app never published and which resolves
-	// to a DIFFERENT published level.
+	// Match explicit spellings, accepting "warning" as an alias for "warn".
+	// Unsupported slog offset syntax such as "info+4" falls back to info with a warning.
 	var level slog.Level // LevelInfo is the zero value
 	recognized := true
 	switch strings.ToLower(strings.TrimSpace(raw)) {
@@ -148,56 +147,46 @@ func configPath() string {
 	return cmp.Or(envx.String("CONFIG_PATH"), defaultConfigPath)
 }
 
-// loadConfig reads, parses, and validates the YAML config. On any
-// failure it logs a structured error and returns it so the caller
-// can exit non-zero.
-func loadConfig() (config, error) {
+// loadConfig reads, parses, and validates the YAML config. The stage is
+// non-empty only on failure so callers can attach it to their diagnostic.
+func loadConfig() (config, string, error) {
 	path := configPath()
 
 	data, err := readCappedConfig(path)
-	if errors.Is(err, os.ErrNotExist) {
-		slog.Error("config not found", "path", path, "error", err,
-			"hint", "mount a config.yaml at this path — see config.example.yaml in the repo")
-		return config{}, fmt.Errorf("read config %q: %w", path, err)
-	}
 	if err != nil {
-		slog.Error("config read failed", "path", path, "error", err)
-		return config{}, fmt.Errorf("read config %q: %w", path, err)
+		return config{}, "read", fmt.Errorf("read config %q: %w", path, err)
 	}
 
 	cfg, err := parseConfig(data)
 	if err != nil {
-		slog.Error("config parse failed", "path", path, "error", err)
-		return config{}, err
+		return config{}, "parse", fmt.Errorf("parse config %q: %w", path, err)
 	}
 
 	if err := cfg.validate(); err != nil {
-		slog.Error("config validation failed", "path", path, "error", err)
-		return config{}, err
+		return config{}, "validate", fmt.Errorf("validate config %q: %w", path, err)
 	}
 
-	return cfg, nil
+	return cfg, "", nil
 }
 
 // readCappedConfig reads path, refusing a non-regular file and any
-// document over configCapBytes. The kind check runs on the stat, before the
-// open, because opening a fifo blocks. The size bound is enforced on the
-// bytes READ, because a regular file can grow after the stat, and a larger
-// regular file can be swapped in between the stat and the open. The +1 is
-// what makes "exceeds" decidable once the app has stopped reading.
+// document over configCapBytes. A nonblocking open prevents a FIFO wait, and
+// the kind check and read use the same descriptor. The size bound is enforced
+// on the bytes read because a regular file can grow after it is opened. The +1
+// makes "exceeds" decidable once the app has stopped reading.
 func readCappedConfig(path string) ([]byte, error) {
-	info, err := os.Stat(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0) // #nosec G304 -- trusted, operator-mounted config path
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
 	if !info.Mode().IsRegular() {
 		return nil, errors.New("not a regular file")
 	}
-	f, err := os.Open(path) // #nosec G304 -- trusted, operator-mounted config path
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = f.Close() }()
 	data, err := io.ReadAll(io.LimitReader(f, configCapBytes+1))
 	if err != nil {
 		return nil, err
@@ -363,13 +352,16 @@ func warnConflictingTree(members []destJob) {
 	if !slices.ContainsFunc(members, func(m destJob) bool { return m.del }) {
 		return
 	}
+	deleting := make([]destJob, 0, len(members))
+	for _, m := range members {
+		if m.del {
+			deleting = append(deleting, m)
+		}
+	}
 	atRisk := make([]destJob, 0, len(members))
 	deleters := make([]string, 0, sampleSize)
 	for _, m := range members {
-		reachable := m.del || slices.ContainsFunc(members, func(o destJob) bool {
-			return o.del && (pathinside.Root(o.path).Contains(m.path) || pathinside.Root(m.path).Contains(o.path))
-		})
-		if !reachable {
+		if !overlapsAny(deleting, m.path) {
 			continue
 		}
 		atRisk = append(atRisk, m)
@@ -377,10 +369,6 @@ func warnConflictingTree(members []destJob) {
 			deleters = append(deleters, m.name)
 		}
 	}
-	if len(atRisk) < 2 {
-		return
-	}
-
 	slices.SortFunc(atRisk, func(a, b destJob) int {
 		return cmp.Or(cmp.Compare(len(a.path), len(b.path)), cmp.Compare(a.path, b.path))
 	})
@@ -585,20 +573,22 @@ func remoteDest(j *job) string {
 // checkReadable confirms path names a regular file that can be opened
 // for reading. The kind check is the ssh_key contract: a directory or
 // a device opens successfully and can never be a private key, and in
-// external mode ssh's own complaint is up to SYNC_INTERVAL away.
+// external mode ssh's own complaint waits for the operator's next
+// trigger, which this app cannot bound.
 func checkReadable(path string) error {
-	info, err := os.Stat(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0) // #nosec G304 -- trusted, operator-mounted key path
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
 	if err != nil {
 		return err
 	}
 	if !info.Mode().IsRegular() {
 		return errors.New("not a regular file")
 	}
-	f, err := os.Open(path) // #nosec G304 -- trusted, operator-mounted key path
-	if err != nil {
-		return err
-	}
-	return f.Close()
+	return nil
 }
 
 // loadSyncTimeout reads SYNC_TIMEOUT (a Go duration) and falls back to
@@ -643,7 +633,9 @@ func loadTransport(hostKeys hostKeyMode) transport {
 }
 
 // loadInterval returns scheduler.ParseInterval's cadence and whether it chose
-// built-in scheduling.
+// built-in scheduling. The cadence is meaningful only when scheduleEnabled is
+// true: every other mode carries defaultInterval for reference, so a caller
+// that skips the check arms or publishes a cadence nothing observes.
 func loadInterval() (interval time.Duration, scheduleEnabled bool) {
 	s := scheduler.ParseInterval(envx.String("SYNC_INTERVAL"), defaultInterval,
 		scheduler.WithName("SYNC_INTERVAL"))

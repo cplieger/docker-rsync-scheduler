@@ -19,7 +19,8 @@ const healthMarkerPath = health.DefaultPath
 // arms a max-age deadline (two intervals plus every job's full SYNC_TIMEOUT) so
 // a marker never refreshed eventually probes unhealthy; external mode stays
 // unbounded, because a marker between sparse triggers must not expire. An
-// unreadable or unparseable config disarms rather than risking a restart loop.
+// unreadable or unparseable config disarms the deadline to prevent a permanent
+// false-unhealthy report.
 func probeOptions() []health.ProbeOption {
 	interval, scheduleEnabled := loadInterval()
 	if !scheduleEnabled {
@@ -33,25 +34,32 @@ func probeOptions() []health.ProbeOption {
 	if err != nil {
 		return nil
 	}
-	maxAge := maxAgeFor(interval, loadSyncTimeout(), len(cfg.Jobs))
+	maxAge := (freshness{
+		interval: interval,
+		timeout:  loadSyncTimeout(),
+		jobs:     len(cfg.Jobs),
+	}).lease()
 	return []health.ProbeOption{health.WithMaxAge(maxAge)}
 }
 
-// maxAgeFor returns the freshness lease for the given number of jobs at this
-// interval and per-job timeout. It saturates instead of wrapping: a lease
-// longer than a time.Duration can hold means "never expires", where an int64
-// wrap would turn it into seconds and restart a healthy container on every
-// poll.
-func maxAgeFor(interval, timeout time.Duration, jobs int) time.Duration {
+type freshness struct {
+	interval time.Duration
+	timeout  time.Duration
+	jobs     int
+}
+
+// lease returns a saturating freshness deadline. A duration overflow would
+// otherwise produce a short lease and a permanent false-unhealthy report.
+func (f freshness) lease() time.Duration {
 	const maxDur = time.Duration(math.MaxInt64)
-	if interval > maxDur/2 {
+	if f.interval > maxDur/2 {
 		return maxDur
 	}
-	lease := 2 * interval
-	if jobs > 0 && timeout > (maxDur-lease)/time.Duration(jobs) {
+	lease := 2 * f.interval
+	if f.jobs > 0 && f.timeout > (maxDur-lease)/time.Duration(f.jobs) {
 		return maxDur
 	}
-	return lease + timeout*time.Duration(jobs)
+	return lease + f.timeout*time.Duration(f.jobs)
 }
 
 // healthMarker is the marker behaviour healthController depends on.

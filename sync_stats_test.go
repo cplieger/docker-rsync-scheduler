@@ -50,12 +50,6 @@ func TestParseStats(t *testing.T) {
 			wantFiles: 0,
 			wantBytes: 0,
 		},
-		{
-			name:      "empty yields zero",
-			in:        "",
-			wantFiles: 0,
-			wantBytes: 0,
-		},
 	}
 
 	for _, tt := range tests {

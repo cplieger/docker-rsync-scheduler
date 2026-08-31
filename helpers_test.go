@@ -96,6 +96,7 @@ func startTestServer(t *testing.T, runner scheduler.CommandRunner) (sock string,
 	if err != nil {
 		t.Fatalf("trigger.Listen() = %v", err)
 	}
+	// TestRunDaemon_ExternalModeBootsHealthyServesAndShutsDownCleanly owns app-hook vocabulary.
 	srv := &trigger.Server[struct{}]{Queue: d.queue}
 	srv.Serve(ln)
 

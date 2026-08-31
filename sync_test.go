@@ -217,10 +217,31 @@ func TestRunJob_vanishedFilesIsSuccessWithWarning(t *testing.T) {
 	}
 }
 
-// TestRunPass_vanishedFilesPassStaysHealthyAndExitsZero pins the two contract
-// surfaces a stranger's program observes for the same case: the health marker
-// value and the `sync` client's exit code.
-func TestRunPass_vanishedFilesPassStaysHealthyAndExitsZero(t *testing.T) {
+func TestRunPass_vanishedFilenameContainingDeleteLimitPhraseStaysHealthy(t *testing.T) {
+	rec := capture.Default(t)
+	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c",
+			`printf 'file has vanished: "/src/b-`+rsyncDelLimitWarn+`"\n' >&2; exit 24`)
+	}
+	src := newRunJobSource(t)
+
+	r := runPass(t.Context(), config{Jobs: []job{*runJobJob(src)}}, time.Minute, transport{}, "test", newCmd)
+
+	if r.failed != 0 || r.ok != 1 {
+		t.Errorf("runPass(exit 24 with diagnostic text in filename) = failed:%d ok:%d, want 0 1", r.failed, r.ok)
+	}
+	const message = "sync completed with vanished source files"
+	if got := rec.CountLevel(slog.LevelWarn, message); got != 1 {
+		t.Errorf("%q WARN records = %d, want 1; logs = %q", message, got, rec.Messages())
+	}
+	if got := rec.CountExact("sync failed"); got != 0 {
+		t.Errorf("sync failed records = %d, want 0; logs = %q", got, rec.Messages())
+	}
+}
+
+// TestRunPass_vanishedFilesPassStaysHealthy pins the health outcome a
+// stranger's program observes when every vanished source file is tolerated.
+func TestRunPass_vanishedFilesPassStaysHealthy(t *testing.T) {
 	t.Parallel()
 	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
 		return exec.CommandContext(ctx, "sh", "-c", "exit 24")
@@ -232,9 +253,6 @@ func TestRunPass_vanishedFilesPassStaysHealthyAndExitsZero(t *testing.T) {
 	}
 	if !r.healthy() {
 		t.Errorf("healthy() = false, want true")
-	}
-	if got := r.exitStatus(); got != 0 {
-		t.Errorf("exitStatus() = %d, want 0 (a vanished-files pass is a success)", got)
 	}
 }
 
@@ -252,32 +270,41 @@ func TestRunJob_emptySourceSkipsWithoutRunning(t *testing.T) {
 	}
 }
 
-func TestRunJob_fifoSourceFailsPromptlyBeforeExec(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "source.fifo")
-	if err := syscall.Mkfifo(path, 0o600); err != nil {
-		t.Fatalf("Mkfifo: %v", err)
+func TestRunJob_sourceReadFailureLogsSyncFailed(t *testing.T) {
+	rec := capture.Default(t)
+	source := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(source, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write source fixture: %v", err)
+	}
+	invoked := false
+	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		invoked = true
+		return exec.CommandContext(ctx, "true")
 	}
 
-	invoked := false
-	ctx := t.Context()
-	done := make(chan jobResult, 1)
-	go func() {
-		done <- runJob(ctx, runJobJob(path), time.Minute, transport{}, func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
-			invoked = true
-			return exec.CommandContext(ctx, "true")
-		})
-	}()
+	res := runJob(t.Context(), runJobJob(source), time.Minute, transport{}, newCmd)
 
-	select {
-	case res := <-done:
-		if res.success || res.skipped {
-			t.Errorf("runJob(FIFO) = success:%v skipped:%v, want false false", res.success, res.skipped)
-		}
-		if invoked {
-			t.Error("rsync runner invoked for FIFO source, want source refusal before exec")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("runJob(FIFO) did not refuse the non-directory source within 1s")
+	if res.success || res.skipped {
+		t.Errorf("runJob(non-directory source) = success:%v skipped:%v, want false false", res.success, res.skipped)
+	}
+	if invoked {
+		t.Error("rsync runner invoked for a source-read failure, want failure before exec")
+	}
+	const message = "sync failed"
+	if got := rec.CountExact(message); got != 1 {
+		t.Fatalf("%q records = %d, want 1; logs = %q", message, got, rec.Messages())
+	}
+	if got := rec.CountLevel(slog.LevelError, message); got != 1 {
+		t.Errorf("%q ERROR records = %d, want 1; logs = %q", message, got, rec.Messages())
+	}
+	if !rec.HasAttr(message, "path", source) {
+		t.Errorf("%q missing path=%q; logs = %q", message, source, rec.Messages())
+	}
+	if _, ok := rec.AttrValueExact(message, "error"); !ok {
+		t.Errorf("%q missing error attribute; logs = %q", message, rec.Messages())
+	}
+	if _, ok := rec.AttrValueExact(message, "rsync_exit"); ok {
+		t.Errorf("%q has rsync_exit although no child ran; logs = %q", message, rec.Messages())
 	}
 }
 
@@ -325,8 +352,58 @@ func TestRunPass_aggregatesFailures(t *testing.T) {
 	if r.healthy() {
 		t.Error("healthy = true, want false (a job failed)")
 	}
-	if r.exitStatus() != 1 {
-		t.Errorf("exitStatus = %d, want 1 (a job failed)", r.exitStatus())
+}
+
+func TestRunJob_cleanExitWithResidualRunErrorStaysSuccessful(t *testing.T) {
+	rec := capture.Default(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	readyR, readyW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("ready pipe: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = readyR.Close()
+		_ = readyW.Close()
+	})
+
+	newCmd := func(cmdCtx context.Context, _ string, _ ...string) *exec.Cmd {
+		cmd := scheduler.NewCommandRunner(time.Second)(cmdCtx, "sh", "-c",
+			`trap '' TERM; printf 'Number of regular files transferred: 2\nTotal transferred file size: 7 bytes\n'; printf x >&3; sleep 0.05; exit 0`)
+		cmd.ExtraFiles = []*os.File{readyW}
+		return cmd
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		var ready [1]byte
+		_, readErr := readyR.Read(ready[:])
+		cancel()
+		readDone <- readErr
+	}()
+
+	res := runJob(ctx, runJobJob(newRunJobSource(t)), time.Minute, transport{}, newCmd)
+	if readErr := <-readDone; readErr != nil {
+		t.Fatalf("read child readiness: %v", readErr)
+	}
+
+	if !res.success || res.exitCode != 0 {
+		t.Errorf("runJob(clean exit with residual error) = success:%v exitCode:%d, want true 0", res.success, res.exitCode)
+	}
+	if res.files != 2 || res.bytes != 7 {
+		t.Errorf("runJob(clean exit with residual error) stats = files:%d bytes:%d, want 2 7", res.files, res.bytes)
+	}
+	const message = "sync completed with a residual run error"
+	if got := rec.CountLevel(slog.LevelWarn, message); got != 1 {
+		t.Errorf("%q WARN records = %d, want 1; logs = %q", message, got, rec.Messages())
+	}
+	for key, value := range map[string]string{"files": "2", "bytes": "7", "deletions": "0", "stderr": ""} {
+		if !rec.HasAttr(message, key, value) {
+			t.Errorf("%q missing attr %s=%q; logs = %q", message, key, value, rec.Messages())
+		}
+	}
+	if got := rec.CountExact("sync failed"); got != 0 {
+		t.Errorf("sync failed records = %d, want 0; logs = %q", got, rec.Messages())
 	}
 }
 
@@ -374,9 +451,6 @@ func TestRunPass_execFailureUnderLiveContextIsUnhealthy(t *testing.T) {
 	}
 	if r.healthy() {
 		t.Error("healthy() = true after exec start failure, want false")
-	}
-	if got := r.exitStatus(); got != 1 {
-		t.Errorf("exitStatus() = %d after exec start failure, want 1", got)
 	}
 	const message = "sync failed"
 	if got := rec.CountLevel(slog.LevelError, message); got != 1 {
@@ -456,9 +530,9 @@ func TestRunPass_emptySourceSkippedNotCountedAsFailure(t *testing.T) {
 // the l-f8 fix: when graceful shutdown cancels the context mid-pass, the
 // interrupted in-flight job must NOT count as a failure (runJob treats it as
 // "not a real failure"), the remaining jobs must NOT be started under the dead
-// context, and the resulting interrupted-clean pass (failed==0) must take
-// the health controller's no-write carve-out and exit 0 — so no false-unhealthy marker
-// outlives the drain.
+// context, and the resulting interrupted-clean pass (failed==0) must take the
+// health controller's no-write carve-out so no false-unhealthy marker outlives
+// the drain.
 func TestRunPass_shutdownInterruptedJobIsNotCountedAsFailure(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(t.Context())
@@ -485,9 +559,6 @@ func TestRunPass_shutdownInterruptedJobIsNotCountedAsFailure(t *testing.T) {
 	}
 	if !r.healthy() {
 		t.Error("healthy() = false, want true (interrupted-clean is not a failure)")
-	}
-	if got := r.exitStatus(); got != 0 {
-		t.Errorf("exitStatus() = %d, want 0 (interrupted-clean exits success)", got)
 	}
 }
 
@@ -517,9 +588,6 @@ func TestRunPass_realFailureDuringShutdownStillUnhealthy(t *testing.T) {
 	if r.healthy() {
 		t.Errorf("healthy() = true, want false")
 	}
-	if got := r.exitStatus(); got != 1 {
-		t.Errorf("exitStatus() = %d, want 1", got)
-	}
 }
 
 // TestRunPass_childFailureUnderCancelledParentStillFails pins a child that
@@ -541,9 +609,6 @@ func TestRunPass_childFailureUnderCancelledParentStillFails(t *testing.T) {
 
 	if r.failed != 1 {
 		t.Errorf("failed = %d, want 1 (a concrete child failure is not a drain)", r.failed)
-	}
-	if got := r.exitStatus(); got != 1 {
-		t.Errorf("exitStatus() = %d, want 1", got)
 	}
 	const message = "sync failed"
 	if got := rec.CountLevel(slog.LevelError, message); got != 1 {
@@ -605,9 +670,6 @@ func TestRunPass_signalExitAfterAppCancellationIsInterruptedClean(t *testing.T) 
 	if r.failed != 0 {
 		t.Errorf("failed = %d, want 0 (an app-signalled exit 20 is a drain)", r.failed)
 	}
-	if got := r.exitStatus(); got != 0 {
-		t.Errorf("exitStatus() = %d, want 0", got)
-	}
 	if got := rec.CountExact("sync failed"); got != 0 {
 		t.Errorf("%q emitted %d time(s), want 0; logs = %q", "sync failed", got, rec.Messages())
 	}
@@ -637,9 +699,6 @@ func TestRunPass_vanishedWithDeleteLimitIsFailure(t *testing.T) {
 	if r.failed != 1 {
 		t.Errorf("failed = %d, want 1 (a capped deletion is a failed pass)", r.failed)
 	}
-	if got := r.exitStatus(); got != 1 {
-		t.Errorf("exitStatus() = %d, want 1", got)
-	}
 	const message = "sync failed"
 	if got := rec.CountLevel(slog.LevelError, message); got != 1 {
 		t.Errorf("%q ERROR records = %d, want 1; logs = %q", message, got, rec.Messages())
@@ -654,24 +713,19 @@ func TestInterruptedByShutdown_withoutProcessState(t *testing.T) {
 	t.Parallel()
 	execFailure := errors.New("exec failed")
 	tests := []struct {
-		name      string
-		parentErr error
-		jobErr    error
-		runErr    error
-		want      bool
+		name    string
+		signals drainSignals
+		want    bool
 	}{
-		{name: "already_cancelled_start_is_a_drain", parentErr: context.Canceled, jobErr: context.Canceled, runErr: context.Canceled, want: true},
-		{name: "exec_failure_followed_by_cancellation_fails", parentErr: context.Canceled, jobErr: context.Canceled, runErr: execFailure},
-		{name: "cancel_error_under_live_parent_fails", runErr: context.Canceled},
-		{name: "deadline_always_fails", parentErr: context.Canceled, jobErr: context.DeadlineExceeded, runErr: context.Canceled},
+		{name: "exec_failure_followed_by_cancellation_fails", signals: drainSignals{parentErr: context.Canceled, jobErr: context.Canceled, runErr: execFailure}},
+		{name: "cancel_error_under_live_parent_fails", signals: drainSignals{runErr: context.Canceled}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := interruptedByShutdown(tt.parentErr, tt.jobErr, tt.runErr, nil, -1, false)
+			got := interruptedByShutdown(tt.signals)
 			if got != tt.want {
-				t.Errorf("interruptedByShutdown(parent=%v, job=%v, run=%v) = %v, want %v",
-					tt.parentErr, tt.jobErr, tt.runErr, got, tt.want)
+				t.Errorf("interruptedByShutdown(%+v) = %v, want %v", tt.signals, got, tt.want)
 			}
 		})
 	}
@@ -725,9 +779,6 @@ func TestRunPass_timeoutRemainsFailureAfterParentCancellation(t *testing.T) {
 	}
 	if r.failed != 1 {
 		t.Errorf("failed = %d, want 1", r.failed)
-	}
-	if got := r.exitStatus(); got != 1 {
-		t.Errorf("exitStatus() = %d, want 1", got)
 	}
 	if !rec.HasAttr("sync failed", "timed_out", "true") {
 		t.Errorf("sync failed record missing timed_out=true; logs = %q", rec.Messages())
@@ -795,9 +846,6 @@ func TestRunPass_externalSignalFollowedByCancellationFails(t *testing.T) {
 	}
 	if r.failed != 1 {
 		t.Errorf("failed = %d, want 1", r.failed)
-	}
-	if got := r.exitStatus(); got != 1 {
-		t.Errorf("exitStatus() = %d, want 1", got)
 	}
 	if got := rec.CountLevel(slog.LevelError, "sync failed"); got != 1 {
 		t.Errorf("sync failed ERROR records = %d, want 1; logs = %q", got, rec.Messages())

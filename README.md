@@ -103,7 +103,7 @@ Overlapping passes cannot happen in either mode: the daemon runs passes strictly
 | `CONFIG_PATH` | Path to the YAML config inside the container | `/config/config.yaml` | No |
 | `SYNC_INTERVAL` | Built-in scheduler cadence as a Go duration (e.g. `6h`, `30m`); the first pass runs at startup. Set `off` (or `disabled`/`0`) for external triggering, see [Scheduling modes](#scheduling-modes). Falls back to `6h` on unset or unparseable (non-sentinel) values. | `6h` | No |
 | `SYNC_TIMEOUT` | Per-job rsync timeout as a Go duration (e.g. `10m`, `1h`). Falls back to the default on unset, non-positive, or unparseable values, so `0` does not disable the timeout. | `10m` | No |
-| `LOG_LEVEL` | Log level: `debug`, `info`, `warn`, or `error`. The startup record (`container started`) and the per-pass heartbeat (`sync cycle complete`) are Info records, so `warn` and `error` remove them and disarm the staleness alert below. | `info` | No |
+| `LOG_LEVEL` | Log level: `debug`, `info`, `warn` (or `warning`), or `error`. Values are case-insensitive; surrounding whitespace is ignored. The startup record (`container started`) and the per-pass heartbeat (`sync cycle complete`) are Info records, so `warn` and `error` remove them and disarm the staleness alert below. | `info` | No |
 | `SYNC_ACLS` | `true` adds rsync `-A` (`--acls`). The remote rsync must support ACLs; verify against your target, because a restricted wrapper such as `rrsync` can filter the option set. | `false` | No |
 | `SYNC_XATTRS` | `true` adds rsync `-X` (`--xattrs`). Same remote precondition as `SYNC_ACLS`. | `false` | No |
 | `SYNC_COMPRESS` | Compression: `off` (or `no`/`false`/`0`) disables it; `on` (or `yes`/`true`/`1`/`auto`) adds `-z` and lets rsync negotiate the algorithm; `zstd`, `lz4` or `zlib` adds `-z --compress-choice=<name>`. Name an algorithm only when you know the receiver has it: the remote refuses an algorithm it lacks and EVERY pass then fails. `on` negotiates and is always safe. Any other value logs a warning and leaves compression off. | `off` | No |
@@ -121,8 +121,8 @@ Each entry under `jobs:` takes these keys:
 | `remote_host` | _none_ | Required; `[user@]host` (DNS name, IPv4, or IPv6 literal) |
 | `remote_path` | _none_ | Required; absolute path on the remote |
 | `ssh_key` | _none_ | Required; private key path inside the container |
-| `remote_uid` | _(unset)_ | With `remote_gid`, adds `--chown=uid:gid` |
-| `remote_gid` | _(unset)_ | With `remote_uid`, adds `--chown=uid:gid` |
+| `remote_uid` | _(unset)_ | With `remote_gid`, adds `--chown=uid:gid`; valid range: 0-4294967294 |
+| `remote_gid` | _(unset)_ | With `remote_uid`, adds `--chown=uid:gid`; valid range: 0-4294967294 |
 | `delete` | `false` | Adds `--delete` when `true` |
 | `max_delete` | _(unset)_ | With `delete`, adds `--max-delete=N` (rsync deletes at most N, then skips the rest and FAILS the pass: exit 25, or 24 if a source file also vanished in the same pass; rsync overwrites 25 with 24, and the app identifies the cap from its stderr line; `sync failed`, unhealthy; `0` refuses every deletion and fails the pass whenever anything would have been deleted); unset leaves deletions uncapped |
 | `excludes` | _(unset)_ | Per-job rsync exclude patterns, added to the built-in globals |
@@ -144,7 +144,7 @@ Every job also receives a fixed set of global excludes: `.stfolder`, `.stversion
 
 ## Healthcheck
 
-The built-in healthcheck (`docker-rsync-scheduler health`) checks for a marker file that is set after each sync pass: healthy when the most recent pass had zero failed jobs, unhealthy when any job failed. Empty-source skips count as success. A pass whose rsync ends with the vanished-files warning (exit 24) also counts as success: it logs `level=WARN msg="sync completed with vanished source files"` with the exit code and the byte counts, and leaves the marker healthy. The container recovers automatically on the next clean pass, no restart required. In built-in mode it begins unhealthy and flips after the startup pass, so size `healthcheck.start_period` for the time the initial pass may take (the baked default is 120s); built-in mode also arms a freshness deadline of `2×SYNC_INTERVAL + jobs×SYNC_TIMEOUT`, so a wedged interval loop (marker present but never refreshed) eventually probes unhealthy and is restarted. In external mode the container starts healthy (idle, nothing has failed), each triggered `sync` updates the marker, and no deadline is armed (a marker between sparse triggers must not expire).
+The built-in healthcheck (`docker-rsync-scheduler health`) checks for a marker file that is set after each sync pass: healthy when the most recent pass had zero failed jobs, unhealthy when any job failed. Empty-source skips count as success. A pass whose rsync ends with the vanished-files warning (exit 24) also counts as success: it logs `level=WARN msg="sync completed with vanished source files"` with the exit code and the byte counts, and leaves the marker healthy. The container recovers automatically on the next clean pass, no restart required. In built-in mode it begins unhealthy and flips after the startup pass, so size `healthcheck.start_period` for the time the initial pass may take (the baked default is 120s); built-in mode also arms a freshness deadline of `2×SYNC_INTERVAL + jobs×SYNC_TIMEOUT`, so a wedged interval loop (marker present but never refreshed) eventually probes unhealthy. In external mode the container starts healthy (idle, nothing has failed), each triggered `sync` updates the marker, and no deadline is armed (a marker between sparse triggers must not expire).
 
 > An empty source is skipped as a success, so a job whose source silently becomes empty (for example a read-only bind mount that failed to mount and Docker materialised as an empty directory) keeps the container healthy and never logs at `level=ERROR`; it is invisible to both the error-level and heartbeat-absence alerts. Each skip emits a `level=WARN msg="skip empty source"` line and the `sync cycle complete` heartbeat carries a `skipped` count. Alert on a persistently non-zero `skipped` (or `skipped == jobs`) across several consecutive passes, or on the recurring warning, to catch a vanished source before the remote mirror goes stale.
 
@@ -165,7 +165,7 @@ groups:
       - alert: RsyncSchedulerSyncFailed
         expr: |
           sum by (container) (count_over_time(
-            {container="rsync"} |= `sync failed` [15m]
+            {container="rsync"} |= `msg="sync failed"` [15m]
           )) > 0
         for: 0m
         labels:
@@ -173,11 +173,10 @@ groups:
         annotations:
           summary: "docker-rsync-scheduler failed a sync job"
           description: >
-            A job logged "sync failed": its rsync exited non-zero (an ssh or
-            transport error, a remote-side failure, or a per-job timeout; the
-            line carries rsync_exit, timed_out, and a bounded stderr tail).
-            That job's remote mirror is now stale. Check the remote host, the
-            ssh key, and connectivity.
+            A job logged "sync failed". Rsync failures include rsync_exit,
+            timed_out, and a bounded stderr tail. A source-read failure includes
+            its path and error instead. That job's remote mirror is now stale.
+            Check the source path, remote host, ssh key, and connectivity.
       - alert: RsyncSchedulerStalled
         expr: |
           absent_over_time({container="rsync"} |= `sync cycle complete` [8h])

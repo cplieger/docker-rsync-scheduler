@@ -31,8 +31,7 @@ func newRequest(trig string) *trigger.Job[struct{}] {
 type daemon struct {
 	queue *trigger.Queue[struct{}]
 	// hc owns every health-state write (drain latch, interrupted-clean
-	// carve-out); runDaemon's exit defer also unlinks the marker, safe only
-	// because it runs after <-executorDone.
+	// carve-out); healthController's doc carries the exit-defer exception.
 	hc        *healthController
 	newCmd    scheduler.CommandRunner
 	timeout   time.Duration
@@ -45,17 +44,17 @@ type daemon struct {
 // and — in built-in mode — drives the interval ticker. It expects an already
 // signal-bound context and a configured logger from dispatch. newCmd builds
 // each rsync child (defaultCommandRunner in production; injected by tests).
-// Returning an error exits non-zero. Every error path logs its diagnostic
-// before returning, so dispatch stays silent to avoid a duplicate record.
 func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandRunner) error {
-	// The marker is created and its removal deferred before the first thing that
-	// can fail: /tmp survives a docker restart, so a boot that fails after a crash
-	// must not leave the previous life's healthy marker for the healthcheck.
+	// Clear stale state before the first operation that can fail: /tmp survives a
+	// docker restart, and no mode has proven healthy until markInitial runs below.
 	marker := health.NewMarker(healthMarkerPath)
+	marker.Set(false)
 	defer marker.Cleanup()
 
-	cfg, err := loadConfig()
+	cfg, stage, err := loadConfig()
 	if err != nil {
+		slog.Error("cannot load config", "path", configPath(), "stage", stage, "error", err,
+			"hint", "mount a config.yaml at this path — see config.example.yaml in the repo")
 		return err
 	}
 	timeout := loadSyncTimeout()
@@ -100,7 +99,8 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 	}
 	slog.Info("container started",
 		"mode", mode, "jobs", len(cfg.Jobs), "config", configPath(),
-		"interval", intervalAttr, "ssh_hostkey_mode", hostKeys.String(),
+		"interval", intervalAttr, "timeout", timeout,
+		"ssh_hostkey_mode", hostKeys.String(),
 		"acls", tr.acls, "xattrs", tr.xattrs, "compress", cmp.Or(tr.compress, "off"),
 		"socket", socketPath)
 
@@ -142,7 +142,8 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 // submitted to the queue like any other trigger and waited on (RunLoop is
 // sequential, so ticks can never pile up behind a long pass). Disabled
 // (closed channel returned) in external mode. The library re-checks ctx
-// before each fire, so no fresh tick is submitted after shutdown begins.
+// before each fire; a tick that still races shutdown is cancelled by the
+// executor without running, or skipped once the queue closes (tick logs it).
 func startTicker(ctx context.Context, d *daemon, interval time.Duration, enabled bool) <-chan struct{} {
 	done := make(chan struct{})
 	if !enabled {
@@ -181,12 +182,14 @@ func (d *daemon) tick(trig string) {
 // run performs one request. It reloads the config, which is what makes a
 // config edit take effect on the next trigger without a restart, and runs the
 // pass under the shutdown-cancellable ctx: SIGTERM interrupts an in-flight
-// rsync, and passResult preserves an interrupted clean pass as a clean drain.
+// rsync. An interrupted-clean pass reports OK for the client to map to exit 0,
+// while the health controller leaves the marker unchanged during the drain.
 func (d *daemon) run(ctx context.Context, trig string, _ struct{}) trigger.Outcome {
 	start := time.Now()
 
-	cfg, err := loadConfig()
+	cfg, stage, err := loadConfig()
 	if err != nil {
+		slog.Error("config reload failed", "path", configPath(), "stage", stage, "trigger", trig, "error", err)
 		d.hc.markUnhealthy()
 		return trigger.Outcome{OK: false, Duration: time.Since(start), Reason: "config reload failed"}
 	}
@@ -194,5 +197,9 @@ func (d *daemon) run(ctx context.Context, trig string, _ struct{}) trigger.Outco
 	res := runPass(ctx, cfg, d.timeout, d.transport, trig, d.newCmd)
 	reportPass(&res)
 	d.hc.apply(&res)
-	return trigger.Outcome{OK: res.exitStatus() == 0, Duration: time.Since(start)}
+	out := trigger.Outcome{OK: res.healthy(), Duration: time.Since(start)}
+	if out.OK && res.interrupted {
+		out.Reason = "pass cut short by shutdown; remaining jobs did not run"
+	}
+	return out
 }

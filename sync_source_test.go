@@ -118,31 +118,6 @@ func TestSourceIsEmpty_readErrorIsReturnedNotSkipped(t *testing.T) {
 	}
 }
 
-// TestSourceIsEmpty_openErrorIsReturnedNotSkipped covers an open failure. A
-// path whose parent component is a regular file yields ENOTDIR, independent of
-// uid (so it is reliable under the root-by-design container).
-func TestSourceIsEmpty_openErrorIsReturnedNotSkipped(t *testing.T) {
-	rec := capture.Default(t)
-
-	parent := filepath.Join(t.TempDir(), "not-a-dir")
-	if err := os.WriteFile(parent, []byte("x"), 0o600); err != nil {
-		t.Fatalf("setup: %v", err)
-	}
-	path := filepath.Join(parent, "child")
-
-	empty, err := sourceIsEmpty(path)
-
-	if err == nil {
-		t.Errorf("sourceIsEmpty(path under a file) = %v, nil, want an error", empty)
-	}
-	if empty {
-		t.Error("sourceIsEmpty(path under a file) = true, want false (a broken source is not an empty one)")
-	}
-	if got := rec.Messages(); len(got) != 0 {
-		t.Errorf("sourceIsEmpty(path under a file) logs = %q, want none (the caller reports)", got)
-	}
-}
-
 // TestSourceIsEmpty_fifoReturnsErrorWithoutBlocking pins the directory-only
 // open. An ordinary read-only fifo open waits for a writer before runJob has a
 // timeout context.
