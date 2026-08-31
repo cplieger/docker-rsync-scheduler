@@ -10,17 +10,14 @@ import (
 
 // healthMarkerPath is where the health marker file lives. Docker's
 // HEALTHCHECK re-invokes the binary with the `health` subcommand, which
-// stats this path. /tmp is conventional because read-only containers
-// mount it as tmpfs. The daemon — the single owner of every pass — is the
-// marker's single writer.
+// stats this path. The daemon is the marker's single writer.
 const healthMarkerPath = health.DefaultPath
 
-// probeOptions returns the healthcheck probe's freshness policy. Built-in mode
-// arms a max-age deadline (two intervals plus every job's full SYNC_TIMEOUT) so
-// a marker never refreshed eventually probes unhealthy; external mode stays
-// unbounded, because a marker between sparse triggers must not expire. An
-// unreadable or unparseable config disarms the deadline to prevent a permanent
-// false-unhealthy report.
+// probeOptions returns the healthcheck probe's freshness policy. Built-in
+// mode arms a max-age deadline (two intervals plus every job's SYNC_TIMEOUT)
+// so a marker never refreshed eventually probes unhealthy; external mode
+// stays unbounded since a marker between sparse triggers must not expire. An
+// unreadable or unparseable config disarms the deadline.
 func probeOptions() []health.ProbeOption {
 	interval, scheduleEnabled := loadInterval()
 	if !scheduleEnabled {
@@ -68,13 +65,12 @@ type healthMarker interface {
 	Set(healthy bool)
 }
 
-// healthController owns every health-state write to the marker, funnelled through
-// its mutex, and enforces one invariant the bare marker cannot: once shutdown
-// begins, health is monotonic toward unhealthy — a pass that finishes as the
-// container drains can never flip it back, and an interrupted-clean pass (no job
-// failed) never writes at all. The marker file is also unlinked by runDaemon's exit
-// defer (health.Marker.Cleanup, the same os.Remove) outside this mutex, safe only
-// because that defer runs after <-executorDone.
+// healthController owns every health-state write to the marker. It enforces
+// one invariant the bare marker cannot: once shutdown begins, health is
+// monotonic toward unhealthy — a pass finishing during drain can never flip
+// it back, and an interrupted-clean pass never writes at all. The marker
+// file's own unlink (runDaemon's exit defer) runs outside this mutex, safe
+// only because it happens after <-executorDone.
 type healthController struct {
 	marker   healthMarker
 	mu       sync.Mutex

@@ -9,11 +9,6 @@ import (
 	"github.com/cplieger/scheduler/v4/trigger"
 )
 
-// --- `sync` subcommand: the trigger client ---
-//
-// The library owns the transport (dial, wire order, failure taxonomy); this
-// file owns the wording.
-
 // runClient performs one triggered pass via the daemon at socketPath and
 // returns the process exit code: 0 on success, 1 on failure (including a
 // rejected or cancelled request, or a daemon that cannot be reached).

@@ -12,17 +12,15 @@ import (
 )
 
 // --- Daemon: the single owner of sync execution ---
-//
-// The executor goroutine is the only in-process caller of d.run.
 
-// queueCapacity sizes the trigger broker's FIFO: the realistic trigger
-// set is one periodic job (Ofelia) plus a manual exec, so 16 is generous
-// headroom. Full-queue rejection semantics are trigger.NewQueue's.
+// queueCapacity sizes the trigger broker's FIFO: the realistic trigger set
+// is one periodic job (Ofelia) plus a manual exec, so 16 is generous
+// headroom.
 const queueCapacity = 16
 
 // newRequest builds one queued pass request for the given trigger label
 // (startup, interval, external). A sync pass takes no arguments — the job
-// set comes from the daemon's mounted YAML config — so the payload is empty.
+// set comes from the daemon's mounted YAML config.
 func newRequest(trig string) *trigger.Job[struct{}] {
 	return trigger.NewJob(trig, struct{}{})
 }
@@ -30,8 +28,8 @@ func newRequest(trig string) *trigger.Job[struct{}] {
 // daemon carries the executor's dependencies.
 type daemon struct {
 	queue *trigger.Queue[struct{}]
-	// hc owns every health-state write (drain latch, interrupted-clean
-	// carve-out); healthController's doc carries the exit-defer exception.
+	// hc owns every health-state write; healthController's doc carries the
+	// exit-defer exception.
 	hc        *healthController
 	newCmd    scheduler.CommandRunner
 	timeout   time.Duration
@@ -39,14 +37,13 @@ type daemon struct {
 }
 
 // runDaemon runs the long-running container (the `daemon` subcommand): it
-// fail-fast loads and validates the config, decides the ssh host-key posture,
-// binds the trigger socket, wires the health controller, starts the executor,
-// and — in built-in mode — drives the interval ticker. It expects an already
-// signal-bound context and a configured logger from dispatch. newCmd builds
-// each rsync child (defaultCommandRunner in production; injected by tests).
+// fail-fast loads and validates the config, decides the ssh host-key
+// posture, binds the trigger socket, wires the health controller, starts the
+// executor, and — in built-in mode — drives the interval ticker. It expects
+// an already signal-bound context and a configured logger from dispatch.
 func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandRunner) error {
-	// Clear stale state before the first operation that can fail: /tmp survives a
-	// docker restart, and no mode has proven healthy until markInitial runs below.
+	// Clear stale state before the first operation that can fail: /tmp
+	// survives a docker restart.
 	marker := health.NewMarker(healthMarkerPath)
 	marker.Set(false)
 	defer marker.Cleanup()
@@ -91,8 +88,8 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 		trigger.Execute(ctx, d.queue, d.run)
 	}()
 
-	// Announced before admission opens: the accept loop and the ticker's first
-	// fire log from other goroutines, so the boot record must precede them.
+	// Announced before admission opens, since the accept loop and ticker
+	// fire from other goroutines.
 	mode, intervalAttr := "external", "none"
 	if scheduleEnabled {
 		mode, intervalAttr = "built-in", interval.String()
@@ -104,10 +101,10 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 		"acls", tr.acls, "xattrs", tr.xattrs, "compress", cmp.Or(tr.compress, "off"),
 		"socket", socketPath)
 
-	// The broker owns the wire (decode, event relay, handler draining); the
-	// hook only supplies this app's acceptance log line. The library's
-	// default rejection warn ("trigger request rejected" + reason) already
-	// matches this app's wording, so no OnRejected hook is needed.
+	// The broker owns the wire (decode, event relay, handler draining); this
+	// hook only supplies the acceptance log line. The library's default
+	// rejection warn already matches this app's wording, so no OnRejected
+	// hook is needed.
 	srv := &trigger.Server[struct{}]{
 		Queue:      d.queue,
 		OnAccepted: func(struct{}) { slog.Info("triggered sync queued") },
@@ -119,15 +116,13 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 	<-ctx.Done()
 	slog.Info("shutting down", "cause", context.Cause(ctx))
 	// Latch unhealthy immediately so observers see the drain before the
-	// in-flight pass resolves (it is being SIGTERM'd via ctx and drains under
-	// the runner's grace window; the latch also blocks a late healthy write).
+	// in-flight pass resolves.
 	hc.beginDrain()
 
-	// Stop admission (socket + queue), then wait: the executor delivers the
-	// interrupted in-flight pass's result and cancellation results to
-	// everything still queued; the ticker returns once its waiting tick
-	// request resolves; the server returns once every accepted request has
-	// its final event on the wire.
+	// Stop admission, then wait: the executor delivers the interrupted
+	// in-flight pass's result and cancellation results to everything still
+	// queued; the ticker returns once its waiting tick resolves; the server
+	// returns once every accepted request has its final event on the wire.
 	_ = ln.Close()
 	d.queue.Close()
 	<-executorDone
@@ -137,13 +132,10 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 	return nil
 }
 
-// startTicker runs the built-in interval scheduler: a startup pass that fires
-// immediately for freshness on deploy, then one pass per interval, each
-// submitted to the queue like any other trigger and waited on (RunLoop is
-// sequential, so ticks can never pile up behind a long pass). Disabled
-// (closed channel returned) in external mode. The library re-checks ctx
-// before each fire; a tick that still races shutdown is cancelled by the
-// executor without running, or skipped once the queue closes (tick logs it).
+// startTicker runs the built-in interval scheduler: a startup pass that
+// fires immediately, then one pass per interval, submitted to the queue like
+// any other trigger (RunLoop is sequential, so ticks can never pile up
+// behind a long pass). Disabled (closed channel returned) in external mode.
 func startTicker(ctx context.Context, d *daemon, interval time.Duration, enabled bool) <-chan struct{} {
 	done := make(chan struct{})
 	if !enabled {
@@ -164,12 +156,9 @@ func startTicker(ctx context.Context, d *daemon, interval time.Duration, enabled
 	return done
 }
 
-// tick submits one scheduled pass and waits for its result (the executor
-// writes the health marker; the queue guarantees exactly one result per
-// accepted request, including a cancellation result at shutdown, so this
-// wait always resolves). A rejected submission — the queue full of external
-// requests, or shutdown racing the tick — is logged and skipped: the next
-// interval provides freshness.
+// tick submits one scheduled pass and waits for its result. A rejected
+// submission (queue full, or shutdown racing the tick) is logged and
+// skipped: the next interval provides freshness.
 func (d *daemon) tick(trig string) {
 	r := newRequest(trig)
 	if err := d.queue.Submit(r); err != nil {
@@ -179,11 +168,10 @@ func (d *daemon) tick(trig string) {
 	<-r.Result()
 }
 
-// run performs one request. It reloads the config, which is what makes a
-// config edit take effect on the next trigger without a restart, and runs the
-// pass under the shutdown-cancellable ctx: SIGTERM interrupts an in-flight
-// rsync. An interrupted-clean pass reports OK for the client to map to exit 0,
-// while the health controller leaves the marker unchanged during the drain.
+// run performs one request. It reloads the config on every call, so a config
+// edit takes effect on the next trigger without a restart, and runs the pass
+// under the shutdown-cancellable ctx: SIGTERM interrupts an in-flight rsync.
+// An interrupted-clean pass reports OK for the client to map to exit 0.
 func (d *daemon) run(ctx context.Context, trig string, _ struct{}) trigger.Outcome {
 	start := time.Now()
 

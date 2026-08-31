@@ -1,29 +1,18 @@
 #!/bin/sh
 # Build-time smoke test for docker-rsync-scheduler's rsync payload.
 #
-# Runs in the Dockerfile `test` stage, so the centralized `ci / validate`
-# docker build-ability gate executes it on every PR and push (the final image
-# stage depends on this stage's marker). Catches a broken rsync source build:
-# `rsync --version` exercises the dynamic linker against the runtime stage's
-# apk-installed libraries (a missing or misnamed lib package fails here), the
-# version line is asserted against the pinned upstream release, and the
-# feature set is asserted to keep parity with the Alpine package the source
-# build replaced. The ssh transport (openssh-client, deliberately still an
-# apk package) is asserted present alongside, as is the embedded CycloneDX
-# SBOM fragment that keeps the source-built rsync visible to the signed
-# release SBOM. A real --max-delete run pins the verbatim stderr line sync.go's
-# exit-24 classifier keys on, so an upstream rewording fails the build instead
-# of silently reporting a tripped deletion cap as a clean pass.
+# Runs in the Dockerfile `test` stage; the final image stage depends on this
+# stage's marker.
 #
 # Run locally:  sh tests/smoke.sh   (needs rsync + ssh on PATH)
 set -eu
 
 fail=0
-log() { printf '%s\n' "$*"; }     # progress + final verdict -> stdout
-err() { printf '%s\n' "$*" >&2; } # failures + captured output -> stderr
+log() { printf '%s\n' "$*"; }
+err() { printf '%s\n' "$*" >&2; }
 
-# 1. rsync runs and reports a version. Proves the built binary executes and
-#    every shared library it links resolves in the runtime image.
+# Proves the built binary executes and every shared library it links
+# resolves in the runtime image.
 if ! ver_out=$(rsync --version 2>&1); then
   err "FAIL: 'rsync --version' failed to run"
   err "$ver_out"
@@ -31,11 +20,9 @@ if ! ver_out=$(rsync --version 2>&1); then
   exit "$fail"
 fi
 
-# 2. Version assertion: the built binary reports exactly the pinned upstream
-#    version (RSYNC_EXPECTED_VERSION, passed by the Dockerfile test stage from
-#    ARG RSYNC_VERSION; a leading "v" is stripped here). Unset means a plain
-#    local run: the check is skipped. The Dockerfile guards the ARG with :?
-#    so the in-image gate can never silently skip.
+# Version assertion against the pinned upstream release (RSYNC_EXPECTED_VERSION,
+# set by the Dockerfile test stage from ARG RSYNC_VERSION; unset skips the check
+# on a plain local run).
 if [ -n "${RSYNC_EXPECTED_VERSION:-}" ]; then
   expected=${RSYNC_EXPECTED_VERSION#v}
   first_line=$(printf '%s\n' "$ver_out" | head -n 1)
@@ -49,13 +36,10 @@ if [ -n "${RSYNC_EXPECTED_VERSION:-}" ]; then
   esac
 fi
 
-# 3. Feature parity with the Alpine package the source build replaced: ACL and
-#    xattr support (rsync -A/-X), the xxhash checksum family, and zstd + lz4
-#    compression must all be compiled in. A dropped configure flag or a
-#    missing -dev build dep surfaces here, not in production. rsync prints
-#    DISABLED capabilities with a "no " prefix ("no ACLs", "no xattrs"), which
-#    a bare substring match would still match — so the negated form is
-#    rejected first, before the positive match can see it.
+# Feature parity with the Alpine package the source build replaced (ACLs,
+# xattrs, xxhash, zstd, lz4). rsync prints disabled features with a "no "
+# prefix, which a bare substring match would still match, so the negated form
+# is rejected first.
 for feature in ACLs xattrs xxhash zstd lz4; do
   case "$ver_out" in
     *"no $feature"*)
@@ -72,13 +56,9 @@ for feature in ACLs xattrs xxhash zstd lz4; do
   esac
 done
 
-# 4. --max-delete diagnostic contract: sync.go's exit-24 classifier keys on
-#    rsyncDelLimitWarn, the verbatim stderr line below, to tell "only files
-#    vanished" (a healthy pass) from "the deletion cap also tripped" (a failed
-#    one) -- rsync assigns 24 AFTER status 25, so that line is the only
-#    surviving witness. A reworded upstream message makes a tripped
-#    --max-delete report as a clean healthy pass, so pin the behaviour with a
-#    real local run. Needs no ssh and no network.
+# sync.go's exit-24 classifier keys on rsyncDelLimitWarn, the verbatim stderr
+# line asserted below (rsync assigns 24 after status 25, so this line is the
+# only surviving witness that the cap tripped vs. files merely vanishing).
 del_dir=$(mktemp -d)
 mkdir -p "$del_dir/src" "$del_dir/dst"
 printf 'a' >"$del_dir/src/a"
@@ -95,8 +75,8 @@ if rsync -rlptD "$del_dir/src/" "$del_dir/dst/" >/dev/null 2>&1; then
     *"Deletions stopped due to --max-delete limit"*) ;;
     *)
       err "FAIL: rsync no longer prints 'Deletions stopped due to --max-delete limit' on a tripped cap."
-      err "      sync.go's rsyncDelLimitWarn constant is that exact string, and its exit-24 classifier"
-      err "      keys on it; without the line a tripped --max-delete reports as a clean healthy pass."
+      err "      sync.go's rsyncDelLimitWarn constant is that exact string; without it a tripped"
+      err "      --max-delete reports as a clean healthy pass."
       err "$del_out"
       fail=1
       ;;
@@ -107,22 +87,18 @@ else
 fi
 rm -rf "$del_dir"
 
-# 5. The ssh transport is present (openssh-client stays an apk package; every
-#    job runs rsync -e ssh).
+# The ssh transport is present (openssh-client stays an apk package; every
+# job runs rsync -e ssh).
 if ! command -v ssh >/dev/null 2>&1; then
   err "FAIL: ssh not found on PATH (openssh-client missing)"
   fail=1
 fi
 
-# 6. Embedded SBOM fragment (Dockerfile rsync-builder stage): the CycloneDX
-#    file covering the source-built rsync must ship in the image, be
-#    JSON-shaped, and name rsync at exactly the pinned version (the release
-#    pipeline's sbom-cataloger inventories it — without it the source-built
-#    rsync is invisible to the signed release SBOM). Gated on
-#    RSYNC_EXPECTED_VERSION like section 2: set in-image by the test stage
-#    (:?-guarded, never skipped there), unset on a plain local run where
-#    /usr/share/sbom does not exist. BusyBox has no jq, so assert shape with
-#    head/tail/grep: non-empty, starts with { and ends with }.
+# Embedded CycloneDX SBOM fragment for the source-built rsync (Dockerfile
+# rsync-builder stage) must be present, JSON-shaped, and name rsync at the
+# pinned version — without it the source-built rsync is invisible to the
+# signed release SBOM. Gated on RSYNC_EXPECTED_VERSION like above. BusyBox has
+# no jq, so shape is asserted with head/tail/grep.
 if [ -n "${RSYNC_EXPECTED_VERSION:-}" ]; then
   SBOM=/usr/share/sbom/rsync-scheduler.cdx.json
   expected=${RSYNC_EXPECTED_VERSION#v}
@@ -146,13 +122,10 @@ if [ -n "${RSYNC_EXPECTED_VERSION:-}" ]; then
   fi
 fi
 
-# 7. --stats label contract: the Go scheduler's parseStats (sync.go) matches
-#    "Number of regular files transferred:" and the transferred-size labels in
-#    rsync --stats output. Older rsyncs used a different label ("Number of
-#    files transferred:"), and a future major could rename again — which would
-#    silently zero the parsed files/bytes stats without failing any sync. Pin
-#    the coupling here at build time with a real local transfer against the
-#    built binary, so a label drift fails the image build instead.
+# sync.go's parseStats matches "Number of regular files transferred:" and the
+# transferred-size label in rsync --stats output; a future rsync major
+# renaming these would silently zero the parsed stats without failing any
+# sync, so pin the labels here at build time.
 stats_dir=$(mktemp -d)
 mkdir -p "$stats_dir/src" "$stats_dir/dst"
 printf 'x' >"$stats_dir/src/f"

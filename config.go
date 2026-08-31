@@ -80,27 +80,23 @@ var userRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 // hostnameRE matches a DNS hostname (alphanumerics, dots, underscores, and
 // hyphens). IPv4/IPv6 literals are validated separately via net.ParseIP, so a
-// colon is deliberately absent here: a colon in a non-literal host is the
-// daemon-mode "::" hazard that rsync's host:path parser would misread.
+// colon is absent here: a colon in a non-literal host is rsync's daemon-mode
+// "::" hazard.
 var hostnameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 // shellMetaChars are the characters a shell reads as separators or
-// substitutions. Only remote_path is held to them: its value becomes
-// rsync's destination argument, which the REMOTE login shell parses.
-// rsync escapes these in that argument by default, so the refusal is
-// insurance against a layer this app does not own -- --old-args and
-// RSYNC_OLD_ARGS turn that escaping off. Globs (* ? [ ]) are absent
-// because rsync never escapes them: remote_path is refused those
-// separately below, and exclude patterns stay expressible.
+// substitutions. Only remote_path is held to them: it becomes rsync's
+// destination argument, parsed by the REMOTE login shell. rsync escapes
+// these by default, so this refusal is insurance against a layer this app
+// does not own. Globs (* ? [ ]) are absent because rsync never escapes them
+// — remote_path is refused those separately below.
 const shellMetaChars = ";|&$`<>(){}\\\"'"
 
-// hasControl reports whether s contains an ASCII control character (C0
-// or DEL). Three have measured consequences: NUL cannot be represented
-// in an argv element at all, a newline in an exclude makes rsync read
-// the rule as one unmatchable pattern -- it exits 0 having excluded
-// nothing, so --delete pushes the file that was meant to stay -- and
-// DEL reaches the log stream unescaped. The rest cost nothing to refuse
-// alongside them. C1 (U+0080-U+009F) is out: those decode from a quoted
+// hasControl reports whether s contains an ASCII control character (C0 or
+// DEL). NUL cannot be represented in an argv element; a newline in an
+// exclude makes rsync read the rule as one unmatchable pattern, excluding
+// nothing (so --delete pushes the file meant to stay); DEL reaches the log
+// stream unescaped. C1 (U+0080-U+009F) is out: those decode from a quoted
 // YAML scalar as ordinary text.
 func hasControl(s string) bool {
 	for _, r := range s {
@@ -117,12 +113,10 @@ func hasShellMeta(s string) bool {
 	return hasControl(s) || strings.ContainsAny(s, shellMetaChars)
 }
 
-// setupLogger installs a slog text handler that emits canonical logfmt
-// (`time=... level=... msg=... k=v`) to stderr for Loki/Alloy collection.
+// setupLogger installs a slog text handler that emits canonical logfmt to
+// stderr for Loki/Alloy collection.
 func setupLogger() {
 	raw := envx.String("LOG_LEVEL")
-	// Match explicit spellings, accepting "warning" as an alias for "warn".
-	// Unsupported slog offset syntax such as "info+4" falls back to info with a warning.
 	var level slog.Level // LevelInfo is the zero value
 	recognized := true
 	switch strings.ToLower(strings.TrimSpace(raw)) {
@@ -169,11 +163,10 @@ func loadConfig() (config, string, error) {
 	return cfg, "", nil
 }
 
-// readCappedConfig reads path, refusing a non-regular file and any
-// document over configCapBytes. A nonblocking open prevents a FIFO wait, and
-// the kind check and read use the same descriptor. The size bound is enforced
-// on the bytes read because a regular file can grow after it is opened. The +1
-// makes "exceeds" decidable once the app has stopped reading.
+// readCappedConfig reads path, refusing a non-regular file and any document
+// over configCapBytes. A nonblocking open prevents a FIFO wait. The size
+// bound is enforced on the bytes read, since a regular file can grow after
+// it is opened; the +1 makes "exceeds" decidable.
 func readCappedConfig(path string) ([]byte, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0) // #nosec G304 -- trusted, operator-mounted config path
 	if err != nil {
@@ -200,8 +193,7 @@ func readCappedConfig(path string) ([]byte, error) {
 // parseConfig unmarshals raw YAML into a config without validating it. Kept
 // separate from validate so fuzz and property tests can drive the parser on
 // arbitrary bytes with no ssh key on disk. yamlenv's CheckSingleDocument and
-// CheckUnknownKeys run first and own the fail-loud contract; they read the raw
-// bytes because this app expands nothing, so what is on disk is what decodes.
+// CheckUnknownKeys read the raw bytes first, since this app expands nothing.
 func parseConfig(data []byte) (config, error) {
 	if err := yamlenv.CheckSingleDocument(data); err != nil {
 		return config{}, fmt.Errorf("parse config: %w", err)
@@ -259,14 +251,14 @@ type destJob struct {
 
 // warnSharedDestinations warns when jobs address one remote tree and any of
 // them deletes: --delete then removes whatever the others put there, every
-// pass, and the per-job empty-source guard cannot see it because the deletion
+// pass, and the per-job empty-source guard cannot see it since the deletion
 // is not per-job. Advisory, not an error: an exclude rule can protect the
-// receiver, so an overlapping set CAN be correct. Identity is host+path: IP
-// literals are compared as parsed addresses, multi-label DNS names are
+// receiver, so an overlapping set can be correct. Identity is host+path: IP
+// literals compare as parsed addresses, multi-label DNS names are
 // case-folded and normalized across a trailing root dot, and other names use
-// their raw case-folded spelling. The ssh keys are reported rather than
-// compared, because a path-rooting wrapper on one of them is what makes a
-// flagged set safe. One record per tree, never one per pair.
+// their raw case-folded spelling. Ssh keys are reported rather than
+// compared, since a path-rooting wrapper on one is what can make a flagged
+// set safe.
 func warnSharedDestinations(jobs []job) {
 	groups := make(map[string][]destJob, len(jobs))
 	for i := range jobs {
@@ -296,10 +288,9 @@ func warnSharedDestinations(jobs []job) {
 	}
 }
 
-// overlapComponents partitions one host's jobs into sets closed under "equal or
-// nested". It grows each set pairwise with the containment helper this file
-// already owns, because a sorted single-pass scan is unsound at this app's
-// input set: a sibling prefix sorts between an ancestor and its descendant, so
+// overlapComponents partitions one host's jobs into sets closed under "equal
+// or nested". It grows each set pairwise rather than a sorted single pass,
+// because a sibling prefix sorts between an ancestor and its descendant, so
 // {/data, /data-old, /data/x} would hide that /data contains /data/x.
 func overlapComponents(group []destJob) [][]destJob {
 	var components [][]destJob
@@ -340,10 +331,9 @@ func overlapsAny(members []destJob, path string) bool {
 }
 
 // warnConflictingTree emits one advisory per overlap component, listing only
-// members reachable by a deleting job's subtree; siblings connected only through
-// a non-deleting ancestor are excluded. Deleters and shortest-path-first member
-// samples are capped at three so a thousand mutually overlapping jobs still
-// cost one bounded record. Single-member and non-deleting components stay silent.
+// members reachable by a deleting job's subtree. Deleters and sample members
+// are capped at three so many mutually overlapping jobs still cost one
+// bounded record.
 func warnConflictingTree(members []destJob) {
 	const sampleSize = 3
 	if len(members) < 2 {
@@ -385,11 +375,9 @@ func warnConflictingTree(members []destJob) {
 }
 
 // validate enforces one job's field contract: required fields present,
-// absolute local/remote paths, a sane remote host, no injection characters
-// anywhere, and a readable ssh key file. Name presence and cross-job uniqueness
-// are enforced by (config).validate. The per-concern checks live in helpers
-// (checkRequiredFields, checkNoForbiddenChars) so this stays readable and
-// under the complexity threshold.
+// absolute local/remote paths, a sane remote host, no injection characters,
+// and a readable ssh key file. Name presence and cross-job uniqueness are
+// enforced by (config).validate.
 func (j *job) validate() error {
 	if err := j.checkRequiredFields(); err != nil {
 		return err
@@ -413,8 +401,8 @@ func (j *job) validate() error {
 		return fmt.Errorf("job %q: ssh_key %q not readable: %w", j.Name, j.SSHKey, err)
 	}
 
-	// 0 already means "allow no deletions" (measured: rsync applies -1 the same
-	// way), so the config publishes one spelling; unset leaves the pass uncapped.
+	// 0 already means "allow no deletions" (rsync applies -1 the same way),
+	// so the config publishes one spelling; unset leaves the pass uncapped.
 	if j.MaxDelete != nil && *j.MaxDelete < 0 {
 		return fmt.Errorf("job %q: max_delete must be >= 0", j.Name)
 	}
@@ -425,9 +413,8 @@ func (j *job) validate() error {
 }
 
 // checkRequiredFields owns the "<field> is required" message for the four
-// always-required string fields. A field added here also needs its own refusal
-// downstream, since presence is all this check judges. (Name presence is
-// enforced by (config).validate, which holds the job index for its message.)
+// always-required string fields. (Name presence is enforced by
+// (config).validate, which holds the job index for its message.)
 func (j *job) checkRequiredFields() error {
 	if j.Local == "" {
 		return fmt.Errorf("job %q: local is required", j.Name)
@@ -490,22 +477,18 @@ func (j *job) checkNoForbiddenChars() error {
 
 // warnInertSettings logs advisory warnings for job fields that are accepted
 // but silently inert in the current configuration: a max_delete cap without
-// delete:true, or a lone remote_uid/remote_gid. Neither is an error -- the job
-// still runs -- so these stay out of validate's error path (and keep validate
-// under the gocyclo complexity threshold).
+// delete:true, or a lone remote_uid/remote_gid. Neither is an error, so
+// these stay out of validate's error path.
 func (j *job) warnInertSettings() {
 	// max_delete only takes effect with delete:true -- buildRsyncArgs emits
-	// --max-delete inside the --delete branch, so a cap set without delete is
-	// silently inert. Warn so the operator notices, mirroring the
-	// remote_uid/remote_gid pairing warning below.
+	// --max-delete inside the --delete branch.
 	if j.MaxDelete != nil && !j.Delete {
 		slog.Warn("max_delete set without delete:true; the cap will be ignored",
 			"job", j.Name)
 	}
 
 	// buildRsyncArgs emits --chown only when BOTH remote_uid and remote_gid
-	// are set, so a lone uid or gid is silently dropped and the remote keeps
-	// the ssh user's ownership. Warn so the operator notices.
+	// are set, so a lone uid or gid is silently dropped.
 	if (j.RemoteUID == nil) != (j.RemoteGID == nil) {
 		slog.Warn("remote_uid/remote_gid set without its pair; --chown will be skipped",
 			"job", j.Name,
@@ -570,11 +553,9 @@ func remoteDest(j *job) string {
 	return host + ":" + j.RemotePath + "/"
 }
 
-// checkReadable confirms path names a regular file that can be opened
-// for reading. The kind check is the ssh_key contract: a directory or
-// a device opens successfully and can never be a private key, and in
-// external mode ssh's own complaint waits for the operator's next
-// trigger, which this app cannot bound.
+// checkReadable confirms path names a regular file that can be opened for
+// reading. A directory or device opens successfully and can never be a
+// private key.
 func checkReadable(path string) error {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0) // #nosec G304 -- trusted, operator-mounted key path
 	if err != nil {
@@ -592,10 +573,9 @@ func checkReadable(path string) error {
 }
 
 // loadSyncTimeout reads SYNC_TIMEOUT (a Go duration) and falls back to
-// defaultSyncTimeout on unset or unparseable values (envx.Duration warns on
-// malformed input), logging a warning rather than refusing to start. The
-// positive-only rule stays app-side: a zero or negative timeout would break
-// every rsync context.
+// defaultSyncTimeout on unset or unparseable values, logging a warning
+// rather than refusing to start. The positive-only rule stays app-side: a
+// zero or negative timeout would break every rsync context.
 func loadSyncTimeout() time.Duration {
 	d := envx.Duration("SYNC_TIMEOUT", defaultSyncTimeout)
 	if d <= 0 {
