@@ -496,16 +496,17 @@ func (j *job) checkNoForbiddenChars() error {
 // transfer.
 func (j *job) checkOwnership() error {
 	for _, f := range []struct {
-		key string
 		val *uint32
+		key string
 	}{
-		{"remote_uid", j.RemoteUID},
-		{"remote_gid", j.RemoteGID},
+		{val: j.RemoteUID, key: "remote_uid"},
+		{val: j.RemoteGID, key: "remote_gid"},
 	} {
 		if f.val != nil && *f.val == math.MaxUint32 {
 			return fmt.Errorf(
 				"job %q: %s %d means \"leave unchanged\" to chown (-1 as an unsigned id), "+
-					"which rsync refuses; omit the field instead", j.Name, f.key, *f.val)
+					"which rsync refuses; omit the field instead", j.Name, f.key, *f.val,
+			)
 		}
 	}
 	return nil
@@ -653,6 +654,8 @@ func loadSyncTimeout() time.Duration {
 	return d
 }
 
+const compressionAuto = "auto"
+
 // loadTransport reads the opt-in rsync transport switches (SYNC_ACLS,
 // SYNC_XATTRS, SYNC_COMPRESS) and combines them with the boot-decided
 // host-key posture. Every switch defaults off, so an unset environment
@@ -667,8 +670,8 @@ func loadTransport(hostKeys hostKeyMode) transport {
 	raw := envx.String("SYNC_COMPRESS")
 	switch v := strings.ToLower(strings.TrimSpace(raw)); v {
 	case "", "off", "disabled", "no", "false", "0":
-	case "on", "yes", "true", "1", "auto":
-		tr.compress = "auto"
+	case "on", "yes", "true", "1", compressionAuto:
+		tr.compress = compressionAuto
 	case "zstd", "lz4", "zlib":
 		tr.compress = v
 	default:

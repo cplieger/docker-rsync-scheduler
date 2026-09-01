@@ -188,7 +188,7 @@ func buildRsyncArgs(j *job, tr transport) []string {
 	}
 	if tr.compress != "" {
 		args = append(args, "-z")
-		if tr.compress != "auto" {
+		if tr.compress != compressionAuto {
 			args = append(args, "--compress-choice="+tr.compress)
 		}
 	}

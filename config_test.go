@@ -1497,7 +1497,7 @@ func TestValidate_sharedDestinationsSampleIsOutermostFirst(t *testing.T) {
 	if rootIndex < 0 || firstIndex < 0 || secondIndex < 0 {
 		t.Fatalf("adviseConfig() outermost_first = %q, want root, lexical-first, and lexical-second", got)
 	}
-	if !(rootIndex < firstIndex && firstIndex < secondIndex) {
+	if rootIndex >= firstIndex || firstIndex >= secondIndex {
 		t.Errorf("adviseConfig() outermost_first = %q, want root then lexical-first then lexical-second", got)
 	}
 	if strings.Contains(got, "deepest at /a/deep/path (") {

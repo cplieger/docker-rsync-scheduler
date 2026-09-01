@@ -32,8 +32,8 @@ type daemon struct {
 	// ordered boot-clear and exit-cleanup exceptions.
 	hc        *healthController
 	newCmd    scheduler.CommandRunner
-	timeout   time.Duration
 	transport transport
+	timeout   time.Duration
 	// Written at construction, then read and written only by the executor.
 	advised [32]byte
 }
