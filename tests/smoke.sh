@@ -1,27 +1,18 @@
 #!/bin/sh
 # Build-time smoke test for docker-rsync-scheduler's rsync payload.
 #
-# Runs in the Dockerfile `test` stage, so the centralized `ci / validate`
-# docker build-ability gate executes it on every PR and push (the final image
-# stage depends on this stage's marker). Catches a broken rsync source build:
-# `rsync --version` exercises the dynamic linker against the runtime stage's
-# apk-installed libraries (a missing or misnamed lib package fails here), the
-# version line is asserted against the pinned upstream release, and the
-# feature set is asserted to keep parity with the Alpine package the source
-# build replaced. The ssh transport (openssh-client, deliberately still an
-# apk package) is asserted present alongside, as is the embedded CycloneDX
-# SBOM fragment that keeps the source-built rsync visible to the signed
-# release SBOM.
+# Runs in the Dockerfile `test` stage; the final image stage depends on this
+# stage's marker.
 #
 # Run locally:  sh tests/smoke.sh   (needs rsync + ssh on PATH)
 set -eu
 
 fail=0
-log() { printf '%s\n' "$*"; }     # progress + final verdict -> stdout
-err() { printf '%s\n' "$*" >&2; } # failures + captured output -> stderr
+log() { printf '%s\n' "$*"; }
+err() { printf '%s\n' "$*" >&2; }
 
-# 1. rsync runs and reports a version. Proves the built binary executes and
-#    every shared library it links resolves in the runtime image.
+# Proves the built binary executes and every shared library it links
+# resolves in the runtime image.
 if ! ver_out=$(rsync --version 2>&1); then
   err "FAIL: 'rsync --version' failed to run"
   err "$ver_out"
@@ -29,11 +20,9 @@ if ! ver_out=$(rsync --version 2>&1); then
   exit "$fail"
 fi
 
-# 2. Version assertion: the built binary reports exactly the pinned upstream
-#    version (RSYNC_EXPECTED_VERSION, passed by the Dockerfile test stage from
-#    ARG RSYNC_VERSION; a leading "v" is stripped here). Unset means a plain
-#    local run: the check is skipped. The Dockerfile guards the ARG with :?
-#    so the in-image gate can never silently skip.
+# Version assertion against the pinned upstream release (RSYNC_EXPECTED_VERSION,
+# set by the Dockerfile test stage from ARG RSYNC_VERSION; unset skips the check
+# on a plain local run).
 if [ -n "${RSYNC_EXPECTED_VERSION:-}" ]; then
   expected=${RSYNC_EXPECTED_VERSION#v}
   first_line=$(printf '%s\n' "$ver_out" | head -n 1)
@@ -47,13 +36,10 @@ if [ -n "${RSYNC_EXPECTED_VERSION:-}" ]; then
   esac
 fi
 
-# 3. Feature parity with the Alpine package the source build replaced: ACL and
-#    xattr support (rsync -A/-X), the xxhash checksum family, and zstd + lz4
-#    compression must all be compiled in. A dropped configure flag or a
-#    missing -dev build dep surfaces here, not in production. rsync prints
-#    DISABLED capabilities with a "no " prefix ("no ACLs", "no xattrs"), which
-#    a bare substring match would still match — so the negated form is
-#    rejected first, before the positive match can see it.
+# Feature parity with the Alpine package the source build replaced (ACLs,
+# xattrs, xxhash, zstd, lz4). rsync prints disabled features with a "no "
+# prefix, which a bare substring match would still match, so the negated form
+# is rejected first.
 for feature in ACLs xattrs xxhash zstd lz4; do
   case "$ver_out" in
     *"no $feature"*)
@@ -70,22 +56,46 @@ for feature in ACLs xattrs xxhash zstd lz4; do
   esac
 done
 
-# 4. The ssh transport is present (openssh-client stays an apk package; every
-#    job runs rsync -e ssh).
+# sync.go's exit-24 classifier keys on rsyncDelLimitWarn, the verbatim stderr
+# line asserted below (rsync assigns 24 after status 25, so this line is the
+# only surviving witness that the cap tripped vs. files merely vanishing).
+del_dir=$(mktemp -d)
+mkdir -p "$del_dir/src" "$del_dir/dst"
+printf 'a' >"$del_dir/src/a"
+printf 'b' >"$del_dir/src/b"
+if rsync -rlptD "$del_dir/src/" "$del_dir/dst/" >/dev/null 2>&1; then
+  rm -f "$del_dir/src/a" "$del_dir/src/b"
+  del_out=$(rsync -rlptD --delete --max-delete=1 "$del_dir/src/" "$del_dir/dst/" 2>&1) && del_rc=0 || del_rc=$?
+  if [ "$del_rc" -eq 0 ]; then
+    err "FAIL: 'rsync --delete --max-delete=1' succeeded with the cap tripped (sync.go's exit-24 classifier expects a failure)"
+    err "$del_out"
+    fail=1
+  fi
+  if ! printf '%s\n' "$del_out" | grep -q '^Deletions stopped due to --max-delete limit'; then
+    err "FAIL: rsync no longer prints 'Deletions stopped due to --max-delete limit' on a tripped cap."
+    err "      sync.go's rsyncDelLimitWarn constant is that exact string; without it a tripped"
+    err "      --max-delete reports as a clean healthy pass."
+    err "$del_out"
+    fail=1
+  fi
+else
+  err "FAIL: local rsync seed transfer for the --max-delete check failed"
+  fail=1
+fi
+rm -rf "$del_dir"
+
+# The ssh transport is present (openssh-client stays an apk package; every
+# job runs rsync -e ssh).
 if ! command -v ssh >/dev/null 2>&1; then
   err "FAIL: ssh not found on PATH (openssh-client missing)"
   fail=1
 fi
 
-# 5. Embedded SBOM fragment (Dockerfile rsync-builder stage): the CycloneDX
-#    file covering the source-built rsync must ship in the image, be
-#    JSON-shaped, and name rsync at exactly the pinned version (the release
-#    pipeline's sbom-cataloger inventories it — without it the source-built
-#    rsync is invisible to the signed release SBOM). Gated on
-#    RSYNC_EXPECTED_VERSION like section 2: set in-image by the test stage
-#    (:?-guarded, never skipped there), unset on a plain local run where
-#    /usr/share/sbom does not exist. BusyBox has no jq, so assert shape with
-#    head/tail/grep: non-empty, starts with { and ends with }.
+# Embedded CycloneDX SBOM fragment for the source-built rsync (Dockerfile
+# rsync-builder stage) must be present, JSON-shaped, and name rsync at the
+# pinned version — without it the source-built rsync is invisible to the
+# signed release SBOM. Gated on RSYNC_EXPECTED_VERSION like above. BusyBox has
+# no jq, so shape is asserted with head/tail/grep.
 if [ -n "${RSYNC_EXPECTED_VERSION:-}" ]; then
   SBOM=/usr/share/sbom/rsync-scheduler.cdx.json
   expected=${RSYNC_EXPECTED_VERSION#v}
@@ -109,27 +119,34 @@ if [ -n "${RSYNC_EXPECTED_VERSION:-}" ]; then
   fi
 fi
 
-# 6. --stats label contract: the Go scheduler's parseStats (sync.go) matches
-#    "Number of regular files transferred:" and the transferred-size labels in
-#    rsync --stats output. Older rsyncs used a different label ("Number of
-#    files transferred:"), and a future major could rename again — which would
-#    silently zero the parsed files/bytes stats without failing any sync. Pin
-#    the coupling here at build time with a real local transfer against the
-#    built binary, so a label drift fails the image build instead.
+# sync.go's parseStats reads three labels out of rsync --stats output, each
+# as the label followed by digits, so a rename OR a reformatted value zeroes
+# a stat without failing any sync. --delete makes the deletion count
+# non-zero: the "0" form carries no "(reg: N)" suffix, which the real one does.
 stats_dir=$(mktemp -d)
 mkdir -p "$stats_dir/src" "$stats_dir/dst"
 printf 'x' >"$stats_dir/src/f"
-if stats_out=$(rsync -rlptD --stats "$stats_dir/src/" "$stats_dir/dst/" 2>&1); then
-  for label in "Number of regular files transferred:" "Total transferred file size:"; do
-    case "$stats_out" in
-      *"$label"*) ;;
-      *)
-        err "FAIL: rsync --stats output missing label: '$label' (the scheduler's stats parser depends on it)"
-        err "$stats_out"
-        fail=1
-        ;;
-    esac
+printf 'y' >"$stats_dir/dst/gone"
+if stats_out=$(rsync -rlptD --delete --stats "$stats_dir/src/" "$stats_dir/dst/" 2>&1); then
+  for label in "Number of regular files transferred:" \
+    "Total transferred file size:" \
+    "Number of deleted files:"; do
+    printf '%s\n' "$stats_out" | grep -q "^${label}[[:space:]]*[0-9]" || {
+      err "FAIL: rsync --stats has no parseable value for '$label' (the scheduler's stats parser depends on it)"
+      err "$stats_out"
+      fail=1
+    }
   done
+  # The parsed number must be the deletion count: a "deleted files: 0 (reg: 1)"
+  # shape would parse as 0 with the label intact.
+  case "$stats_out" in
+    *"Number of deleted files: 1"*) ;;
+    *)
+      err "FAIL: rsync --stats did not report the single receiver-side deletion"
+      err "$stats_out"
+      fail=1
+      ;;
+  esac
 else
   err "FAIL: local rsync --stats transfer failed"
   err "$stats_out"

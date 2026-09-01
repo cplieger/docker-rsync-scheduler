@@ -21,12 +21,6 @@ func FuzzParseConfig(f *testing.F) {
 	})
 }
 
-// FuzzHasShellMeta asserts that hasShellMeta agrees with an independent
-// oracle over coverage-guided input: a string is unsafe iff it contains a
-// control character (< 0x20 or 0x7f) or any shell metacharacter. This
-// strengthens the previous crash-only target so the security gate's
-// detection invariant accumulates a persistent corpus, complementing the
-// every-PR rapid property test.
 func FuzzHasShellMeta(f *testing.F) {
 	f.Add("/sources/caddy")
 	f.Add("root@host")
@@ -59,9 +53,6 @@ func TestProperty_ParseConfigNeverPanics(t *testing.T) {
 	})
 }
 
-// TestProperty_HasShellMetaTotal confirms hasShellMeta is total over
-// arbitrary strings and that any string containing a known injection
-// character is rejected.
 func TestProperty_HasShellMetaTotal(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		s := rapid.String().Draw(rt, "s")

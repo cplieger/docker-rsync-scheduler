@@ -28,11 +28,9 @@ func fixedRunner(bin string) scheduler.CommandRunner {
 	}
 }
 
-// recordingRunner is fixedRunner with a test handle, for call sites that read
-// better with the t argument (parity with the sibling scheduler's suite).
-func recordingRunner(t *testing.T, bin string) scheduler.CommandRunner {
+func newTestHealth(t *testing.T) *health.Latch {
 	t.Helper()
-	return fixedRunner(bin)
+	return health.NewLatch(health.NewMarker(filepath.Join(t.TempDir(), "marker")))
 }
 
 // newTestDaemon builds a daemon wired to a temp health marker and the given
@@ -47,7 +45,7 @@ func newTestDaemon(t *testing.T, runner scheduler.CommandRunner) (d *daemon, can
 	markerPath = filepath.Join(t.TempDir(), "marker")
 	d = &daemon{
 		queue:   trigger.NewQueue[struct{}](queueCapacity),
-		hc:      newHealthController(health.NewMarker(markerPath)),
+		health:  health.NewLatch(health.NewMarker(markerPath)),
 		newCmd:  runner,
 		timeout: time.Minute,
 	}
@@ -92,7 +90,7 @@ func startTestServer(t *testing.T, runner scheduler.CommandRunner) (sock string,
 	ctx, cancel := context.WithCancel(context.Background())
 	d = &daemon{
 		queue:   trigger.NewQueue[struct{}](queueCapacity),
-		hc:      newHealthController(health.NewMarker(filepath.Join(t.TempDir(), "marker"))),
+		health:  newTestHealth(t),
 		newCmd:  runner,
 		timeout: time.Minute,
 	}
@@ -103,6 +101,7 @@ func startTestServer(t *testing.T, runner scheduler.CommandRunner) (sock string,
 	if err != nil {
 		t.Fatalf("trigger.Listen() = %v", err)
 	}
+	// TestRunDaemon_ExternalModeBootsHealthyServesAndShutsDownCleanly owns app-hook vocabulary.
 	srv := &trigger.Server[struct{}]{Queue: d.queue}
 	srv.Serve(ln)
 

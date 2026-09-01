@@ -1,20 +1,34 @@
 package main
 
 import (
-	"log/slog"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/cplieger/slogx/capture"
 )
+
+// emptyOf drives sourceIsEmpty for a case that must not error, failing the
+// test if it does.
+func emptyOf(t *testing.T, path string) bool {
+	t.Helper()
+	empty, err := sourceIsEmpty(path)
+	if err != nil {
+		t.Fatalf("sourceIsEmpty(%q) = _, %v, want no error", path, err)
+	}
+	return empty
+}
 
 func TestSourceIsEmpty(t *testing.T) {
 	t.Parallel()
 
 	t.Run("empty dir is empty", func(t *testing.T) {
 		t.Parallel()
-		if !sourceIsEmpty(t.TempDir()) {
+		if !emptyOf(t, t.TempDir()) {
 			t.Error("sourceIsEmpty on empty dir = false, want true")
 		}
 	})
@@ -25,15 +39,19 @@ func TestSourceIsEmpty(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "f"), []byte("x"), 0o600); err != nil {
 			t.Fatalf("setup: %v", err)
 		}
-		if sourceIsEmpty(dir) {
+		if emptyOf(t, dir) {
 			t.Error("sourceIsEmpty on populated dir = true, want false")
 		}
 	})
 
-	t.Run("missing path is empty", func(t *testing.T) {
+	t.Run("missing path returns error", func(t *testing.T) {
 		t.Parallel()
-		if !sourceIsEmpty(filepath.Join(t.TempDir(), "nope")) {
-			t.Error("sourceIsEmpty on missing path = false, want true")
+		empty, err := sourceIsEmpty(filepath.Join(t.TempDir(), "nope"))
+		if err == nil {
+			t.Errorf("sourceIsEmpty(missing path) = %v, nil, want an error", empty)
+		}
+		if empty {
+			t.Error("sourceIsEmpty(missing path) = true, want false")
 		}
 	})
 }
@@ -55,7 +73,7 @@ func TestSourceIsEmpty_onlyGloballyExcludedEntriesIsEmpty(t *testing.T) {
 				t.Fatalf("setup: %v", err)
 			}
 		}
-		if !sourceIsEmpty(dir) {
+		if !emptyOf(t, dir) {
 			t.Error("sourceIsEmpty on an excludes-only dir = false, want true (must skip to protect the remote)")
 		}
 	})
@@ -69,20 +87,17 @@ func TestSourceIsEmpty_onlyGloballyExcludedEntriesIsEmpty(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "real.conf"), []byte("x"), 0o600); err != nil {
 			t.Fatalf("setup: %v", err)
 		}
-		if sourceIsEmpty(dir) {
+		if emptyOf(t, dir) {
 			t.Error("sourceIsEmpty on a dir with a real file = true, want false (must mirror)")
 		}
 	})
 }
 
-// TestSourceIsEmpty_unreadableDirSurfacesWarnAndSkips covers the cycle-2
-// error-surfacing arm where os.Open succeeds but Readdirnames returns a
-// non-EOF error: a source path that is a regular file (not a directory).
-// sourceIsEmpty must still report empty (true) so a broken source cannot let
-// --delete wipe the remote, AND it must emit a WARN so the breakage is not
-// masked as a benign empty source. Asserting the WARN is what distinguishes
-// this arm from the silent missing-dir case.
-func TestSourceIsEmpty_unreadableDirSurfacesWarnAndSkips(t *testing.T) {
+// TestSourceIsEmpty_readErrorIsReturnedNotSkipped covers a source path that
+// is a regular file rather than a directory. A broken source must be returned
+// as an error rather than reported as a benign empty one, and the classifier
+// must emit nothing because runJob owns the diagnostic.
+func TestSourceIsEmpty_readErrorIsReturnedNotSkipped(t *testing.T) {
 	rec := capture.Default(t)
 
 	path := filepath.Join(t.TempDir(), "not-a-dir")
@@ -90,37 +105,53 @@ func TestSourceIsEmpty_unreadableDirSurfacesWarnAndSkips(t *testing.T) {
 		t.Fatalf("setup: %v", err)
 	}
 
-	got := sourceIsEmpty(path)
+	empty, err := sourceIsEmpty(path)
 
-	if !got {
-		t.Errorf("sourceIsEmpty(regular file) = false, want true (skip to protect remote)")
+	if err == nil {
+		t.Errorf("sourceIsEmpty(regular file) = %v, nil, want an error", empty)
 	}
-	if rec.CountLevel(slog.LevelWarn, "source unreadable") == 0 {
-		t.Errorf("sourceIsEmpty(regular file) logs = %q, want a 'source unreadable' WARN", rec.Messages())
+	if empty {
+		t.Error("sourceIsEmpty(regular file) = true, want false (a broken source is not an empty one)")
+	}
+	if got := rec.Messages(); len(got) != 0 {
+		t.Errorf("sourceIsEmpty(regular file) logs = %q, want none (the caller reports)", got)
 	}
 }
 
-// TestSourceIsEmpty_openErrorSurfacesWarnAndSkips covers the other cycle-2
-// arm: os.Open itself fails with a non-ErrNotExist error. A path whose parent
-// component is a regular file yields ENOTDIR (not ENOENT), independent of uid
-// (so it is reliable under the root-by-design container, unlike a chmod-0
-// dir). The expected missing-dir (ENOENT) case stays silent; this asserts the
-// non-silent arm so the two are not collapsed.
-func TestSourceIsEmpty_openErrorSurfacesWarnAndSkips(t *testing.T) {
-	rec := capture.Default(t)
-
-	parent := filepath.Join(t.TempDir(), "not-a-dir")
-	if err := os.WriteFile(parent, []byte("x"), 0o600); err != nil {
-		t.Fatalf("setup: %v", err)
+// TestSourceIsEmpty_fifoReturnsErrorWithoutBlocking pins the directory-only
+// open. An ordinary read-only fifo open waits for a writer before runJob has a
+// timeout context.
+func TestSourceIsEmpty_fifoReturnsErrorWithoutBlocking(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "source.fifo")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatalf("Mkfifo: %v", err)
 	}
-	path := filepath.Join(parent, "child")
 
-	got := sourceIsEmpty(path)
+	done := make(chan error, 1)
+	go func() {
+		empty, err := sourceIsEmpty(path)
+		if err == nil {
+			done <- fmt.Errorf("sourceIsEmpty(fifo) = %v, nil, want an error", empty)
+			return
+		}
+		if empty {
+			done <- errors.New("sourceIsEmpty(fifo) = true, want false")
+			return
+		}
+		done <- nil
+	}()
 
-	if !got {
-		t.Errorf("sourceIsEmpty(path under a file) = false, want true (skip to protect remote)")
-	}
-	if rec.CountLevel(slog.LevelWarn, "source unreadable") == 0 {
-		t.Errorf("sourceIsEmpty(path under a file) logs = %q, want a 'source unreadable' WARN", rec.Messages())
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Error(err)
+		}
+	case <-time.After(time.Second):
+		fd, err := syscall.Open(path, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err == nil {
+			_ = syscall.Close(fd)
+		}
+		t.Fatal("sourceIsEmpty(fifo) blocked for a writer")
 	}
 }

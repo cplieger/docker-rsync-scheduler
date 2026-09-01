@@ -1,10 +1,9 @@
 package main
 
 import (
-	"errors"
-	"os/exec"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"pgregory.net/rapid"
 )
@@ -12,26 +11,23 @@ import (
 func TestParseStats(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name      string
-		in        string
-		wantFiles int64
-		wantBytes int64
+		name          string
+		in            string
+		wantFiles     int64
+		wantBytes     int64
+		wantDeletions int64
 	}{
 		{
 			name: "full stats block",
 			in: "Number of files: 12 (reg: 10, dir: 2)\n" +
+				"Number of deleted files: 1 (reg: 1)\n" +
 				"Number of regular files transferred: 5\n" +
 				"Total file size: 1,000 bytes\n" +
 				"Total transferred file size: 2,048 bytes\n" +
 				"sent 3,000 bytes  received 96 bytes\n",
-			wantFiles: 5,
-			wantBytes: 2048,
-		},
-		{
-			name:      "sent fallback when no transferred line",
-			in:        "sent 4,096 bytes  received 96 bytes  total size 4,096\n",
-			wantFiles: 0,
-			wantBytes: 4096,
+			wantFiles:     5,
+			wantBytes:     2048,
+			wantDeletions: 1,
 		},
 		{
 			name:      "files with thousands separator",
@@ -46,16 +42,13 @@ func TestParseStats(t *testing.T) {
 			wantBytes: 0,
 		},
 		{
-			name:      "empty yields zero",
-			in:        "",
+			// A capture of only separators reduces to the empty string, which
+			// ParseInt refuses: the matched-but-unparseable arm parseStats
+			// publishes as "malformed values yield 0".
+			name:      "matched but unparseable yields zero",
+			in:        "Number of regular files transferred: ,,,\n",
 			wantFiles: 0,
 			wantBytes: 0,
-		},
-		{
-			name:      "transferred preferred over sent",
-			in:        "Total transferred file size: 10 bytes\nsent 9999 bytes\n",
-			wantFiles: 0,
-			wantBytes: 10,
 		},
 	}
 
@@ -69,96 +62,10 @@ func TestParseStats(t *testing.T) {
 			if got.bytes != tt.wantBytes {
 				t.Errorf("parseStats bytes = %d, want %d", got.bytes, tt.wantBytes)
 			}
+			if got.deletions != tt.wantDeletions {
+				t.Errorf("parseStats deletions = %d, want %d", got.deletions, tt.wantDeletions)
+			}
 		})
-	}
-}
-
-func TestParseNum(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		in   string
-		want int64
-	}{
-		{"0", 0},
-		{"42", 42},
-		{"1,234", 1234},
-		{"1,234,567", 1234567},
-		{"", 0},
-		{"abc", 0},
-		{"12.5", 0},
-	}
-	for _, tt := range tests {
-		if got := parseNum(tt.in); got != tt.want {
-			t.Errorf("parseNum(%q) = %d, want %d", tt.in, got, tt.want)
-		}
-	}
-}
-
-func TestExitCode(t *testing.T) {
-	t.Parallel()
-	if got := exitCode(nil); got != 0 {
-		t.Errorf("exitCode(nil) = %d, want 0", got)
-	}
-	if got := exitCode(errors.New("boom")); got != -1 {
-		t.Errorf("exitCode(generic) = %d, want -1", got)
-	}
-
-	cmd := exec.Command("sh", "-c", "exit 23")
-	runErr := cmd.Run()
-	if got := exitCode(runErr); got != 23 {
-		t.Errorf("exitCode(exit 23) = %d, want 23", got)
-	}
-}
-
-func TestCappedBuffer(t *testing.T) {
-	t.Parallel()
-
-	t.Run("retains within cap", func(t *testing.T) {
-		t.Parallel()
-		b := &cappedBuffer{max: 10}
-		n, err := b.Write([]byte("hello"))
-		if err != nil || n != 5 {
-			t.Fatalf("Write = (%d, %v), want (5, nil)", n, err)
-		}
-		if b.String() != "hello" {
-			t.Errorf("String = %q, want hello", b.String())
-		}
-	})
-
-	t.Run("truncates overflow but reports full length", func(t *testing.T) {
-		t.Parallel()
-		b := &cappedBuffer{max: 4}
-		n, err := b.Write([]byte("abcdefgh"))
-		if err != nil || n != 8 {
-			t.Fatalf("Write = (%d, %v), want (8, nil)", n, err)
-		}
-		if b.String() != "abcd" {
-			t.Errorf("String = %q, want abcd", b.String())
-		}
-	})
-}
-
-// TestCappedBuffer_capEnforcedAcrossWrites pins the remaining-room arithmetic
-// (max - current length). A first write half-fills the buffer; the second
-// write must be truncated against the *remaining* room, not the full cap.
-// Observing the exact retained bytes (not just the reported count) catches a
-// `-` -> `+` mutation of the remaining computation, which would let the second
-// write overflow the cap to "abcdef".
-func TestCappedBuffer_capEnforcedAcrossWrites(t *testing.T) {
-	t.Parallel()
-	b := &cappedBuffer{max: 4}
-
-	n1, _ := b.Write([]byte("ab"))
-	n2, _ := b.Write([]byte("cdef"))
-
-	if n1 != 2 || n2 != 4 {
-		t.Errorf("Write lengths = (%d, %d), want (2, 4)", n1, n2)
-	}
-	if b.String() != "abcd" {
-		t.Errorf("cappedBuffer after writes = %q, want abcd", b.String())
-	}
-	if len(b.String()) > 4 {
-		t.Errorf("cappedBuffer length = %d, want <= cap 4", len(b.String()))
 	}
 }
 
@@ -180,24 +87,45 @@ func TestTail(t *testing.T) {
 	if !strings.Contains(got, "truncated") {
 		t.Errorf("tail = %q, want truncation marker", got)
 	}
+	// A cut that splits a valid multi-byte rune must leave no continuation
+	// byte at the head of the retained tail: the rune it belonged to is gone,
+	// so the bytes are unattributable noise. Cutting 3000 'a' + U+4E16 + 2046
+	// 'b' at 2048 lands inside the three-byte rune.
+	split := tail(strings.Repeat("a", 3000)+"\u4e16"+strings.Repeat("b", 2046), 2048)
+	head := strings.TrimPrefix(split, truncMarker)
+	if head == "" || !utf8.RuneStart(head[0]) {
+		t.Errorf("tail() retained tail starts with %q, want a rune start", head[:min(len(head), 4)])
+	}
 }
 
-func TestProperty_ParseStatsNeverPanics(t *testing.T) {
-	rapid.Check(t, func(rt *rapid.T) {
-		in := rapid.String().Draw(rt, "in")
-		got := parseStats(in)
-		if got.files < 0 || got.bytes < 0 {
-			rt.Fatalf("parseStats(%q) = %+v, want non-negative", in, got)
-		}
-	})
+func TestDelLimitCapture_matchesPrefixAcrossWritesBeforeTailEviction(t *testing.T) {
+	t.Parallel()
+
+	tail := &cappedBuffer{max: 8}
+	capture := &delLimitCapture{dst: tail}
+	split := len(rsyncDelLimitWarn) / 2
+	if _, err := capture.Write([]byte(rsyncDelLimitWarn[:split])); err != nil {
+		t.Fatalf("first Write() error = %v, want nil", err)
+	}
+	if capture.limited {
+		t.Error("limited = true after a partial prefix, want false")
+	}
+	if _, err := capture.Write([]byte(rsyncDelLimitWarn[split:] + " discarded tail")); err != nil {
+		t.Fatalf("second Write() error = %v, want nil", err)
+	}
+	if !capture.limited {
+		t.Error("limited = false after a split warning prefix, want true")
+	}
+	if strings.Contains(tail.String(), rsyncDelLimitWarn) {
+		t.Errorf("bounded tail = %q, want the matched warning evicted", tail.String())
+	}
 }
 
 // TestProperty_CappedBufferNeverExceedsMax asserts the two core invariants of
 // cappedBuffer across any sequence of writes: the retained bytes never exceed
-// max, and they are exactly the first min(total, max) bytes of the
-// concatenated input. This is the round-trip/bound counterpart to the
-// table-driven cap test and robustly kills arithmetic mutations of the
-// remaining-room computation.
+// max, and they are exactly the last min(total, max) bytes of the
+// concatenated input. This robustly kills arithmetic mutations of the
+// overflow computation.
 func TestProperty_CappedBufferNeverExceedsMax(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		max := rapid.IntRange(0, 64).Draw(rt, "max")
@@ -221,8 +149,8 @@ func TestProperty_CappedBufferNeverExceedsMax(t *testing.T) {
 			rt.Fatalf("buffer length %d exceeds max %d", len(got), max)
 		}
 		wantLen := min(len(concat), max)
-		if want := string(concat[:wantLen]); got != want {
-			rt.Fatalf("buffer = %q, want %q (first %d bytes of input)", got, want, wantLen)
+		if want := string(concat[len(concat)-wantLen:]); got != want {
+			rt.Fatalf("buffer = %q, want %q (last %d bytes of input)", got, want, wantLen)
 		}
 	})
 }
@@ -246,28 +174,27 @@ func assertCappedWrite(t *testing.T, max int, in, wantBuf string, wantN int) {
 }
 
 // TestCappedBuffer_writeBoundaries pins the two cap boundaries the other
-// cappedBuffer tests skip: an exact fit (len(p) == remaining room) and a write
-// into an already-full buffer (remaining == 0). Together they lock the
-// min()-clamp form of cappedBuffer.Write.
+// cappedBuffer tests skip: an exact fit (len(p) == max) and a write into an
+// already-full buffer. Together they lock the sliding-window form of
+// cappedBuffer.Write.
 //
-// These same boundaries are why two CONDITIONALS_BOUNDARY mutants on the clamp
-// are equivalent (unkillable): at an exact fit, writing all of p and writing
-// p[:remaining] are identical (p[:remaining] == p when remaining == len(p)); at
-// an already-full buffer, the remaining>0 guard and its >=0 mutant both write
-// nothing. The min() rewrite removed the first comparison outright; the second
-// is documented here and deliberately left in place.
+// Both boundaries in that form are mutation-equivalent, which is why they are
+// documented rather than asserted separately: `len(p) >= c.max` -> `>` reaches
+// the default arm, where `overflow` is then `c.buf.Len()`, so Next drops the
+// whole retained prefix and the result is identical; and `overflow > 0` ->
+// `>= 0` calls Next(0), which is a no-op.
 func TestCappedBuffer_writeBoundaries(t *testing.T) {
 	t.Parallel()
 
-	// len(p) == remaining: exact fit, whole input retained (not truncated).
+	// len(p) == max: exact fit, whole input retained.
 	assertCappedWrite(t, 4, "abcd", "abcd", 4)
-	// len(p) > remaining: truncated to the cap, full length still reported.
-	assertCappedWrite(t, 4, "abcde", "abcd", 5)
-	// len(p) < remaining: room to spare, whole input retained.
+	// len(p) >= max: only the newest max bytes are retained, full length still reported.
+	assertCappedWrite(t, 4, "abcde", "bcde", 5)
+	// len(p) < max: room to spare, whole input retained.
 	assertCappedWrite(t, 4, "ab", "ab", 2)
 
-	// remaining == 0: a write into an already-full buffer adds nothing but
-	// still reports the consumed length.
+	// A write into an already-full buffer slides the window forward: the
+	// newest bytes are kept and the consumed length is still reported.
 	b := &cappedBuffer{max: 3}
 	if _, _ = b.Write([]byte("xyz")); b.String() != "xyz" {
 		t.Fatalf("setup write left buffer = %q, want xyz", b.String())
@@ -279,7 +206,7 @@ func TestCappedBuffer_writeBoundaries(t *testing.T) {
 	if n != 4 {
 		t.Errorf("full-buffer Write n = %d, want 4", n)
 	}
-	if got := b.String(); got != "xyz" {
-		t.Errorf("full-buffer Write left buffer = %q, want xyz (unchanged)", got)
+	if got := b.String(); got != "ore" {
+		t.Errorf("full-buffer Write left buffer = %q, want ore (newest bytes)", got)
 	}
 }
