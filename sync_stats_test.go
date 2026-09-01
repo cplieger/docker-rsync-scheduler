@@ -98,6 +98,29 @@ func TestTail(t *testing.T) {
 	}
 }
 
+func TestDelLimitCapture_matchesPrefixAcrossWritesBeforeTailEviction(t *testing.T) {
+	t.Parallel()
+
+	tail := &cappedBuffer{max: 8}
+	capture := &delLimitCapture{dst: tail, matching: true}
+	split := len(rsyncDelLimitWarn) / 2
+	if _, err := capture.Write([]byte(rsyncDelLimitWarn[:split])); err != nil {
+		t.Fatalf("first Write() error = %v, want nil", err)
+	}
+	if capture.limited {
+		t.Error("limited = true after a partial prefix, want false")
+	}
+	if _, err := capture.Write([]byte(rsyncDelLimitWarn[split:] + " discarded tail")); err != nil {
+		t.Fatalf("second Write() error = %v, want nil", err)
+	}
+	if !capture.limited {
+		t.Error("limited = false after a split warning prefix, want true")
+	}
+	if strings.Contains(tail.String(), rsyncDelLimitWarn) {
+		t.Errorf("bounded tail = %q, want the matched warning evicted", tail.String())
+	}
+}
+
 // TestProperty_CappedBufferNeverExceedsMax asserts the two core invariants of
 // cappedBuffer across any sequence of writes: the retained bytes never exceed
 // max, and they are exactly the last min(total, max) bytes of the

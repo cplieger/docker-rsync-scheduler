@@ -124,6 +124,79 @@ func TestExecutor_ValidConfigReloadUsesReplacementJobs(t *testing.T) {
 	}
 }
 
+func TestDaemonRun_populatesDurationOnEveryOutcome(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		writeValidCfg(t, t.TempDir())
+		d := &daemon{
+			hc:      newHealthController(&fakeMarker{}),
+			newCmd:  fixedRunner("true"),
+			timeout: time.Minute,
+		}
+
+		out := d.run(t.Context(), "external", struct{}{})
+
+		if !out.OK {
+			t.Errorf("daemon.run() success outcome ok = false, want true")
+		}
+		if out.Duration <= 0 {
+			t.Errorf("daemon.run() success duration = %v, want positive", out.Duration)
+		}
+	})
+
+	t.Run("reload_failure", func(t *testing.T) {
+		t.Setenv("CONFIG_PATH", filepath.Join(t.TempDir(), "absent.yaml"))
+		d := &daemon{hc: newHealthController(&fakeMarker{})}
+
+		out := d.run(t.Context(), "external", struct{}{})
+
+		if out.OK {
+			t.Errorf("daemon.run() reload-failure outcome ok = true, want false")
+		}
+		if out.Duration <= 0 {
+			t.Errorf("daemon.run() reload-failure duration = %v, want positive", out.Duration)
+		}
+	})
+}
+
+func TestDaemonRun_advisesOncePerDistinctConfigDocument(t *testing.T) {
+	rec := capture.Default(t)
+	cfgPath := writeValidCfg(t, t.TempDir())
+	doc, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	doc = append(doc, []byte("    max_delete: 1\n")...)
+	if err := os.WriteFile(cfgPath, doc, 0o600); err != nil {
+		t.Fatalf("write advisory config: %v", err)
+	}
+	d := &daemon{
+		hc:      newHealthController(&fakeMarker{}),
+		newCmd:  fixedRunner("true"),
+		timeout: time.Minute,
+	}
+	const warning = "max_delete set without delete:true; the cap will be ignored"
+
+	for range 2 {
+		if out := d.run(t.Context(), "external", struct{}{}); !out.OK {
+			t.Fatalf("daemon.run() with unchanged config ok = false, want true")
+		}
+	}
+	if got := rec.CountExact(warning); got != 1 {
+		t.Errorf("unchanged config advisory count = %d, want 1; logs=%q", got, rec.Messages())
+	}
+
+	doc = append(doc, []byte("# edited document\n")...)
+	if err := os.WriteFile(cfgPath, doc, 0o600); err != nil {
+		t.Fatalf("edit config: %v", err)
+	}
+	if out := d.run(t.Context(), "external", struct{}{}); !out.OK {
+		t.Fatalf("daemon.run() after config edit ok = false, want true")
+	}
+	if got := rec.CountExact(warning); got != 2 {
+		t.Errorf("edited config advisory count = %d, want 2; logs=%q", got, rec.Messages())
+	}
+}
+
 // TestExecutor_EmptySourceIsRecheckedEachPass pins that the empty-source guard
 // is re-evaluated per request: an operator submitting consecutive daemon
 // requests while the mounted source empties out must see the later pass skipped
@@ -224,6 +297,50 @@ func TestExecutor_ReloadedJobKeepsStrictHostKeyMode(t *testing.T) {
 		if !strings.Contains(sshCommands[1], want) {
 			t.Errorf("replacement job ssh command = %q, want it to contain %q", sshCommands[1], want)
 		}
+	}
+}
+
+func TestDaemonRun_failedInterruptedPassLeavesFailureFallback(t *testing.T) {
+	source := newRunJobSource(t)
+	cfgPath := writeValidCfg(t, source)
+	key := filepath.Join(filepath.Dir(cfgPath), "id_ed25519")
+	doc := "jobs:\n" +
+		"  - name: first\n    local: " + source + "\n" +
+		"    remote_host: root@192.0.2.10\n    remote_path: /srv/first\n" +
+		"    ssh_key: " + key + "\n" +
+		"  - name: second\n    local: " + source + "\n" +
+		"    remote_host: root@192.0.2.10\n    remote_path: /srv/second\n" +
+		"    ssh_key: " + key + "\n"
+	if err := os.WriteFile(cfgPath, []byte(doc), 0o600); err != nil {
+		t.Fatalf("write two-job config: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	calls := 0
+	runner := func(cmdCtx context.Context, _ string, _ ...string) *exec.Cmd {
+		calls++
+		if calls == 1 {
+			return exec.CommandContext(cmdCtx, "false")
+		}
+		cancel()
+		return exec.CommandContext(cmdCtx, "sleep", "30")
+	}
+	d := &daemon{
+		hc:      newHealthController(&fakeMarker{}),
+		newCmd:  runner,
+		timeout: time.Minute,
+	}
+
+	out := d.run(ctx, "external", struct{}{})
+
+	if calls != 2 {
+		t.Fatalf("daemon.run() runner calls = %d, want 2 (failed then interrupted)", calls)
+	}
+	if out.OK {
+		t.Errorf("daemon.run() failed-interrupted outcome ok = true, want false")
+	}
+	if out.Reason != "" {
+		t.Errorf("daemon.run() failed-interrupted reason = %q, want empty for the job-failure fallback", out.Reason)
 	}
 }
 
@@ -500,6 +617,102 @@ func TestRunDaemon_StartupRecordPublishesResolvedPolicy(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRunDaemon_PopulatedKnownHostsUsesStrictTransport(t *testing.T) {
+	writeValidCfg(t, newRunJobSource(t))
+	t.Setenv("SYNC_INTERVAL", "off")
+	t.Cleanup(func() { _ = os.Remove(healthMarkerPath) })
+
+	path := filepath.Join(t.TempDir(), "known_hosts")
+	if err := os.WriteFile(path, []byte("192.0.2.10 ssh-ed25519 AAAAC3Nz\n"), 0o600); err != nil {
+		t.Fatalf("write known_hosts: %v", err)
+	}
+	originalKnownHostsPath := knownHostsPath
+	knownHostsPath = path
+	t.Cleanup(func() { knownHostsPath = originalKnownHostsPath })
+
+	sshCommands := make(chan string, 1)
+	runner := func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		for i, arg := range args {
+			if arg == "-e" && i+1 < len(args) {
+				sshCommands <- args[i+1]
+				break
+			}
+		}
+		return exec.CommandContext(ctx, "true")
+	}
+
+	sock := testSocketPath(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	var runErr error
+	go func() {
+		defer close(done)
+		runErr = runDaemon(ctx, sock, runner)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	waitFor(t, 2*time.Second, func() bool {
+		_, err := os.Stat(sock)
+		return err == nil
+	}, "daemon did not bind the trigger socket")
+	if code := runClient(t.Context(), sock); code != 0 {
+		t.Errorf("runClient() = %d, want 0", code)
+	}
+
+	var command string
+	select {
+	case command = <-sshCommands:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rsync invocation did not expose its ssh command")
+	}
+	for _, want := range []string{
+		"-o StrictHostKeyChecking=yes",
+		"-o UserKnownHostsFile=" + path,
+	} {
+		if !strings.Contains(command, want) {
+			t.Errorf("ssh command = %q, want it to contain %q", command, want)
+		}
+	}
+
+	cancel()
+	<-done
+	if runErr != nil {
+		t.Errorf("runDaemon() = %v, want nil", runErr)
+	}
+}
+
+func TestRunDaemon_BindFailureLogsActionableRecord(t *testing.T) {
+	writeValidCfg(t, t.TempDir())
+	t.Setenv("SYNC_INTERVAL", "off")
+	t.Cleanup(func() { _ = os.Remove(healthMarkerPath) })
+
+	originalKnownHostsPath := knownHostsPath
+	knownHostsPath = filepath.Join(t.TempDir(), "absent-known-hosts")
+	t.Cleanup(func() { knownHostsPath = originalKnownHostsPath })
+
+	rec := capture.Default(t)
+	sock := filepath.Join(t.TempDir(), "missing", "s.sock")
+
+	err := runDaemon(t.Context(), sock, fixedRunner("true"))
+
+	if err == nil {
+		t.Fatal("runDaemon() with an unbindable socket path = nil, want error")
+	}
+	const message = "cannot bind trigger socket"
+	if count := rec.CountLevel(slog.LevelError, message); count != 1 {
+		t.Errorf("%q ERROR records = %d, want 1; logs = %q", message, count, rec.Messages())
+	}
+	if !rec.HasAttr(message, "path", sock) {
+		t.Errorf("%q missing path=%q; logs = %q", message, sock, rec.Messages())
+	}
+	if value, ok := rec.AttrValueExact(message, "error"); !ok || value == "" {
+		t.Errorf("%q error attribute = %q, %v, want non-empty, true", message, value, ok)
 	}
 }
 

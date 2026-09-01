@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -182,6 +183,40 @@ func TestProbeOptions_readableInvalidConfigsDisarm(t *testing.T) {
 				t.Errorf("probeOptions() with %s config = %d options, want 0 (disarmed)", tt.name, len(opts))
 			}
 		})
+	}
+}
+
+func TestMain_healthProbeSilencesConfigWarnings(t *testing.T) {
+	const helperEnv = "GO_WANT_HEALTH_PROBE_HELPER"
+	if os.Getenv(helperEnv) == "1" {
+		os.Args = []string{os.Args[0], "health"}
+		main()
+		return
+	}
+
+	cfgPath := writeValidCfg(t, t.TempDir())
+	marker := health.NewMarker(healthMarkerPath)
+	marker.Set(true)
+	t.Cleanup(marker.Cleanup)
+
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	cmd := exec.Command(executable, "-test.run=^TestMain_healthProbeSilencesConfigWarnings$")
+	cmd.Env = append(os.Environ(),
+		helperEnv+"=1",
+		"CONFIG_PATH="+cfgPath,
+		"SYNC_INTERVAL=bogus",
+		"SYNC_TIMEOUT=bogus",
+	)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("health subprocess: %v; stderr = %q", err, stderr.String())
+	}
+	if got := stderr.String(); got != "" {
+		t.Errorf("health subprocess stderr = %q, want empty", got)
 	}
 }
 

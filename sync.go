@@ -127,21 +127,16 @@ type transport struct {
 // falling back. Entries are counted, never parsed, so a marker
 // (@cert-authority, @revoked) or hashed (|1|) line counts.
 func classifyKnownHosts(path string) (hostKeyMode, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0) // #nosec G304 -- operator-mounted known_hosts path
+	f, err := openRegular(path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return hostKeyAcceptNew, nil
+	case errors.Is(err, errNotRegular):
+		return hostKeyAcceptNew, fmt.Errorf("known_hosts %q is %w", path, err)
 	case err != nil:
 		return hostKeyAcceptNew, fmt.Errorf("known_hosts: %w", err)
 	}
 	defer func() { _ = f.Close() }()
-	info, err := f.Stat()
-	switch {
-	case err != nil:
-		return hostKeyAcceptNew, fmt.Errorf("known_hosts: %w", err)
-	case !info.Mode().IsRegular():
-		return hostKeyAcceptNew, fmt.Errorf("known_hosts %q is not a regular file", path)
-	}
 	br := bufio.NewReader(f)
 	inComment := false
 	for {
@@ -206,7 +201,7 @@ func buildRsyncArgs(j *job, tr transport) []string {
 		}
 	}
 	if j.RemoteUID != nil && j.RemoteGID != nil {
-		args = append(args, fmt.Sprintf("--chown=%d:%d", *j.RemoteUID, *j.RemoteGID))
+		args = append(args, fmt.Sprintf("--chown=%d:%d", *j.RemoteUID, *j.RemoteGID), "--super")
 	}
 	args = append(args, "--stats", "-e", sshCommand(j.SSHKey, tr.hostKeys))
 
@@ -366,6 +361,7 @@ func runJob(ctx context.Context, j *job, timeout time.Duration, tr transport, ne
 
 	outBuf := &cappedBuffer{max: outputCapBytes}
 	errBuf := &cappedBuffer{max: outputCapBytes}
+	delLimit := &delLimitCapture{dst: errBuf, matching: true}
 	cmd := newCmd(jobCtx, "rsync", buildRsyncArgs(j, tr)...)
 	var cancelSent atomic.Bool
 	if cancelCmd := cmd.Cancel; cancelCmd != nil {
@@ -378,7 +374,7 @@ func runJob(ctx context.Context, j *job, timeout time.Duration, tr transport, ne
 		}
 	}
 	cmd.Stdout = outBuf
-	cmd.Stderr = errBuf
+	cmd.Stderr = delLimit
 
 	runErr := cmd.Run()
 	res.duration = time.Since(start)
@@ -396,10 +392,9 @@ func runJob(ctx context.Context, j *job, timeout time.Duration, tr transport, ne
 	}
 	stderrAll := errBuf.String()
 	res.stderrTail = tail(stderrAll, logStderrTailBytes)
-	// rsync emits this warning on its own line and escapes control bytes in
-	// filenames, so a filename cannot forge the line boundary.
-	delLimited := strings.HasPrefix(stderrAll, rsyncDelLimitWarn) ||
-		strings.Contains(stderrAll, "\n"+rsyncDelLimitWarn)
+	// Match the original byte stream before the bounded tail can evict the
+	// warning or expose a partial line at its head.
+	delLimited := delLimit.limited
 
 	if runErr == nil {
 		res.success = true
@@ -539,6 +534,36 @@ func reportPass(r *passResult) {
 		"trigger", r.trigger, "jobs", r.total,
 		"ok", r.ok, "skipped", r.emptySkipped, "failed", r.failed,
 		"duration_ms", r.duration.Milliseconds())
+}
+
+type delLimitCapture struct {
+	dst         *cappedBuffer
+	prefixIndex int
+	matching    bool
+	limited     bool
+}
+
+func (c *delLimitCapture) Write(p []byte) (int, error) {
+	if !c.limited {
+	scan:
+		for _, b := range p {
+			switch {
+			case b == '\n':
+				c.prefixIndex = 0
+				c.matching = true
+			case !c.matching:
+			case b != rsyncDelLimitWarn[c.prefixIndex]:
+				c.matching = false
+			default:
+				c.prefixIndex++
+				if c.prefixIndex == len(rsyncDelLimitWarn) {
+					c.limited = true
+					break scan
+				}
+			}
+		}
+	}
+	return c.dst.Write(p)
 }
 
 // cappedBuffer is an io.Writer that retains at most max bytes of the tail,

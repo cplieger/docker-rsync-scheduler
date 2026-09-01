@@ -3,11 +3,13 @@ package main
 
 import (
 	"cmp"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"maps"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -141,26 +143,32 @@ func configPath() string {
 	return cmp.Or(envx.String("CONFIG_PATH"), defaultConfigPath)
 }
 
+// loadedConfig is a validated config plus its source document's digest.
+type loadedConfig struct {
+	cfg    config
+	digest [32]byte
+}
+
 // loadConfig reads, parses, and validates the YAML config. The stage is
 // non-empty only on failure so callers can attach it to their diagnostic.
-func loadConfig() (config, string, error) {
+func loadConfig() (loadedConfig, string, error) {
 	path := configPath()
 
 	data, err := readCappedConfig(path)
 	if err != nil {
-		return config{}, "read", fmt.Errorf("read config %q: %w", path, err)
+		return loadedConfig{}, "read", err
 	}
 
 	cfg, err := parseConfig(data)
 	if err != nil {
-		return config{}, "parse", fmt.Errorf("parse config %q: %w", path, err)
+		return loadedConfig{}, "parse", err
 	}
 
 	if err := cfg.validate(); err != nil {
-		return config{}, "validate", fmt.Errorf("validate config %q: %w", path, err)
+		return loadedConfig{}, "validate", err
 	}
 
-	return cfg, "", nil
+	return loadedConfig{cfg: cfg, digest: sha256.Sum256(data)}, "", nil
 }
 
 // readCappedConfig reads path, refusing a non-regular file and any document
@@ -168,18 +176,11 @@ func loadConfig() (config, string, error) {
 // bound is enforced on the bytes read, since a regular file can grow after
 // it is opened; the +1 makes "exceeds" decidable.
 func readCappedConfig(path string) ([]byte, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0) // #nosec G304 -- trusted, operator-mounted config path
+	f, err := openRegular(path)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, errors.New("not a regular file")
-	}
 	data, err := io.ReadAll(io.LimitReader(f, configCapBytes+1))
 	if err != nil {
 		return nil, err
@@ -209,8 +210,7 @@ func parseConfig(data []byte) (config, error) {
 }
 
 // validate enforces the config contract: a non-empty job list with unique
-// names, delegating each job's per-field contract to (job).validate. It also
-// warns when two jobs address one remote tree and either deletes.
+// names, delegating each job's per-field contract to (job).validate.
 func (c config) validate() error {
 	if len(c.Jobs) == 0 {
 		return errors.New("config: jobs list is empty")
@@ -233,9 +233,15 @@ func (c config) validate() error {
 		}
 	}
 
-	warnSharedDestinations(c.Jobs)
-
 	return nil
+}
+
+// adviseConfig emits inert-setting and shared-destination advisories.
+func adviseConfig(cfg config) {
+	for i := range cfg.Jobs {
+		cfg.Jobs[i].warnInertSettings()
+	}
+	warnSharedDestinations(cfg.Jobs)
 }
 
 // destJob is one job's contribution to the shared-destination advisory: its
@@ -331,9 +337,10 @@ func overlapsAny(members []destJob, path string) bool {
 }
 
 // warnConflictingTree emits one advisory per overlap component, listing only
-// members reachable by a deleting job's subtree. Deleters and sample members
-// are capped at three so many mutually overlapping jobs still cost one
-// bounded record.
+// members whose tree overlaps a deleting job's -- a sibling connected only
+// through a non-deleting ancestor is excluded. Deleters and members are
+// sampled shortest-path-first and capped at three, so a thousand mutually
+// overlapping jobs still cost one bounded record.
 func warnConflictingTree(members []destJob) {
 	const sampleSize = 3
 	if len(members) < 2 {
@@ -349,26 +356,31 @@ func warnConflictingTree(members []destJob) {
 		}
 	}
 	atRisk := make([]destJob, 0, len(members))
-	deleters := make([]string, 0, sampleSize)
 	for _, m := range members {
 		if !overlapsAny(deleting, m.path) {
 			continue
 		}
 		atRisk = append(atRisk, m)
-		if m.del && len(deleters) < sampleSize {
-			deleters = append(deleters, m.name)
-		}
 	}
 	slices.SortFunc(atRisk, func(a, b destJob) int {
 		return cmp.Or(cmp.Compare(len(a.path), len(b.path)), cmp.Compare(a.path, b.path))
 	})
+	deleters := make([]string, 0, sampleSize)
+	for _, m := range atRisk {
+		if len(deleters) == sampleSize {
+			break
+		}
+		if m.del {
+			deleters = append(deleters, m.name)
+		}
+	}
 	samples := make([]string, 0, sampleSize)
 	for _, m := range atRisk[:min(sampleSize, len(atRisk))] {
 		samples = append(samples,
 			fmt.Sprintf("%s at %s (ssh_key %s, delete %t)", m.name, m.path, m.key, m.del))
 	}
 	slog.Warn("jobs share a remote destination tree and one deletes; each pass may delete the others' files",
-		"remote_host", atRisk[0].raw, "jobs", len(atRisk),
+		"remote_host", atRisk[0].raw, "jobs", len(atRisk), "deleting", len(deleting),
 		"outermost_first", strings.Join(samples, "; "),
 		"deletes", strings.Join(deleters, ", "),
 		"hint", "exclude the sibling's content from the deleting job, or give each job its own remote_path")
@@ -407,7 +419,9 @@ func (j *job) validate() error {
 		return fmt.Errorf("job %q: max_delete must be >= 0", j.Name)
 	}
 
-	j.warnInertSettings()
+	if err := j.checkOwnership(); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -433,8 +447,10 @@ func (j *job) checkRequiredFields() error {
 
 // checkNoForbiddenChars applies one refusal per interpreter a value
 // actually crosses: ASCII controls on every field, shell metacharacters
-// on remote_path (the only value a remote shell parses), and the
-// no-space rule on the two fields that are word-split downstream.
+// and spaces on remote_path -- which the REMOTE shell parses, and which
+// rsync escapes by default, so both refusals cover the premise
+// shellMetaChars names -- and spaces on ssh_key, which rsync word-splits
+// itself.
 func (j *job) checkNoForbiddenChars() error {
 	if hasShellMeta(j.RemotePath) {
 		return fmt.Errorf("job %q: remote_path contains forbidden characters", j.Name)
@@ -475,10 +491,23 @@ func (j *job) checkNoForbiddenChars() error {
 	return nil
 }
 
-// warnInertSettings logs advisory warnings for job fields that are accepted
-// but silently inert in the current configuration: a max_delete cap without
-// delete:true, or a lone remote_uid/remote_gid. Neither is an error, so
-// these stay out of validate's error path.
+func (j *job) checkOwnership() error {
+	for _, f := range []struct {
+		key string
+		val *uint32
+	}{
+		{"remote_uid", j.RemoteUID},
+		{"remote_gid", j.RemoteGID},
+	} {
+		if f.val != nil && *f.val == math.MaxUint32 {
+			return fmt.Errorf("job %q: %s must be 0-%d", j.Name, f.key,
+				uint32(math.MaxUint32)-1)
+		}
+	}
+	return nil
+}
+
+// warnInertSettings logs accepted job settings that have no effect.
 func (j *job) warnInertSettings() {
 	// max_delete only takes effect with delete:true -- buildRsyncArgs emits
 	// --max-delete inside the --delete branch.
@@ -495,10 +524,30 @@ func (j *job) warnInertSettings() {
 			"remote_uid_set", j.RemoteUID != nil,
 			"remote_gid_set", j.RemoteGID != nil)
 	}
+
+	if slices.Contains(j.Excludes, "") {
+		slog.Warn("empty excludes entry is ignored; an empty pattern excludes nothing",
+			"job", j.Name)
+	}
+
+	// rsync matches surrounding whitespace literally, but a path may
+	// legitimately contain it, so advise rather than refuse.
+	for _, e := range j.Excludes {
+		trimmed := strings.TrimSpace(e)
+		if trimmed == e {
+			continue
+		}
+		message := "exclude pattern has leading or trailing whitespace; rsync matches it literally"
+		if trimmed == "" {
+			message += "; the pattern excludes nothing"
+		}
+		slog.Warn(message,
+			"job", j.Name, "exclude", e, "without_whitespace", trimmed)
+	}
 }
 
 // splitRemoteHost separates an optional "user@" prefix from the host and
-// strips the surrounding brackets from an IPv6 literal written in rsync's
+// strips the surrounding brackets from an IP literal written in rsync's
 // [addr] form. It performs no validation; user is "" when no prefix is
 // present. Brackets are stripped only when the inner text is a valid IP, so a
 // stray "[name]" is left intact for validateRemoteHost to reject.
@@ -557,19 +606,31 @@ func remoteDest(j *job) string {
 // reading. A directory or device opens successfully and can never be a
 // private key.
 func checkReadable(path string) error {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0) // #nosec G304 -- trusted, operator-mounted key path
+	f, err := openRegular(path)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = f.Close() }()
+	return nil
+}
+
+var errNotRegular = errors.New("not a regular file")
+
+func openRegular(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0) // #nosec G304 -- trusted, operator-mounted path
+	if err != nil {
+		return nil, err
+	}
 	info, err := f.Stat()
 	if err != nil {
-		return err
+		_ = f.Close()
+		return nil, err
 	}
 	if !info.Mode().IsRegular() {
-		return errors.New("not a regular file")
+		_ = f.Close()
+		return nil, errNotRegular
 	}
-	return nil
+	return f, nil
 }
 
 // loadSyncTimeout reads SYNC_TIMEOUT (a Go duration) and falls back to

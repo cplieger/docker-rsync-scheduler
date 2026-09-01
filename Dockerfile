@@ -47,10 +47,10 @@ COPY rsync-release.gpg /usr/local/share/rsync-release.gpg
 # The dist tarball, not the auto-generated GitHub tag archive. Both gates are
 # fail-closed and the order matters: a bad signature stops the build before the
 # pinned digest is consulted at all.
-RUN curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 5 \
+RUN curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 5 --retry-all-errors \
       -o "rsync-${RSYNC_VERSION#v}.tar.gz" \
       "https://download.samba.org/pub/rsync/src/rsync-${RSYNC_VERSION#v}.tar.gz" \
-    && curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 5 \
+    && curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 5 --retry-all-errors \
       -o "rsync-${RSYNC_VERSION#v}.tar.gz.asc" \
       "https://download.samba.org/pub/rsync/src/rsync-${RSYNC_VERSION#v}.tar.gz.asc" \
     && gpgv --keyring /usr/local/share/rsync-release.gpg \

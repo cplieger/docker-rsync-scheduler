@@ -219,9 +219,13 @@ func TestRunJob_vanishedFilesIsSuccessWithWarning(t *testing.T) {
 
 func TestRunPass_vanishedFilenameContainingDeleteLimitPhraseStaysHealthy(t *testing.T) {
 	rec := capture.Default(t)
+	suffixBytes := outputCapBytes - len(rsyncDelLimitWarn) - len("\"\n")
 	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
-		return exec.CommandContext(ctx, "sh", "-c",
-			`printf 'file has vanished: "/src/b-`+rsyncDelLimitWarn+`"\n' >&2; exit 24`)
+		command := fmt.Sprintf(
+			`printf 'file has vanished: "/src/b-%s"\n' >&2; dd if=/dev/zero bs=%d count=1 1>&2 2>/dev/null; exit 24`,
+			rsyncDelLimitWarn, suffixBytes,
+		)
+		return exec.CommandContext(ctx, "sh", "-c", command)
 	}
 	src := newRunJobSource(t)
 
@@ -239,20 +243,16 @@ func TestRunPass_vanishedFilenameContainingDeleteLimitPhraseStaysHealthy(t *test
 	}
 }
 
-// TestRunPass_vanishedFilesPassStaysHealthy pins the health outcome a
-// stranger's program observes when every vanished source file is tolerated.
-func TestRunPass_vanishedFilesPassStaysHealthy(t *testing.T) {
-	t.Parallel()
+func TestRunJob_maxDeleteWarningSurvivesStderrCap(t *testing.T) {
 	newCmd := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
-		return exec.CommandContext(ctx, "sh", "-c", "exit 24")
+		return exec.CommandContext(ctx, "sh", "-c",
+			`printf '`+rsyncDelLimitWarn+`\n' >&2; dd if=/dev/zero bs=1048576 count=2 1>&2 2>/dev/null; exit 24`)
 	}
-	src := newRunJobSource(t)
-	r := runPass(t.Context(), config{Jobs: []job{*runJobJob(src)}}, time.Minute, transport{}, "test", newCmd)
-	if r.failed != 0 || r.ok != 1 {
-		t.Errorf("runPass(exit 24) = failed:%d ok:%d, want 0 1", r.failed, r.ok)
-	}
-	if !r.healthy() {
-		t.Errorf("healthy() = false, want true")
+
+	res := runJob(t.Context(), runJobJob(newRunJobSource(t)), time.Minute, transport{}, newCmd)
+
+	if res.success || res.exitCode != rsyncVanishedExit {
+		t.Errorf("runJob(exit 24 with evicted max-delete warning) = success:%v exitCode:%d, want false 24", res.success, res.exitCode)
 	}
 }
 

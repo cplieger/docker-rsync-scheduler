@@ -65,12 +65,13 @@ type healthMarker interface {
 	Set(healthy bool)
 }
 
-// healthController owns every health-state write to the marker. It enforces
-// one invariant the bare marker cannot: once shutdown begins, health is
+// healthController owns health-state writes after boot. It enforces one
+// invariant the bare marker cannot: once shutdown begins, health is
 // monotonic toward unhealthy — a pass finishing during drain can never flip
-// it back, and an interrupted-clean pass never writes at all. The marker
-// file's own unlink (runDaemon's exit defer) runs outside this mutex, safe
-// only because it happens after <-executorDone.
+// it back, and an interrupted-clean pass never writes at all. Two writes
+// bypass its mutex but are safe by ordering: runDaemon clears stale state
+// before construction and defers marker cleanup until after the executor
+// stops.
 type healthController struct {
 	marker   healthMarker
 	mu       sync.Mutex
@@ -96,10 +97,10 @@ func (h *healthController) markInitial(healthy bool) {
 // no state to record and a drain must not emit a healthy transition), and no
 // pass writes healthy once shutdown has begun.
 func (h *healthController) apply(r *passResult) {
-	if r.interrupted && r.failed == 0 {
+	healthy := r.healthy()
+	if r.interrupted && healthy {
 		return
 	}
-	healthy := r.healthy()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.draining && healthy {

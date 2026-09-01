@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -42,11 +43,29 @@ func TestRunClient_ExitCodesOverRealSocket(t *testing.T) {
 }
 
 // TestRunClient_DaemonUnreachableExitsOne pins the no-daemon failure mode:
-// an immediate exit 1 (the trigger reports a failed job), never a hang.
+// exit 1, never a hang, plus the phase-specific ERROR naming the socket
+// path and a remedy — neither of which the generic missing-result arm
+// carries. Not parallel: swaps the global slog default.
 func TestRunClient_DaemonUnreachableExitsOne(t *testing.T) {
+	rec := capture.Default(t)
 	sock := filepath.Join(t.TempDir(), "absent.sock")
+
 	if code := runClient(t.Context(), sock); code != 1 {
 		t.Errorf("runClient() = %d with no daemon, want 1", code)
+	}
+
+	const message = "cannot reach the scheduler daemon"
+	if count := rec.CountLevel(slog.LevelError, message); count != 1 {
+		t.Errorf("%q ERROR records = %d, want 1; logs = %q", message, count, rec.Messages())
+	}
+	if !rec.HasAttr(message, "path", sock) {
+		t.Errorf("%q missing path=%q; logs = %q", message, sock, rec.Messages())
+	}
+	if value, ok := rec.AttrValueExact(message, "error"); !ok || value == "" {
+		t.Errorf("%q error attribute = %q, %v, want non-empty, true", message, value, ok)
+	}
+	if value, ok := rec.AttrValueExact(message, "hint"); !ok || value == "" {
+		t.Errorf("%q hint attribute = %q, %v, want non-empty, true", message, value, ok)
 	}
 }
 
@@ -127,13 +146,10 @@ func TestRunClient_ConnectionLostReportsMissingResult(t *testing.T) {
 	}
 }
 
-// TestRunClient_CancelledWaitWarnsWithoutPaging pins the arm split off from the
-// catch-all: an operator interrupting the `docker exec` cancels the wait, not
-// the pass, so the record is a WARN saying the pass continues in the daemon —
-// never an ERROR asserting the connection was lost and the daemon stopped,
-// which is what the published Loki fault rule pages on. Exit stays 1 (the
-// trigger cannot report a result it never received). Not parallel: sets env and
-// swaps the global slog default.
+// TestRunClient_CancelledWaitWarnsWithoutPaging pins a cancelled wait as a
+// WARN rather than an ERROR: an operator's own interrupt is not a fault
+// anyone acts on. Exit stays 1 because the trigger received no final
+// result. Not parallel: sets env and swaps the global slog default.
 func TestRunClient_CancelledWaitWarnsWithoutPaging(t *testing.T) {
 	writeValidCfg(t, t.TempDir())
 	rec := capture.Default(t)
@@ -219,6 +235,46 @@ func TestRunClient_CancelledAfterSendReportsAcceptanceUnknown(t *testing.T) {
 	}
 	if state, ok := rec.AttrValueExact(message, "acceptance"); !ok || state != "unknown" {
 		t.Errorf("runClient() acceptance = %q, %v, want unknown, true", state, ok)
+	}
+}
+
+// TestRunClient_CancelledAfterAcceptanceReportsObserved pins the other half
+// of the cancellation arm: an interrupt landing AFTER the queued event was
+// relayed reports acceptance=observed, so a reader can tell "a pass is
+// running and I stopped watching" from "nothing was queued". Not parallel:
+// sets env and swaps the global slog default.
+func TestRunClient_CancelledAfterAcceptanceReportsObserved(t *testing.T) {
+	writeValidCfg(t, newRunJobSource(t))
+	rec := capture.Default(t)
+	release := make(chan struct{})
+	runner := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		<-release
+		return exec.CommandContext(ctx, "true")
+	}
+	sock, _ := startTestServer(t, runner)
+	t.Cleanup(func() { close(release) })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	clientDone := make(chan int, 1)
+	go func() { clientDone <- runClient(ctx, sock) }()
+
+	waitFor(t, 2*time.Second, func() bool {
+		return rec.CountExact("triggered sync accepted") == 1
+	}, "client did not observe queue acceptance")
+	cancel()
+
+	select {
+	case code := <-clientDone:
+		if code != 1 {
+			t.Errorf("runClient() after observed acceptance and cancellation = %d, want 1", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runClient() did not return after cancellation")
+	}
+	const message = "this trigger was interrupted while waiting"
+	if state, ok := rec.AttrValueExact(message, "acceptance"); !ok || state != "observed" {
+		t.Errorf("runClient() acceptance = %q, %v, want observed, true", state, ok)
 	}
 }
 

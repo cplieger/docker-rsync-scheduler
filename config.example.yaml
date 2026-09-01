@@ -1,8 +1,9 @@
 # docker-rsync-scheduler — example configuration.
 #
-# Copy to config.yaml and edit, then mount it at /config/config.yaml
-# (or point CONFIG_PATH elsewhere). The container fails fast with a clear
-# error if the config is missing or invalid.
+# Copy to config.yaml and edit, then mount its containing directory at /config
+# (or point CONFIG_PATH elsewhere). For live updates, atomically rename the new
+# config into that directory. The container fails fast with a clear error if
+# the config is missing or invalid.
 #
 # Each job pushes <local>/ to <remote_host>:<remote_path>/ one-way over
 # rsync+ssh. An empty <local> directory skips that job rather than letting

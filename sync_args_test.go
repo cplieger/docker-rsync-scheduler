@@ -64,6 +64,9 @@ func TestBuildRsyncArgs(t *testing.T) {
 		if hasChown(got) {
 			t.Errorf("--chown present with gid unset in %v", got)
 		}
+		if slices.Contains(got, "--super") {
+			t.Errorf("--super present with gid unset in %v", got)
+		}
 	})
 
 	t.Run("gid only does not add chown", func(t *testing.T) {
@@ -71,6 +74,9 @@ func TestBuildRsyncArgs(t *testing.T) {
 		got := buildRsyncArgs(argJob(false, nil, new(uint32(1000)), nil), transport{})
 		if hasChown(got) {
 			t.Errorf("--chown present with uid unset in %v", got)
+		}
+		if slices.Contains(got, "--super") {
+			t.Errorf("--super present with uid unset in %v", got)
 		}
 	})
 
@@ -114,7 +120,7 @@ func TestBuildRsyncArgs(t *testing.T) {
 		t.Parallel()
 		got := buildRsyncArgs(argJob(true, new(uint32(0)), new(uint32(0)), []string{"logs"}), transport{})
 		want := []string{
-			"-rlptD", "--delete", "--chown=0:0", "--stats", "-e", wantSSHAcceptNew,
+			"-rlptD", "--delete", "--chown=0:0", "--super", "--stats", "-e", wantSSHAcceptNew,
 			"--filter=- .stfolder", "--filter=- .stversions",
 			"--filter=- .DS_Store", "--filter=- Thumbs.db",
 			"--filter=- logs",

@@ -71,16 +71,13 @@ if rsync -rlptD "$del_dir/src/" "$del_dir/dst/" >/dev/null 2>&1; then
     err "$del_out"
     fail=1
   fi
-  case "$del_out" in
-    *"Deletions stopped due to --max-delete limit"*) ;;
-    *)
-      err "FAIL: rsync no longer prints 'Deletions stopped due to --max-delete limit' on a tripped cap."
-      err "      sync.go's rsyncDelLimitWarn constant is that exact string; without it a tripped"
-      err "      --max-delete reports as a clean healthy pass."
-      err "$del_out"
-      fail=1
-      ;;
-  esac
+  if ! printf '%s\n' "$del_out" | grep -q '^Deletions stopped due to --max-delete limit'; then
+    err "FAIL: rsync no longer prints 'Deletions stopped due to --max-delete limit' on a tripped cap."
+    err "      sync.go's rsyncDelLimitWarn constant is that exact string; without it a tripped"
+    err "      --max-delete reports as a clean healthy pass."
+    err "$del_out"
+    fail=1
+  fi
 else
   err "FAIL: local rsync seed transfer for the --max-delete check failed"
   fail=1
@@ -122,24 +119,34 @@ if [ -n "${RSYNC_EXPECTED_VERSION:-}" ]; then
   fi
 fi
 
-# sync.go's parseStats matches "Number of regular files transferred:" and the
-# transferred-size label in rsync --stats output; a future rsync major
-# renaming these would silently zero the parsed stats without failing any
-# sync, so pin the labels here at build time.
+# sync.go's parseStats reads three labels out of rsync --stats output, each
+# as the label followed by digits, so a rename OR a reformatted value zeroes
+# a stat without failing any sync. --delete makes the deletion count
+# non-zero: the "0" form carries no "(reg: N)" suffix, which the real one does.
 stats_dir=$(mktemp -d)
 mkdir -p "$stats_dir/src" "$stats_dir/dst"
 printf 'x' >"$stats_dir/src/f"
-if stats_out=$(rsync -rlptD --stats "$stats_dir/src/" "$stats_dir/dst/" 2>&1); then
-  for label in "Number of regular files transferred:" "Total transferred file size:"; do
-    case "$stats_out" in
-      *"$label"*) ;;
-      *)
-        err "FAIL: rsync --stats output missing label: '$label' (the scheduler's stats parser depends on it)"
-        err "$stats_out"
-        fail=1
-        ;;
-    esac
+printf 'y' >"$stats_dir/dst/gone"
+if stats_out=$(rsync -rlptD --delete --stats "$stats_dir/src/" "$stats_dir/dst/" 2>&1); then
+  for label in "Number of regular files transferred:" \
+    "Total transferred file size:" \
+    "Number of deleted files:"; do
+    printf '%s\n' "$stats_out" | grep -q "^${label}[[:space:]]*[0-9]" || {
+      err "FAIL: rsync --stats has no parseable value for '$label' (the scheduler's stats parser depends on it)"
+      err "$stats_out"
+      fail=1
+    }
   done
+  # The parsed number must be the deletion count: a "deleted files: 0 (reg: 1)"
+  # shape would parse as 0 with the label intact.
+  case "$stats_out" in
+    *"Number of deleted files: 1"*) ;;
+    *)
+      err "FAIL: rsync --stats did not report the single receiver-side deletion"
+      err "$stats_out"
+      fail=1
+      ;;
+  esac
 else
   err "FAIL: local rsync --stats transfer failed"
   err "$stats_out"

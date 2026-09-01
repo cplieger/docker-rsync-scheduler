@@ -28,12 +28,14 @@ func newRequest(trig string) *trigger.Job[struct{}] {
 // daemon carries the executor's dependencies.
 type daemon struct {
 	queue *trigger.Queue[struct{}]
-	// hc owns every health-state write; healthController's doc carries the
-	// exit-defer exception.
+	// hc owns health-state writes after boot; healthController documents the
+	// ordered boot-clear and exit-cleanup exceptions.
 	hc        *healthController
 	newCmd    scheduler.CommandRunner
 	timeout   time.Duration
 	transport transport
+	// Only the executor reads and writes advised.
+	advised [32]byte
 }
 
 // runDaemon runs the long-running container (the `daemon` subcommand): it
@@ -45,15 +47,16 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 	// Clear stale state before the first operation that can fail: /tmp
 	// survives a docker restart.
 	marker := health.NewMarker(healthMarkerPath)
-	marker.Set(false)
+	marker.Cleanup()
 	defer marker.Cleanup()
 
-	cfg, stage, err := loadConfig()
+	lc, stage, err := loadConfig()
 	if err != nil {
 		slog.Error("cannot load config", "path", configPath(), "stage", stage, "error", err,
 			"hint", "mount a config.yaml at this path — see config.example.yaml in the repo")
 		return err
 	}
+	adviseConfig(lc.cfg)
 	timeout := loadSyncTimeout()
 	interval, scheduleEnabled := loadInterval()
 	hostKeys, err := classifyKnownHosts(knownHostsPath)
@@ -80,6 +83,7 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 		newCmd:    newCmd,
 		timeout:   timeout,
 		transport: tr,
+		advised:   lc.digest,
 	}
 
 	executorDone := make(chan struct{})
@@ -95,9 +99,9 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 		mode, intervalAttr = "built-in", interval.String()
 	}
 	slog.Info("container started",
-		"mode", mode, "jobs", len(cfg.Jobs), "config", configPath(),
+		"mode", mode, "jobs", len(lc.cfg.Jobs), "config", configPath(),
 		"interval", intervalAttr, "timeout", timeout,
-		"ssh_hostkey_mode", hostKeys.String(),
+		"ssh_hostkey_mode", tr.hostKeys.String(),
 		"acls", tr.acls, "xattrs", tr.xattrs, "compress", cmp.Or(tr.compress, "off"),
 		"socket", socketPath)
 
@@ -175,14 +179,18 @@ func (d *daemon) tick(trig string) {
 func (d *daemon) run(ctx context.Context, trig string, _ struct{}) trigger.Outcome {
 	start := time.Now()
 
-	cfg, stage, err := loadConfig()
+	lc, stage, err := loadConfig()
 	if err != nil {
 		slog.Error("config reload failed", "path", configPath(), "stage", stage, "trigger", trig, "error", err)
 		d.hc.markUnhealthy()
 		return trigger.Outcome{OK: false, Duration: time.Since(start), Reason: "config reload failed"}
 	}
+	if lc.digest != d.advised {
+		adviseConfig(lc.cfg)
+		d.advised = lc.digest
+	}
 
-	res := runPass(ctx, cfg, d.timeout, d.transport, trig, d.newCmd)
+	res := runPass(ctx, lc.cfg, d.timeout, d.transport, trig, d.newCmd)
 	reportPass(&res)
 	d.hc.apply(&res)
 	out := trigger.Outcome{OK: res.healthy(), Duration: time.Since(start)}

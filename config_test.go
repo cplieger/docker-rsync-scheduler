@@ -488,6 +488,24 @@ func TestParseConfigInvalidYAML(t *testing.T) {
 	}
 }
 
+func TestParseConfig_rejectsInvalidUTF8(t *testing.T) {
+	t.Parallel()
+	tests := map[string]byte{
+		"raw_0x80": 0x80,
+		"raw_0xff": 0xff,
+	}
+	for name, invalid := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			doc := append([]byte("jobs:\n  - name: invalid"), invalid)
+			doc = append(doc, '\n')
+			if _, err := parseConfig(doc); err == nil {
+				t.Errorf("parseConfig(%s) = nil error, want invalid UTF-8 refusal", name)
+			}
+		})
+	}
+}
+
 // TestParseConfigUnknownKeyRejected pins the fail-loud unknown-key contract
 // from yamlenv.CheckUnknownKeys: a misspelled optional job key (max_delet
 // for max_delete) is a parse error naming the key, not a silently ignored
@@ -757,12 +775,12 @@ func TestLoadConfig_acceptsExactlyCapBytes(t *testing.T) {
 	t.Setenv("CONFIG_PATH", cfgPath)
 	t.Setenv("SYNC_INTERVAL", "")
 
-	cfg, _, err := loadConfig()
+	lc, _, err := loadConfig()
 	if err != nil {
 		t.Fatalf("loadConfig at exactly cap (%d bytes) = %v, want success", configCapBytes, err)
 	}
-	if len(cfg.Jobs) != 1 || cfg.Jobs[0].Name != "caddy" {
-		t.Errorf("loadConfig = %+v, want one caddy job", cfg.Jobs)
+	if len(lc.cfg.Jobs) != 1 || lc.cfg.Jobs[0].Name != "caddy" {
+		t.Errorf("loadConfig = %+v, want one caddy job", lc.cfg.Jobs)
 	}
 }
 
@@ -1019,21 +1037,6 @@ func TestSetupLogger_warningFiresOnlyForUnpublishedValues(t *testing.T) {
 	}
 }
 
-func TestLoadConfig_readErrorWhenPathIsDir(t *testing.T) {
-	dir := t.TempDir() // a directory: refused by the regular-file check
-
-	t.Setenv("CONFIG_PATH", dir)
-
-	_, _, err := loadConfig()
-
-	if err == nil {
-		t.Fatalf("loadConfig() with CONFIG_PATH=%q (a directory) = nil, want a read error", dir)
-	}
-	if !strings.Contains(err.Error(), "read config") {
-		t.Errorf("loadConfig() dir error = %q, want to contain 'read config'", err)
-	}
-}
-
 func TestValidateRemoteHost(t *testing.T) {
 	t.Parallel()
 	tests := []struct{ name, host, wantErr string }{
@@ -1133,11 +1136,13 @@ func TestValidate_warnsMaxDeleteWithoutDelete(t *testing.T) {
 			j := validJob("caddy", key)
 			j.MaxDelete = tt.maxDelete
 			j.Delete = tt.delete
-			if err := (config{Jobs: []job{j}}).validate(); err != nil {
+			cfg := config{Jobs: []job{j}}
+			if err := cfg.validate(); err != nil {
 				t.Fatalf("validate() = %v, want nil", err)
 			}
+			adviseConfig(cfg)
 			if got := rec.Contains(warning); got != tt.wantWarn {
-				t.Errorf("validate(max_delete=%v, delete=%v) warned=%v, want %v; logs=%q",
+				t.Errorf("adviseConfig(max_delete=%v, delete=%v) warned=%v, want %v; logs=%q",
 					tt.maxDelete, tt.delete, got, tt.wantWarn, rec.Messages())
 			}
 		})
@@ -1173,11 +1178,13 @@ func TestValidate_warnsLoneRemoteOwnership(t *testing.T) {
 			j := validJob("caddy", key)
 			j.RemoteUID = tt.uid
 			j.RemoteGID = tt.gid
-			if err := (config{Jobs: []job{j}}).validate(); err != nil {
+			cfg := config{Jobs: []job{j}}
+			if err := cfg.validate(); err != nil {
 				t.Fatalf("validate() = %v, want nil", err)
 			}
+			adviseConfig(cfg)
 			if got := rec.Contains(warning); got != tt.wantWarn {
-				t.Errorf("validate(uid_set=%v, gid_set=%v) warned=%v, want %v; logs=%q",
+				t.Errorf("adviseConfig(uid_set=%v, gid_set=%v) warned=%v, want %v; logs=%q",
 					tt.uid != nil, tt.gid != nil, got, tt.wantWarn, rec.Messages())
 			}
 			// When the advisory fires it must report WHICH side is set, so an
@@ -1190,6 +1197,47 @@ func TestValidate_warnsLoneRemoteOwnership(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestAdviseConfig_warnsEmptyExclude(t *testing.T) {
+	rec := capture.Default(t)
+	j := validJob("caddy", writeKey(t))
+	j.Excludes = []string{""}
+	cfg := config{Jobs: []job{j}}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil", err)
+	}
+
+	adviseConfig(cfg)
+
+	const warning = "empty excludes entry is ignored; an empty pattern excludes nothing"
+	if got := rec.CountExact(warning); got != 1 {
+		t.Errorf("adviseConfig() empty-exclude warnings = %d, want 1; logs=%q", got, rec.Messages())
+	}
+	if !rec.HasAttr(warning, "job", "caddy") {
+		t.Errorf("adviseConfig() empty-exclude warning missing job=caddy; logs=%q", rec.Messages())
+	}
+}
+
+func TestAdviseConfig_warnsExcludeWhitespace(t *testing.T) {
+	rec := capture.Default(t)
+	j := validJob("caddy", writeKey(t))
+	j.Excludes = []string{" *.log ", "   "}
+	cfg := config{Jobs: []job{j}}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil", err)
+	}
+
+	adviseConfig(cfg)
+
+	const warning = "exclude pattern has leading or trailing whitespace; rsync matches it literally"
+	if !rec.HasAttr(warning, "without_whitespace", "*.log") {
+		t.Errorf("adviseConfig() whitespace warning missing trimmed pattern; logs=%q", rec.Messages())
+	}
+	const emptyWarning = warning + "; the pattern excludes nothing"
+	if !rec.HasAttr(emptyWarning, "without_whitespace", "") {
+		t.Errorf("adviseConfig() whitespace-only warning missing empty consequence; logs=%q", rec.Messages())
 	}
 }
 
@@ -1274,11 +1322,13 @@ func TestValidate_warnsSharedDestinations(t *testing.T) {
 			a, b := validJob("a", key), validJob("b", key)
 			a.RemotePath, a.Delete = tt.pathA, tt.deleteA
 			b.RemotePath, b.Delete, b.RemoteHost = tt.pathB, tt.deleteB, tt.hostB
-			if err := (config{Jobs: []job{a, b}}).validate(); err != nil {
+			cfg := config{Jobs: []job{a, b}}
+			if err := cfg.validate(); err != nil {
 				t.Fatalf("validate() = %v, want nil", err)
 			}
+			adviseConfig(cfg)
 			if got := rec.Contains(warning); got != tt.wantWarn {
-				t.Errorf("validate(%q vs %q on %q) warned=%v, want %v; logs=%q",
+				t.Errorf("adviseConfig(%q vs %q on %q) warned=%v, want %v; logs=%q",
 					tt.pathA, tt.pathB, tt.hostB, got, tt.wantWarn, rec.Messages())
 			}
 		})
@@ -1306,11 +1356,13 @@ func TestValidate_sharedDestinationsIdentityIsTheHostComponent(t *testing.T) {
 			a, b := validJob("a", key), validJob("b", key)
 			a.RemoteHost, a.RemotePath, a.Delete = tt.hostA, "/srv/x", true
 			b.RemoteHost, b.RemotePath = tt.hostB, "/srv/x"
-			if err := (config{Jobs: []job{a, b}}).validate(); err != nil {
+			cfg := config{Jobs: []job{a, b}}
+			if err := cfg.validate(); err != nil {
 				t.Fatalf("validate() = %v, want nil", err)
 			}
+			adviseConfig(cfg)
 			if !rec.Contains(warning) {
-				t.Errorf("validate(%q vs %q) did not warn; logs=%q", tt.hostA, tt.hostB, rec.Messages())
+				t.Errorf("adviseConfig(%q vs %q) did not warn; logs=%q", tt.hostA, tt.hostB, rec.Messages())
 			}
 		})
 	}
@@ -1323,13 +1375,15 @@ func TestValidate_sharedDestinationsNormalizesIPv6Identity(t *testing.T) {
 	a.RemoteHost, a.RemotePath, a.Delete = "2001:db8::1", "/srv/x", true
 	b.RemoteHost, b.RemotePath = "2001:0db8:0:0:0:0:0:1", "/srv/x"
 
-	if err := (config{Jobs: []job{a, b}}).validate(); err != nil {
+	cfg := config{Jobs: []job{a, b}}
+	if err := cfg.validate(); err != nil {
 		t.Fatalf("validate() = %v, want nil", err)
 	}
+	adviseConfig(cfg)
 
 	const warning = "jobs share a remote destination tree"
 	if !rec.Contains(warning) {
-		t.Errorf("validate() with equivalent IPv6 spellings did not warn; logs=%q", rec.Messages())
+		t.Errorf("adviseConfig() with equivalent IPv6 spellings did not warn; logs=%q", rec.Messages())
 	}
 }
 
@@ -1345,13 +1399,15 @@ func TestValidate_sharedDestinationsSuppressionByKeyIsGone(t *testing.T) {
 	a.RemotePath, a.Delete = "/srv/x", true
 	b.RemotePath = "/srv/x"
 
-	if err := (config{Jobs: []job{a, b}}).validate(); err != nil {
+	cfg := config{Jobs: []job{a, b}}
+	if err := cfg.validate(); err != nil {
 		t.Fatalf("validate() = %v, want nil", err)
 	}
+	adviseConfig(cfg)
 
 	const warning = "jobs share a remote destination tree and one deletes"
 	if !rec.Contains(warning) {
-		t.Errorf("validate() with two ssh keys on one tree did not warn; logs=%q", rec.Messages())
+		t.Errorf("adviseConfig() with two ssh keys on one tree did not warn; logs=%q", rec.Messages())
 	}
 }
 
@@ -1371,13 +1427,82 @@ func TestValidate_sharedDestinationsOutputIsBounded(t *testing.T) {
 		jobs = append(jobs, j)
 	}
 
-	if err := (config{Jobs: jobs}).validate(); err != nil {
+	cfg := config{Jobs: jobs}
+	if err := cfg.validate(); err != nil {
 		t.Fatalf("validate() = %v, want nil", err)
 	}
+	adviseConfig(cfg)
 
 	const warning = "jobs share a remote destination tree and one deletes; each pass may delete the others' files"
 	if got := rec.CountExact(warning); got != 1 {
 		t.Errorf("validate() with 40 identical deleting destinations emitted %d advisory records, want 1", got)
+	}
+}
+
+func TestValidate_sharedDestinationsSamplesAreCappedAtThree(t *testing.T) {
+	rec := capture.Default(t)
+	key := writeKey(t)
+	root := validJob("root", key)
+	first := validJob("first", key)
+	second := validJob("second", key)
+	omitted := validJob("omitted", key)
+	root.RemotePath, root.Delete = "/a", true
+	first.RemotePath, first.Delete = "/a/b", true
+	second.RemotePath, second.Delete = "/a/c", true
+	omitted.RemotePath, omitted.Delete = "/a/d", true
+	cfg := config{Jobs: []job{root, first, second, omitted}}
+
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil", err)
+	}
+	adviseConfig(cfg)
+
+	const warning = "jobs share a remote destination tree"
+	if !rec.HasAttr(warning, "jobs", "4") {
+		t.Errorf("adviseConfig() advisory missing jobs=4; logs=%q", rec.Messages())
+	}
+	if !rec.HasAttr(warning, "deletes", "root, first, second") {
+		t.Errorf("adviseConfig() pruning-name sample is not capped at three; logs=%q", rec.Messages())
+	}
+	if rec.AttrContains(warning, "outermost_first", "omitted at /a/d (") {
+		t.Errorf("adviseConfig() member sample includes the fourth job; logs=%q", rec.Messages())
+	}
+}
+
+func TestValidate_sharedDestinationsSampleIsOutermostFirst(t *testing.T) {
+	rec := capture.Default(t)
+	key := writeKey(t)
+	deepest := validJob("deepest", key)
+	lexicalSecond := validJob("lexical-second", key)
+	lexicalFirst := validJob("lexical-first", key)
+	root := validJob("root", key)
+	deepest.RemotePath = "/a/deep/path"
+	lexicalSecond.RemotePath = "/a/cc"
+	lexicalFirst.RemotePath = "/a/bb"
+	root.RemotePath, root.Delete = "/a", true
+	cfg := config{Jobs: []job{deepest, lexicalSecond, lexicalFirst, root}}
+
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil", err)
+	}
+	adviseConfig(cfg)
+
+	const warning = "jobs share a remote destination tree"
+	got, ok := rec.AttrValue(warning, "outermost_first")
+	if !ok {
+		t.Fatalf("adviseConfig() advisory has no outermost_first attribute; logs=%q", rec.Messages())
+	}
+	rootIndex := strings.Index(got, "root at /a (")
+	firstIndex := strings.Index(got, "lexical-first at /a/bb (")
+	secondIndex := strings.Index(got, "lexical-second at /a/cc (")
+	if rootIndex < 0 || firstIndex < 0 || secondIndex < 0 {
+		t.Fatalf("adviseConfig() outermost_first = %q, want root, lexical-first, and lexical-second", got)
+	}
+	if !(rootIndex < firstIndex && firstIndex < secondIndex) {
+		t.Errorf("adviseConfig() outermost_first = %q, want root then lexical-first then lexical-second", got)
+	}
+	if strings.Contains(got, "deepest at /a/deep/path (") {
+		t.Errorf("adviseConfig() outermost_first = %q, want the deeper fourth member outside the sample", got)
 	}
 }
 
@@ -1396,9 +1521,11 @@ func TestValidate_sharedDestinationsOneRecordPerTree(t *testing.T) {
 		jobs = append(jobs, j)
 	}
 
-	if err := (config{Jobs: jobs}).validate(); err != nil {
+	cfg := config{Jobs: jobs}
+	if err := cfg.validate(); err != nil {
 		t.Fatalf("validate() = %v, want nil", err)
 	}
+	adviseConfig(cfg)
 
 	const warning = "jobs share a remote destination tree and one deletes; each pass may delete the others' files"
 	if got := rec.CountExact(warning); got != 2 {
@@ -1425,9 +1552,11 @@ func TestValidate_sharedDestinationsFindsInterleavedSiblingPrefix(t *testing.T) 
 		jobs = append(jobs, j)
 	}
 
-	if err := (config{Jobs: jobs}).validate(); err != nil {
+	cfg := config{Jobs: jobs}
+	if err := cfg.validate(); err != nil {
 		t.Fatalf("validate() = %v, want nil", err)
 	}
+	adviseConfig(cfg)
 
 	const warning = "jobs share a remote destination tree and one deletes; each pass may delete the others' files"
 	if got := rec.CountExact(warning); got != 1 {
@@ -1439,6 +1568,68 @@ func TestValidate_sharedDestinationsFindsInterleavedSiblingPrefix(t *testing.T) 
 	}
 	if !rec.HasAttr(warning, "jobs", "2") {
 		t.Errorf("advisory jobs count is not 2, so /data-old was folded in; logs=%q", rec.Messages())
+	}
+}
+
+func TestValidate_invalidJobDoesNotEmitSharedDestinationAdvisory(t *testing.T) {
+	rec := capture.Default(t)
+	source := t.TempDir()
+	cfgPath := writeValidCfg(t, source)
+	key := filepath.Join(filepath.Dir(cfgPath), "id_ed25519")
+	doc := "jobs:\n" +
+		"  - name: \"bad\\x7fname\"\n    local: " + source + "\n" +
+		"    remote_host: root@192.0.2.10\n    remote_path: /srv/shared\n" +
+		"    ssh_key: " + key + "\n    delete: true\n" +
+		"  - name: other\n    local: " + source + "\n" +
+		"    remote_host: root@192.0.2.10\n    remote_path: /srv/shared\n" +
+		"    ssh_key: " + key + "\n"
+	if err := os.WriteFile(cfgPath, []byte(doc), 0o600); err != nil {
+		t.Fatalf("write invalid overlapping config: %v", err)
+	}
+	d := &daemon{hc: newHealthController(health.NewMarker(filepath.Join(t.TempDir(), "marker")))}
+
+	out := d.run(t.Context(), "external", struct{}{})
+
+	if out.OK {
+		t.Error("daemon.run() with an invalid overlapping config ok = true, want false")
+	}
+	if !rec.AttrContains("config reload failed", "error", "control characters") {
+		t.Errorf("daemon.run() error does not report the control-character refusal; logs=%q", rec.Messages())
+	}
+	const warning = "jobs share a remote destination tree and one deletes"
+	if rec.Contains(warning) {
+		t.Errorf("daemon.run() on a refused config emitted the shared-destination advisory; logs=%q", rec.Messages())
+	}
+}
+
+func TestValidate_sharedDestinationsReportsOnlyTreesAtRiskFromDelete(t *testing.T) {
+	rec := capture.Default(t)
+	key := writeKey(t)
+	ancestor := validJob("ancestor", key)
+	pruningChild := validJob("pruning-child", key)
+	sibling := validJob("sibling", key)
+	ancestor.RemotePath = "/a"
+	pruningChild.RemotePath, pruningChild.Delete = "/a/b", true
+	sibling.RemotePath = "/a/c"
+	cfg := config{Jobs: []job{ancestor, pruningChild, sibling}}
+
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("validate() = %v, want nil", err)
+	}
+	adviseConfig(cfg)
+
+	const warning = "jobs share a remote destination tree"
+	if !rec.HasAttr(warning, "jobs", "2") {
+		t.Errorf("adviseConfig() advisory missing jobs=2; logs=%q", rec.Messages())
+	}
+	if !rec.AttrContains(warning, "outermost_first", "ancestor at /a (") {
+		t.Errorf("adviseConfig() advisory missing the non-pruning ancestor; logs=%q", rec.Messages())
+	}
+	if !rec.AttrContains(warning, "outermost_first", "pruning-child at /a/b (") {
+		t.Errorf("adviseConfig() advisory missing the pruning child; logs=%q", rec.Messages())
+	}
+	if rec.AttrContains(warning, "outermost_first", "sibling at /a/c (") {
+		t.Errorf("adviseConfig() advisory includes an unaffected sibling; logs=%q", rec.Messages())
 	}
 }
 
@@ -1491,6 +1682,29 @@ func TestLoadTransport(t *testing.T) {
 				t.Errorf("loadTransport() = %+v, want %+v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestLoadTransport_UnrecognizedCompressionWarns(t *testing.T) {
+	rec := capture.Default(t)
+	t.Setenv("SYNC_ACLS", "")
+	t.Setenv("SYNC_XATTRS", "")
+	t.Setenv("SYNC_COMPRESS", "brotli")
+
+	got := loadTransport(hostKeyAcceptNew)
+
+	if got.compress != "" {
+		t.Errorf("loadTransport() compress = %q, want off", got.compress)
+	}
+	const message = "unrecognized SYNC_COMPRESS, compression stays off"
+	if count := rec.CountLevel(slog.LevelWarn, message); count != 1 {
+		t.Errorf("%q WARN records = %d, want 1; logs = %q", message, count, rec.Messages())
+	}
+	if !rec.HasAttr(message, "value", "brotli") {
+		t.Errorf("%q missing value=brotli; logs = %q", message, rec.Messages())
+	}
+	if !rec.HasAttr(message, "accepted", "off|on|auto|zstd|lz4|zlib") {
+		t.Errorf("%q missing accepted choices; logs = %q", message, rec.Messages())
 	}
 }
 
