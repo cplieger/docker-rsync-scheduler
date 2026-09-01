@@ -144,7 +144,7 @@ Every job also receives a fixed set of global excludes: `.stfolder`, `.stversion
 
 ## Healthcheck
 
-The built-in healthcheck (`docker-rsync-scheduler health`) checks for a marker file that is set after each sync pass: healthy when the most recent pass had zero failed jobs, unhealthy when any job failed. Empty-source skips count as success. A pass whose rsync ends with the vanished-files warning (exit 24) also counts as success: it logs `level=WARN msg="sync completed with vanished source files"` with the exit code and the byte counts, and leaves the marker healthy. The container recovers automatically on the next clean pass, no restart required. In built-in mode it begins unhealthy and flips after the startup pass, so size `healthcheck.start_period` for the time the initial pass may take (the baked default is 120s); built-in mode also arms a freshness deadline of `2×SYNC_INTERVAL + jobs×SYNC_TIMEOUT`, so a wedged interval loop (marker present but never refreshed) eventually probes unhealthy. In external mode the container starts healthy (idle, nothing has failed), each triggered `sync` updates the marker, and no deadline is armed (a marker between sparse triggers must not expire).
+The built-in healthcheck (`docker-rsync-scheduler health`) checks for a marker file that is set after each sync pass: healthy when the most recent pass had zero failed jobs, unhealthy when any job failed. A pass that cannot reload the config runs no job and also leaves the marker unhealthy. Empty-source skips count as success. A pass whose rsync ends with the vanished-files warning (exit 24) also counts as success: it logs `level=WARN msg="sync completed with vanished source files"` with the exit code and the byte counts, and leaves the marker healthy. The container recovers automatically on the next clean pass, no restart required. In built-in mode it begins unhealthy and flips after the startup pass, so size `healthcheck.start_period` for the time the initial pass may take (the baked default is 120s); built-in mode also arms a freshness deadline of `2×SYNC_INTERVAL + jobs×SYNC_TIMEOUT`, so a wedged interval loop (marker present but never refreshed) eventually probes unhealthy. In external mode the container starts healthy (idle, nothing has failed), each triggered `sync` updates the marker, and no deadline is armed (a marker between sparse triggers must not expire).
 
 > An empty source is skipped as a success, so a job whose source silently becomes empty (for example a read-only bind mount that failed to mount and Docker materialised as an empty directory) keeps the container healthy and never logs at `level=ERROR`; it is invisible to both the error-level and heartbeat-absence alerts. Each skip emits a `level=WARN msg="skip empty source"` line and the `sync cycle complete` heartbeat carries a `skipped` count. Alert on a persistently non-zero `skipped` (or `skipped == jobs`) across several consecutive passes, or on the recurring warning, to catch a vanished source before the remote mirror goes stale.
 
@@ -165,18 +165,20 @@ groups:
       - alert: RsyncSchedulerSyncFailed
         expr: |
           sum by (container) (count_over_time(
-            {container="rsync"} |= `msg="sync failed"` [15m]
+            {container="rsync"} |= `level=ERROR` [15m]
           )) > 0
         for: 0m
         labels:
           severity: warning
         annotations:
-          summary: "docker-rsync-scheduler failed a sync job"
+          summary: "docker-rsync-scheduler logged an error"
           description: >
-            A job logged "sync failed". Rsync failures include rsync_exit,
-            timed_out, and a bounded stderr tail. A source-read failure includes
-            its path and error instead. That job's remote mirror is now stale.
-            Check the source path, remote host, ssh key, and connectivity.
+            The container logged an Error record. A failed job logs
+            "sync failed" with rsync_exit, timed_out and a bounded stderr tail;
+            a source-read failure logs its path and error instead; a config edit
+            the daemon cannot reload logs "config reload failed" and runs no job.
+            The affected remote mirror is now stale. Check the config, the source
+            path, the remote host, the ssh key, and connectivity.
       - alert: RsyncSchedulerStalled
         expr: |
           absent_over_time({container="rsync"} |= `sync cycle complete` [8h])
@@ -196,7 +198,7 @@ groups:
 
 `RsyncSchedulerStalled` matches an Info record, so it needs `LOG_LEVEL` at
 `debug` or `info`; at `warn` or `error` the heartbeat is never emitted and the
-rule fires permanently. The `sync failed` fault rule is an Error record and is
+rule fires permanently. The fault rule keys on Error records and is
 unaffected.
 
 The "sync cycle complete" line is emitted whether a pass finished clean or with
@@ -219,7 +221,7 @@ silently gone empty, and a pass whose rsync reports vanished source files
 
 ## Security
 
-No network listener, no HTTP server, no exposed ports. Triggering is an in-container unix socket (`/tmp/docker-rsync-scheduler.sock`, owner-only `0600`), so trigger authority is scoped to the container's own user, the same boundary `docker exec` already enforces. The image ships `openssh-client` only, no `sshd`. Each job is executed with an explicit argument slice via `exec.CommandContext`, and the `-e "ssh ..."` value is one argument that rsync splits into an argv vector itself, so nothing on the local side reaches a shell. The destination argument does reach the remote login shell, so `remote_path` alone is held to a shell-metacharacter refusal, and it also refuses glob characters (`*?[]`), which rsync deliberately does not escape: a pattern-shaped path lets the remote side pick whichever tree matches, and under `--delete` that is the wrong tree. Config is validated at startup and reloaded per pass: required fields present, names unique, `local`/`remote_path` absolute, `remote_host` matched against a strict pattern, the ssh key readable, `ssh_key` and `remote_path` free of spaces, and every field refused ASCII control characters.
+No network listener, no HTTP server, no exposed ports. Triggering is an in-container unix socket (`/tmp/docker-rsync-scheduler.sock`, owner-only `0600`), so trigger authority is scoped to the container's own user, the same boundary `docker exec` already enforces. The image ships `openssh-client` only, no `sshd`. Each job is executed with an explicit argument slice via `exec.CommandContext`, and the `-e "ssh ..."` value is one argument that rsync splits into an argv vector itself, so nothing on the local side reaches a shell. The destination argument does reach the remote login shell, so `remote_path` alone is held to a shell-metacharacter refusal, and it also refuses glob characters (`*?[]`), which rsync deliberately does not escape: a pattern-shaped path lets the remote side pick whichever tree matches, and under `--delete` that is the wrong tree. Config is validated at startup and reloaded per pass: required fields present, names unique, `local`/`remote_path` absolute, `remote_host` matched against a strict pattern, the ssh key readable, `remote_path` free of spaces, `ssh_key` free of spaces and quotes, and every field refused ASCII control characters.
 
 ### Editing the config of a running container
 
