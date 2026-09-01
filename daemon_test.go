@@ -128,7 +128,7 @@ func TestDaemonRun_populatesDurationOnEveryOutcome(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		writeValidCfg(t, t.TempDir())
 		d := &daemon{
-			hc:      newHealthController(&fakeMarker{}),
+			health:  newTestHealth(t),
 			newCmd:  fixedRunner("true"),
 			timeout: time.Minute,
 		}
@@ -145,7 +145,7 @@ func TestDaemonRun_populatesDurationOnEveryOutcome(t *testing.T) {
 
 	t.Run("reload_failure", func(t *testing.T) {
 		t.Setenv("CONFIG_PATH", filepath.Join(t.TempDir(), "absent.yaml"))
-		d := &daemon{hc: newHealthController(&fakeMarker{})}
+		d := &daemon{health: newTestHealth(t)}
 
 		out := d.run(t.Context(), "external", struct{}{})
 
@@ -170,7 +170,7 @@ func TestDaemonRun_advisesOncePerDistinctConfigDocument(t *testing.T) {
 		t.Fatalf("write advisory config: %v", err)
 	}
 	d := &daemon{
-		hc:      newHealthController(&fakeMarker{}),
+		health:  newTestHealth(t),
 		newCmd:  fixedRunner("true"),
 		timeout: time.Minute,
 	}
@@ -326,7 +326,7 @@ func TestDaemonRun_failedInterruptedPassLeavesFailureFallback(t *testing.T) {
 		return exec.CommandContext(cmdCtx, "sleep", "30")
 	}
 	d := &daemon{
-		hc:      newHealthController(&fakeMarker{}),
+		health:  newTestHealth(t),
 		newCmd:  runner,
 		timeout: time.Minute,
 	}
@@ -773,7 +773,7 @@ func TestRunDaemon_ExternalModeBootsHealthyServesAndShutsDownCleanly(t *testing.
 }
 
 // TestRunDaemon_BuiltinModeStartsUnhealthyUntilStartupPassCompletes pins the
-// built-in arm of hc.markInitial(!cfg.ScheduleEnabled): the container reports
+// built-in arm of state.Set(!cfg.ScheduleEnabled): the container reports
 // unhealthy until the startup pass proves rsync can run. The runner blocks
 // command construction, so the marker is sampled after built-in
 // initialization but before the startup pass can flip it. Not parallel: it

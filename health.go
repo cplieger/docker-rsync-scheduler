@@ -2,7 +2,6 @@ package main
 
 import (
 	"math"
-	"sync"
 	"time"
 
 	"github.com/cplieger/health"
@@ -59,72 +58,15 @@ func (f freshness) lease() time.Duration {
 	return lease + f.timeout*time.Duration(f.jobs)
 }
 
-// healthMarker is the marker behaviour healthController depends on.
-// *health.Marker satisfies it; tests inject a fake to observe writes.
-type healthMarker interface {
-	Set(healthy bool)
-}
-
-// healthController owns health-state writes after boot. It enforces one
-// invariant the bare marker cannot: once shutdown begins, health is
-// monotonic toward unhealthy — a pass finishing during drain can never flip
-// it back, and an interrupted-clean pass never writes at all. Two writes
-// bypass its mutex but are safe by ordering: runDaemon clears stale state
-// before construction and defers marker cleanup until after the executor
-// stops.
-type healthController struct {
-	marker   healthMarker
-	mu       sync.Mutex
-	draining bool
-}
-
-// newHealthController returns a controller that writes through marker.
-func newHealthController(marker healthMarker) *healthController {
-	return &healthController{marker: marker}
-}
-
-// markInitial sets the pre-pass state: unhealthy for the built-in scheduler
-// (no pass has run yet, so the first completed pass flips it) and healthy for
-// the idle external-trigger container (nothing has failed).
-func (h *healthController) markInitial(healthy bool) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.marker.Set(healthy)
-}
-
-// apply translates a pass result into a marker write, and holds both drain
-// rules: an interrupted-clean pass writes nothing (no job failed, so there is
-// no state to record and a drain must not emit a healthy transition), and no
-// pass writes healthy once shutdown has begun.
-func (h *healthController) apply(r *passResult) {
-	healthy := r.healthy()
-	if r.interrupted && healthy {
+// applyPassHealth maps rsync's pass policy onto the shared shutdown latch.
+// An interrupted pass with no job failure writes nothing: its partial success
+// must not replace the last completed pass's health. Every other result writes
+// its ordinary healthy verdict; the latch prevents a late healthy verdict from
+// masking shutdown.
+func applyPassHealth(latch *health.Latch, result *passResult) {
+	healthy := result.healthy()
+	if result.interrupted && healthy {
 		return
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.draining && healthy {
-		return
-	}
-	h.marker.Set(healthy)
-}
-
-// beginDrain latches shutdown and marks unhealthy immediately, so observers
-// see the draining signal before in-flight work finishes. After it, apply can
-// never restore healthy.
-func (h *healthController) beginDrain() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.draining = true
-	h.marker.Set(false)
-}
-
-// markUnhealthy writes an unconditional unhealthy marker for a failure that
-// happens outside a pass (the executor's per-pass config reload failing).
-// Unhealthy writes are always permitted — draining or not — so this takes
-// the lock only to serialize with the other writers.
-func (h *healthController) markUnhealthy() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.marker.Set(false)
+	latch.Set(healthy)
 }

@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cplieger/health"
 	"github.com/cplieger/scheduler/v4"
 	"github.com/cplieger/slogx/capture"
 )
@@ -783,10 +784,12 @@ func TestRunPass_timeoutRemainsFailureAfterParentCancellation(t *testing.T) {
 	if !rec.HasAttr("sync failed", "timed_out", "true") {
 		t.Errorf("sync failed record missing timed_out=true; logs = %q", rec.Messages())
 	}
-	m := &fakeMarker{}
-	newHealthController(m).apply(&r)
-	if value, writes := m.state(); value || writes != 1 {
-		t.Errorf("marker state = (%v, %d writes), want (false, 1 write)", value, writes)
+	markerPath := filepath.Join(t.TempDir(), "healthy")
+	state := health.NewLatch(health.NewMarker(markerPath))
+	state.Set(true)
+	applyPassHealth(state, &r)
+	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
+		t.Errorf("health marker after timed-out pass: stat error = %v, want not-exist", err)
 	}
 }
 

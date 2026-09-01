@@ -28,9 +28,8 @@ func newRequest(trig string) *trigger.Job[struct{}] {
 // daemon carries the executor's dependencies.
 type daemon struct {
 	queue *trigger.Queue[struct{}]
-	// hc owns health-state writes after boot; healthController documents the
-	// ordered boot-clear and exit-cleanup exceptions.
-	hc        *healthController
+	// health owns every marker write after the pre-construction stale clear.
+	health    *health.Latch
 	newCmd    scheduler.CommandRunner
 	transport transport
 	timeout   time.Duration
@@ -72,14 +71,14 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 		return err
 	}
 
-	hc := newHealthController(marker)
+	state := health.NewLatch(marker)
 	// Inverted on purpose: built-in scheduling starts UNHEALTHY.
-	hc.markInitial(!scheduleEnabled)
+	state.Set(!scheduleEnabled)
 
 	tr := loadTransport(hostKeys)
 	d := &daemon{
 		queue:     trigger.NewQueue[struct{}](queueCapacity),
-		hc:        hc,
+		health:    state,
 		newCmd:    newCmd,
 		timeout:   timeout,
 		transport: tr,
@@ -121,7 +120,7 @@ func runDaemon(ctx context.Context, socketPath string, newCmd scheduler.CommandR
 	slog.Info("shutting down", "cause", context.Cause(ctx))
 	// Latch unhealthy immediately so observers see the drain before the
 	// in-flight pass resolves.
-	hc.beginDrain()
+	state.BeginDrain()
 
 	// Stop admission, then wait: the executor delivers the interrupted
 	// in-flight pass's result and cancellation results to everything still
@@ -182,7 +181,7 @@ func (d *daemon) run(ctx context.Context, trig string, _ struct{}) trigger.Outco
 	lc, stage, err := loadConfig()
 	if err != nil {
 		slog.Error("config reload failed", "path", configPath(), "stage", stage, "trigger", trig, "error", err)
-		d.hc.markUnhealthy()
+		d.health.Set(false)
 		return trigger.Outcome{OK: false, Duration: time.Since(start), Reason: "config reload failed"}
 	}
 	if lc.digest != d.advised {
@@ -192,7 +191,7 @@ func (d *daemon) run(ctx context.Context, trig string, _ struct{}) trigger.Outco
 
 	res := runPass(ctx, lc.cfg, d.timeout, d.transport, trig, d.newCmd)
 	reportPass(&res)
-	d.hc.apply(&res)
+	applyPassHealth(d.health, &res)
 	out := trigger.Outcome{OK: res.healthy(), Duration: time.Since(start)}
 	if out.OK && res.interrupted {
 		out.Reason = "pass cut short by shutdown; remaining jobs did not run"

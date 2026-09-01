@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/cplieger/envx/yamlenv/v2"
-	"github.com/cplieger/health"
 	"github.com/cplieger/slogx/capture"
 )
 
@@ -724,7 +723,7 @@ func TestDaemonRun_ConfigFailureLogsOneActionableRecord(t *testing.T) {
 				}
 			}
 			t.Setenv("CONFIG_PATH", path)
-			d := &daemon{hc: newHealthController(health.NewMarker(filepath.Join(t.TempDir(), "marker")))}
+			d := &daemon{health: newTestHealth(t)}
 
 			out := d.run(t.Context(), "external", struct{}{})
 			if out.OK || out.Reason != "config reload failed" {
@@ -1585,7 +1584,7 @@ func TestValidate_invalidJobDoesNotEmitSharedDestinationAdvisory(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte(doc), 0o600); err != nil {
 		t.Fatalf("write invalid overlapping config: %v", err)
 	}
-	d := &daemon{hc: newHealthController(health.NewMarker(filepath.Join(t.TempDir(), "marker")))}
+	d := &daemon{health: newTestHealth(t)}
 
 	out := d.run(t.Context(), "external", struct{}{})
 
