@@ -171,10 +171,9 @@ func loadConfig() (loadedConfig, string, error) {
 	return loadedConfig{cfg: cfg, digest: sha256.Sum256(data)}, "", nil
 }
 
-// readCappedConfig reads path, refusing a non-regular file and any document
-// over configCapBytes. A nonblocking open prevents a FIFO wait. The size
-// bound is enforced on the bytes read, since a regular file can grow after
-// it is opened; the +1 makes "exceeds" decidable.
+// readCappedConfig reads path through openRegular, refusing any document over
+// configCapBytes. The bound is enforced on the bytes read, since a regular
+// file can grow after it is opened; the +1 makes "exceeds" decidable.
 func readCappedConfig(path string) ([]byte, error) {
 	f, err := openRegular(path)
 	if err != nil {
@@ -491,6 +490,10 @@ func (j *job) checkNoForbiddenChars() error {
 	return nil
 }
 
+// checkOwnership refuses the one uint32 chown(2) reads as "leave the id
+// unchanged", -1. rsync refuses it too ("uid 4294967295 (-1) is impossible to
+// set", exit 23), so accepting it only moves the failure into the middle of a
+// transfer.
 func (j *job) checkOwnership() error {
 	for _, f := range []struct {
 		key string
@@ -500,14 +503,16 @@ func (j *job) checkOwnership() error {
 		{"remote_gid", j.RemoteGID},
 	} {
 		if f.val != nil && *f.val == math.MaxUint32 {
-			return fmt.Errorf("job %q: %s must be 0-%d", j.Name, f.key,
-				uint32(math.MaxUint32)-1)
+			return fmt.Errorf(
+				"job %q: %s %d means \"leave unchanged\" to chown (-1 as an unsigned id), "+
+					"which rsync refuses; omit the field instead", j.Name, f.key, *f.val)
 		}
 	}
 	return nil
 }
 
-// warnInertSettings logs accepted job settings that have no effect.
+// warnInertSettings logs accepted job settings that are inert, or whose
+// spelling rsync reads more literally than the operator likely intended.
 func (j *job) warnInertSettings() {
 	// max_delete only takes effect with delete:true -- buildRsyncArgs emits
 	// --max-delete inside the --delete branch.
@@ -537,11 +542,7 @@ func (j *job) warnInertSettings() {
 		if trimmed == e {
 			continue
 		}
-		message := "exclude pattern has leading or trailing whitespace; rsync matches it literally"
-		if trimmed == "" {
-			message += "; the pattern excludes nothing"
-		}
-		slog.Warn(message,
+		slog.Warn("exclude pattern has leading or trailing whitespace; rsync matches it literally",
 			"job", j.Name, "exclude", e, "without_whitespace", trimmed)
 	}
 }
@@ -614,8 +615,13 @@ func checkReadable(path string) error {
 	return nil
 }
 
+// errNotRegular is returned unwrapped by openRegular so callers can branch on
+// it with errors.Is.
 var errNotRegular = errors.New("not a regular file")
 
+// openRegular opens path for reading and refuses anything but a regular file
+// with errNotRegular. The nonblocking open is load-bearing: opening a FIFO
+// without it waits for a writer that may never arrive.
 func openRegular(path string) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0) // #nosec G304 -- trusted, operator-mounted path
 	if err != nil {

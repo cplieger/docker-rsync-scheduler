@@ -102,7 +102,7 @@ func TestDelLimitCapture_matchesPrefixAcrossWritesBeforeTailEviction(t *testing.
 	t.Parallel()
 
 	tail := &cappedBuffer{max: 8}
-	capture := &delLimitCapture{dst: tail, matching: true}
+	capture := &delLimitCapture{dst: tail}
 	split := len(rsyncDelLimitWarn) / 2
 	if _, err := capture.Write([]byte(rsyncDelLimitWarn[:split])); err != nil {
 		t.Fatalf("first Write() error = %v, want nil", err)

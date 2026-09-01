@@ -361,7 +361,7 @@ func runJob(ctx context.Context, j *job, timeout time.Duration, tr transport, ne
 
 	outBuf := &cappedBuffer{max: outputCapBytes}
 	errBuf := &cappedBuffer{max: outputCapBytes}
-	delLimit := &delLimitCapture{dst: errBuf, matching: true}
+	delLimit := &delLimitCapture{dst: errBuf}
 	cmd := newCmd(jobCtx, "rsync", buildRsyncArgs(j, tr)...)
 	var cancelSent atomic.Bool
 	if cancelCmd := cmd.Cancel; cancelCmd != nil {
@@ -460,6 +460,7 @@ func runJob(ctx context.Context, j *job, timeout time.Duration, tr transport, ne
 		"job", j.Name,
 		"duration_ms", res.duration.Milliseconds(),
 		"timed_out", errors.Is(jobCtx.Err(), context.DeadlineExceeded),
+		"del_limited", delLimited,
 		"error", runErr,
 		"rsync_exit", res.exitCode,
 		"stderr", res.stderrTail)
@@ -536,10 +537,15 @@ func reportPass(r *passResult) {
 		"duration_ms", r.duration.Milliseconds())
 }
 
+// delLimitCapture tees rsync's stderr into dst while watching the byte
+// stream for rsyncDelLimitWarn at a line start. The anchor is a raw
+// '\n', which a filename cannot forge: rsync escapes control bytes in
+// the names it prints, so a newline in a name renders as \#012. The
+// zero value is ready to use -- a stream's first byte is a line start.
 type delLimitCapture struct {
 	dst         *cappedBuffer
 	prefixIndex int
-	matching    bool
+	unmatched   bool
 	limited     bool
 }
 
@@ -550,10 +556,11 @@ func (c *delLimitCapture) Write(p []byte) (int, error) {
 			switch {
 			case b == '\n':
 				c.prefixIndex = 0
-				c.matching = true
-			case !c.matching:
+				c.unmatched = false
+			case c.unmatched:
+				// Past a divergence: the rest of this line cannot match.
 			case b != rsyncDelLimitWarn[c.prefixIndex]:
-				c.matching = false
+				c.unmatched = true
 			default:
 				c.prefixIndex++
 				if c.prefixIndex == len(rsyncDelLimitWarn) {

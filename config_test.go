@@ -1235,9 +1235,8 @@ func TestAdviseConfig_warnsExcludeWhitespace(t *testing.T) {
 	if !rec.HasAttr(warning, "without_whitespace", "*.log") {
 		t.Errorf("adviseConfig() whitespace warning missing trimmed pattern; logs=%q", rec.Messages())
 	}
-	const emptyWarning = warning + "; the pattern excludes nothing"
-	if !rec.HasAttr(emptyWarning, "without_whitespace", "") {
-		t.Errorf("adviseConfig() whitespace-only warning missing empty consequence; logs=%q", rec.Messages())
+	if !rec.HasAttr(warning, "without_whitespace", "") {
+		t.Errorf("adviseConfig() whitespace-only warning missing trimmed pattern; logs=%q", rec.Messages())
 	}
 }
 

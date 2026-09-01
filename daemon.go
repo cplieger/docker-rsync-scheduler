@@ -34,7 +34,7 @@ type daemon struct {
 	newCmd    scheduler.CommandRunner
 	timeout   time.Duration
 	transport transport
-	// Only the executor reads and writes advised.
+	// Written at construction, then read and written only by the executor.
 	advised [32]byte
 }
 
