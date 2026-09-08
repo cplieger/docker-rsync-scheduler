@@ -48,8 +48,7 @@ func TestExecutor_MarkerFollowsPassOutcome(t *testing.T) {
 // actionable reason, flips the marker unhealthy, and never invokes rsync.
 // Not parallel: sets env.
 func TestExecutor_ConfigReloadFailureFailsRequestAndMarker(t *testing.T) {
-	prev := slog.Default()
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	restoreLogger(t)
 
 	invoked := false
 	runner := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
