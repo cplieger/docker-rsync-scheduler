@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"log"
+	"log/slog"
 	"net"
 	"os/exec"
 	"path/filepath"
@@ -145,5 +149,56 @@ func nextEvent(t *testing.T, dec *json.Decoder) trigger.Event {
 	case <-time.After(5 * time.Second):
 		t.Fatal("no event within 5s")
 		return trigger.Event{}
+	}
+}
+
+// restoreLogger saves slog's default logger together with the log package's
+// writer and flags, restoring all three on cleanup. Use it around any code
+// that installs a default logger, setupLogger included.
+//
+// slog.SetDefault also points the log package at the installed handler and
+// zeroes its flags, and skips that redirect for slog's own default handler, so
+// restoring slog alone leaves log writing into a dead handler. slog goes back
+// first: reinstalling a non-default prev re-runs the redirect.
+func restoreLogger(t *testing.T) {
+	t.Helper()
+	prev, prevWriter, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+	})
+}
+
+// TestRestoreLogger_restoresLogPackage pins all three globals slog.SetDefault
+// mutates. A sentinel writer and a non-zero flag set are installed first so
+// neither assertion can hold by accident: the incomplete restore leaves the
+// log package aimed at the swapped handler with its flags zeroed, which
+// silences every later slog call in the package.
+func TestRestoreLogger_restoresLogPackage(t *testing.T) {
+	prevWriter, prevFlags := log.Writer(), log.Flags()
+	t.Cleanup(func() {
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+	})
+	var sentinel bytes.Buffer
+	log.SetOutput(&sentinel)
+	log.SetFlags(log.Lshortfile)
+
+	t.Run("swap", func(t *testing.T) {
+		restoreLogger(t)
+		var captured bytes.Buffer
+		slog.SetDefault(slog.New(slog.NewTextHandler(&captured, nil)))
+		slog.Info("captured")
+		if captured.Len() == 0 {
+			t.Fatal("the swapped handler captured nothing; the swap itself is broken, so the restore assertions below would be vacuous")
+		}
+	})
+
+	if got := log.Writer(); got != io.Writer(&sentinel) {
+		t.Errorf("after restoreLogger cleanup, log.Writer() = %T, want the sentinel *bytes.Buffer", got)
+	}
+	if got := log.Flags(); got != log.Lshortfile {
+		t.Errorf("after restoreLogger cleanup, log.Flags() = %d, want %d", got, log.Lshortfile)
 	}
 }

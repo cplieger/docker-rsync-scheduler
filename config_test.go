@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -906,8 +907,7 @@ func TestLoadSyncTimeout_NonPositiveWarnsWithFallback(t *testing.T) {
 }
 
 func TestSetupLogger_levelMapping(t *testing.T) {
-	orig := slog.Default()
-	t.Cleanup(func() { slog.SetDefault(orig) })
+	restoreLogger(t)
 
 	tests := []struct {
 		name string
@@ -952,7 +952,12 @@ func TestSetupLogger_levelMapping(t *testing.T) {
 // os.Stderr plus the global slog default.
 func captureSetupLoggerStderr(t *testing.T, level string) string {
 	t.Helper()
-	originalLogger := slog.Default()
+	originalLogger, originalWriter, originalFlags := slog.Default(), log.Writer(), log.Flags()
+	restoreLoggerTo := func() {
+		slog.SetDefault(originalLogger)
+		log.SetOutput(originalWriter)
+		log.SetFlags(originalFlags)
+	}
 	originalStderr := os.Stderr
 	stderrPath := filepath.Join(t.TempDir(), "stderr")
 	stderr, err := os.Create(stderrPath)
@@ -962,7 +967,7 @@ func captureSetupLoggerStderr(t *testing.T, level string) string {
 	os.Stderr = stderr
 	t.Cleanup(func() {
 		os.Stderr = originalStderr
-		slog.SetDefault(originalLogger)
+		restoreLoggerTo()
 		_ = stderr.Close()
 	})
 	t.Setenv("LOG_LEVEL", level)
@@ -973,7 +978,7 @@ func captureSetupLoggerStderr(t *testing.T, level string) string {
 		t.Fatalf("close stderr capture: %v", err)
 	}
 	os.Stderr = originalStderr
-	slog.SetDefault(originalLogger)
+	restoreLoggerTo()
 	out, err := os.ReadFile(stderrPath)
 	if err != nil {
 		t.Fatalf("read stderr capture: %v", err)
