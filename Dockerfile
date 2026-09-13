@@ -84,11 +84,11 @@ RUN cat > /out/rsync-scheduler.cdx.json <<EOF
   "version": 1,
   "components": [
     {
-      "bom-ref": "pkg:generic/rsync@${RSYNC_VERSION#v}?download_url=https://download.samba.org/pub/rsync/src/rsync-${RSYNC_VERSION#v}.tar.gz",
+      "bom-ref": "pkg:generic/rsync@${RSYNC_VERSION#v}",
       "type": "application",
       "name": "rsync",
       "version": "${RSYNC_VERSION#v}",
-      "purl": "pkg:generic/rsync@${RSYNC_VERSION#v}?download_url=https://download.samba.org/pub/rsync/src/rsync-${RSYNC_VERSION#v}.tar.gz",
+      "purl": "pkg:generic/rsync@${RSYNC_VERSION#v}?download_url=https://download.samba.org/pub/rsync/src/rsync-${RSYNC_VERSION#v}.tar.gz&checksum=sha256:${RSYNC_SHA256}",
       "cpe": "cpe:2.3:a:samba:rsync:${RSYNC_VERSION#v}:*:*:*:*:*:*:*"
     }
   ]
