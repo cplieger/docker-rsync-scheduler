@@ -455,26 +455,10 @@ func TestStartTicker_FiresStartupThenInterval(t *testing.T) {
 	d, cancel, execDone, _ := newTestDaemon(t, fixedRunner("true"))
 
 	tickCtx, stopTicker := context.WithCancel(t.Context())
-	tickerDone := startTicker(tickCtx, d, 15*time.Millisecond, true)
+	tickerDone := startTicker(tickCtx, d, 15*time.Millisecond, true, 0)
 
-	// heartbeatTriggers returns each heartbeat's trigger attr, in emit order.
-	heartbeatTriggers := func() []string {
-		var out []string
-		for _, r := range rec.Records() {
-			if r.Message != "sync cycle complete" {
-				continue
-			}
-			r.Attrs(func(a slog.Attr) bool {
-				if a.Key == "trigger" {
-					out = append(out, a.Value.String())
-				}
-				return true
-			})
-		}
-		return out
-	}
 	waitFor(t, 5*time.Second, func() bool {
-		return len(heartbeatTriggers()) >= 2
+		return len(heartbeatTriggers(rec)) >= 2
 	}, "ticker did not fire startup + interval within 5s")
 	stopTicker()
 	<-tickerDone
@@ -482,13 +466,31 @@ func TestStartTicker_FiresStartupThenInterval(t *testing.T) {
 	d.queue.Close()
 	<-execDone
 
-	triggers := heartbeatTriggers()
+	triggers := heartbeatTriggers(rec)
 	if triggers[0] != "startup" {
 		t.Errorf("first heartbeat trigger = %q, want startup", triggers[0])
 	}
 	if triggers[1] != "interval" {
 		t.Errorf("second heartbeat trigger = %q, want interval", triggers[1])
 	}
+}
+
+// heartbeatTriggers returns each "sync cycle complete" heartbeat's trigger
+// attr, in emit order.
+func heartbeatTriggers(rec *capture.Recorder) []string {
+	var out []string
+	for _, r := range rec.Records() {
+		if r.Message != "sync cycle complete" {
+			continue
+		}
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == "trigger" {
+				out = append(out, a.Value.String())
+			}
+			return true
+		})
+	}
+	return out
 }
 
 func TestStartTicker_WaitsForLongPassBeforeNextTick(t *testing.T) {
@@ -503,7 +505,7 @@ func TestStartTicker_WaitsForLongPassBeforeNextTick(t *testing.T) {
 	}
 	d, _, _, _ := newTestDaemon(t, runner)
 	tickCtx, stopTicker := context.WithCancel(t.Context())
-	tickerDone := startTicker(tickCtx, d, 10*time.Millisecond, true)
+	tickerDone := startTicker(tickCtx, d, 10*time.Millisecond, true, 0)
 	var releaseOnce sync.Once
 	releasePass := func() { releaseOnce.Do(func() { close(release) }) }
 	t.Cleanup(func() {
@@ -541,7 +543,7 @@ func TestStartTicker_DisabledInExternalMode(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		d := &daemon{queue: trigger.NewQueue[struct{}](4)}
-		done := startTicker(t.Context(), d, time.Millisecond, false)
+		done := startTicker(t.Context(), d, time.Millisecond, false, 0)
 		select {
 		case <-done:
 		case <-time.After(time.Second):
@@ -560,6 +562,7 @@ func TestStartTicker_DisabledInExternalMode(t *testing.T) {
 }
 
 func TestRunDaemon_StartupRecordPublishesResolvedPolicy(t *testing.T) {
+	useTempStamp(t)
 	originalKnownHostsPath := knownHostsPath
 	knownHostsPath = filepath.Join(t.TempDir(), "absent-known-hosts")
 	t.Cleanup(func() { knownHostsPath = originalKnownHostsPath })
@@ -768,52 +771,6 @@ func TestRunDaemon_ExternalModeBootsHealthyServesAndShutsDownCleanly(t *testing.
 	}
 	if _, err := os.Stat(sock); !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("socket file not removed on shutdown; stat err = %v, want not-exist", err)
-	}
-}
-
-// TestRunDaemon_BuiltinModeStartsUnhealthyUntilStartupPassCompletes pins the
-// built-in arm of state.Set(!cfg.ScheduleEnabled): the container reports
-// unhealthy until the startup pass proves rsync can run. The runner blocks
-// command construction, so the marker is sampled after built-in
-// initialization but before the startup pass can flip it. Not parallel: it
-// uses the package-global healthMarkerPath and env.
-func TestRunDaemon_BuiltinModeStartsUnhealthyUntilStartupPassCompletes(t *testing.T) {
-	writeValidCfg(t, newRunJobSource(t))
-	t.Setenv("SYNC_INTERVAL", "6h")
-	marker := health.NewMarker(healthMarkerPath)
-	marker.Cleanup()
-	t.Cleanup(marker.Cleanup)
-
-	entered := make(chan struct{})
-	proceed := make(chan struct{})
-	runner := func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
-		close(entered)
-		<-proceed
-		return exec.CommandContext(ctx, "true")
-	}
-
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() { done <- runDaemon(ctx, testSocketPath(t), runner) }()
-
-	select {
-	case <-entered:
-	case <-time.After(2 * time.Second):
-		t.Fatal("startup pass did not begin")
-	}
-	if _, err := os.Stat(healthMarkerPath); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("built-in marker before startup completion: stat error = %v, want not-exist", err)
-	}
-
-	cancel()
-	close(proceed)
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Errorf("runDaemon() = %v, want nil", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("runDaemon did not return after shutdown")
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"log"
 	"log/slog"
 	"net"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
@@ -37,6 +38,33 @@ func newTestHealth(t *testing.T) *health.Latch {
 	return health.NewLatch(health.NewMarker(filepath.Join(t.TempDir(), "marker")))
 }
 
+func newTestStamp(t *testing.T) (stamp *scheduler.Stamp, path string) {
+	t.Helper()
+	path = filepath.Join(t.TempDir(), "last-run")
+	return scheduler.NewStamp(path), path
+}
+
+// recordLine renders a last-run record for a pass that completed age ago;
+// Record always stamps now, so a test writes the line itself.
+func recordLine(age time.Duration, outcome string) string {
+	return time.Now().Add(-age).UTC().Format(time.RFC3339Nano) + " " + outcome + "\n"
+}
+
+func writeRecord(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("seed last-run record: %v", err)
+	}
+}
+
+func useTempStamp(t *testing.T) string {
+	t.Helper()
+	original := stampPath
+	stampPath = filepath.Join(t.TempDir(), "last-run")
+	t.Cleanup(func() { stampPath = original })
+	return stampPath
+}
+
 // newTestDaemon builds a daemon wired to a temp health marker and the given
 // runner, with the executor started. Returns the daemon, the shutdown cancel,
 // a channel closed when the executor has drained, and the marker path.
@@ -47,11 +75,14 @@ func newTestDaemon(t *testing.T, runner scheduler.CommandRunner) (d *daemon, can
 	// cancelled by the time cleanup runs.
 	ctx, cancelCtx := context.WithCancel(context.Background())
 	markerPath = filepath.Join(t.TempDir(), "marker")
+	stamp, stampFile := newTestStamp(t)
 	d = &daemon{
-		queue:   trigger.NewQueue[struct{}](queueCapacity),
-		health:  health.NewLatch(health.NewMarker(markerPath)),
-		newCmd:  runner,
-		timeout: time.Minute,
+		queue:     trigger.NewQueue[struct{}](queueCapacity),
+		health:    health.NewLatch(health.NewMarker(markerPath)),
+		stamp:     stamp,
+		stampPath: stampFile,
+		newCmd:    runner,
+		timeout:   time.Minute,
 	}
 	executorDone := make(chan struct{})
 	go func() {
@@ -92,11 +123,14 @@ func startTestServer(t *testing.T, runner scheduler.CommandRunner) (sock string,
 	// Not t.Context(): the executor and server are torn down by the t.Cleanup
 	// below, which cancels this context and then waits for the drain.
 	ctx, cancel := context.WithCancel(context.Background())
+	stamp, stampFile := newTestStamp(t)
 	d = &daemon{
-		queue:   trigger.NewQueue[struct{}](queueCapacity),
-		health:  newTestHealth(t),
-		newCmd:  runner,
-		timeout: time.Minute,
+		queue:     trigger.NewQueue[struct{}](queueCapacity),
+		health:    newTestHealth(t),
+		stamp:     stamp,
+		stampPath: stampFile,
+		newCmd:    runner,
+		timeout:   time.Minute,
 	}
 	execDone := make(chan struct{})
 	go func() { defer close(execDone); trigger.Execute(ctx, d.queue, d.run) }()

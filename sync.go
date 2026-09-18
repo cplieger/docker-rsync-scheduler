@@ -483,6 +483,11 @@ type passResult struct {
 // failed. Interrupted and unstarted jobs are not failures.
 func (r *passResult) healthy() bool { return r.failed == 0 }
 
+// vouchable reports whether this pass reached a verdict it can publish to the
+// health marker and the last-run record: an interrupted pass with no failure
+// completed nothing to vouch for.
+func (r *passResult) vouchable() bool { return !r.interrupted || r.failed > 0 }
+
 // runPass runs every job once and returns their aggregate result. The
 // daemon's single executor is the only caller and owns serialization.
 func runPass(ctx context.Context, cfg config, timeout time.Duration, tr transport, trig string, newCmd scheduler.CommandRunner) passResult {

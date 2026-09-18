@@ -110,6 +110,8 @@ RUN echo "OS package refresh: ${PKG_REFRESH}" \
         zlib \
         zstd-libs
 
+RUN mkdir -p /data
+
 COPY --chmod=755 --from=rsync-builder /out/usr/bin/rsync /usr/bin/rsync
 COPY --from=rsync-builder /out/rsync-scheduler.cdx.json /usr/share/sbom/rsync-scheduler.cdx.json
 COPY --chmod=755 --from=go-builder /docker-rsync-scheduler /usr/local/bin/docker-rsync-scheduler
