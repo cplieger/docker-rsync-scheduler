@@ -138,6 +138,10 @@ func setupLogger() {
 	}
 }
 
+// stampPath is the built-in scheduler's last-run record; a /data volume
+// carries it across a container recreate.
+var stampPath = "/data/.docker-rsync-scheduler-last-run"
+
 // configPath returns the active config path, honouring CONFIG_PATH.
 func configPath() string {
 	return cmp.Or(envx.String("CONFIG_PATH"), defaultConfigPath)

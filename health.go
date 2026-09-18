@@ -35,14 +35,12 @@ func probeOptions() []health.ProbeOption {
 }
 
 // applyPassHealth maps rsync's pass policy onto the shared shutdown latch.
-// An interrupted pass with no job failure writes nothing: its partial success
-// must not replace the last completed pass's health. Every other result writes
-// its ordinary healthy verdict; the latch prevents a late healthy verdict from
-// masking shutdown.
+// An unvouchable pass writes nothing: its partial success must not replace
+// the last completed pass's health. Every other result writes its ordinary
+// healthy verdict; the latch prevents a late healthy verdict from masking
+// shutdown.
 func applyPassHealth(latch *health.Latch, result *passResult) {
-	healthy := result.healthy()
-	if result.interrupted && healthy {
-		return
+	if result.vouchable() {
+		latch.Set(result.healthy())
 	}
-	latch.Set(healthy)
 }

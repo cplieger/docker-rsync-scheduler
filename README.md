@@ -33,6 +33,7 @@ services:
     volumes:
       - ./config:/config:ro  # config/config.yaml; see "Editing the config of a running container"
       - ./id_ed25519:/keys/id_ed25519:ro
+      - ./data:/data  # last-run record; keeps the schedule across recreates and image updates
       - /srv/source/certs:/sources/certs:ro
 ```
 
@@ -49,7 +50,9 @@ The container runs in one of two modes, selected by `SYNC_INTERVAL`.
 
 ### Built-in scheduler (default)
 
-Set `SYNC_INTERVAL` to a Go duration (`6h`, `1h`, `30m`, …). The container runs a sync pass at startup and then every interval. This is the zero-dependency default; nothing else is required. On an unset or unparseable (non-sentinel) value it falls back to `6h`.
+Set `SYNC_INTERVAL` to a Go duration (`6h`, `1h`, `30m`, …). The container runs a sync pass at startup when one is due, and then every interval. This is the zero-dependency default; nothing else is required. On an unset or unparseable (non-sentinel) value it falls back to `6h`.
+
+A restart does not reset the schedule. The daemon records when its last scheduled pass completed and whether it succeeded in `/data/.docker-rsync-scheduler-last-run`. When the container starts and that record shows a successful pass younger than `SYNC_INTERVAL`, the startup pass is skipped and the first tick fires at the time the record still had left (a pass 2h old on a 6h schedule ticks 4h after boot), so an image update or a `docker compose up` neither adds a pass nor delays the next one. A failed last pass still reruns at boot, so a fixed config gives immediate feedback. Passes triggered with `sync` do not update the record. A record dated in the future (a restored `/data`, a clock stepped back) counts as fresh until the clock catches up, so the first pass can land up to one full interval after boot. A record the daemon can read but not rewrite (a read-only `/data`) is ignored: that boot runs the startup pass and logs why. Without a `/data` volume the record lives in the container's writable layer, so a `docker restart` keeps the schedule but recreating the container (`docker rm`, an image update) loses it, and that boot runs a startup pass; a mounted `/data` survives recreation and image updates.
 
 ### External scheduler
 
@@ -94,7 +97,7 @@ Overlapping passes cannot happen in either mode: the daemon runs passes strictly
 | Variable | Description | Default | Required |
 | --- | --- | --- | --- |
 | `CONFIG_PATH` | Path to the YAML config inside the container | `/config/config.yaml` | No |
-| `SYNC_INTERVAL` | Built-in scheduler cadence as a Go duration (e.g. `6h`, `30m`); the first pass runs at startup. Set `off` (or `disabled`/`0`) for external triggering, see [Scheduling modes](#scheduling-modes). Falls back to `6h` on unset or unparseable (non-sentinel) values. | `6h` | No |
+| `SYNC_INTERVAL` | Built-in scheduler cadence as a Go duration (e.g. `6h`, `30m`); a startup pass runs unless the `/data` record shows a successful pass within the interval. Set `off` (or `disabled`/`0`) for external triggering, see [Scheduling modes](#scheduling-modes). Falls back to `6h` on unset or unparseable (non-sentinel) values. | `6h` | No |
 | `SYNC_TIMEOUT` | Per-job rsync timeout as a Go duration (e.g. `10m`, `1h`). Falls back to the default on unset, non-positive, or unparseable values, so `0` does not disable the timeout. | `10m` | No |
 | `LOG_LEVEL` | Log level: `debug`, `info`, `warn` (or `warning`), or `error`. Values are case-insensitive; surrounding whitespace is ignored. The startup record (`container started`) and the per-pass heartbeat (`sync cycle complete`) are Info records, so `warn` and `error` remove them and disarm the staleness alert below. | `info` | No |
 | `SYNC_ACLS` | `true`, `1`, `yes`, or `on` adds rsync `-A` (`--acls`); `false`, `0`, `no`, or `off` disables it. Values are case-insensitive; surrounding whitespace is ignored. The remote rsync must support ACLs; verify against your target, because a restricted wrapper such as `rrsync` can filter the option set. | `false` | No |
@@ -133,11 +136,12 @@ Every job also receives a fixed set of global excludes: `.stfolder`, `.stversion
 | `/config/config.yaml` | The YAML config (mount read-only). Override the path with `CONFIG_PATH`. |
 | `/config/known_hosts` | Optional SSH known_hosts file (mount read-only). When present, enables strict host-key pinning instead of TOFU. See [SSH host-key verification](#ssh-host-key-verification). |
 | `/keys/<name>` | SSH private key(s). Mount read-only; the host file must be mode `0600`. |
+| `/data` | Optional. Holds the built-in scheduler's last-run record. Without a mount the record survives a restart of the same container but not its recreation; mount a volume here so the schedule also survives recreation and image updates. Give it a directory of its own rather than one shared with another container: the daemon writes the record as root and follows symlinks. Unused in external mode. |
 | (your sources) | The `local` directories referenced by your jobs. Mount read-only. |
 
 ## Healthcheck
 
-The built-in healthcheck (`docker-rsync-scheduler health`) checks for a marker file that is set after each sync pass: healthy when the most recent pass had zero failed jobs, unhealthy when any job failed. A pass that cannot reload the config runs no job and also leaves the marker unhealthy. Empty-source skips count as success. A pass whose rsync ends with the vanished-files warning (exit 24) also counts as success: it logs `level=WARN msg="sync completed with vanished source files"` with the exit code and the byte counts, and leaves the marker healthy. The container recovers automatically on the next clean pass, no restart required. In built-in mode it begins unhealthy and flips after the startup pass, so size `healthcheck.start_period` for the time the initial pass may take (the baked default is 120s); built-in mode also arms a freshness deadline of `2×SYNC_INTERVAL + jobs×SYNC_TIMEOUT`, so a wedged interval loop (marker present but never refreshed) eventually probes unhealthy. In external mode the container starts healthy (idle, nothing has failed), each triggered `sync` updates the marker, and no deadline is armed (a marker between sparse triggers must not expire).
+The built-in healthcheck (`docker-rsync-scheduler health`) checks for a marker file that is set after each sync pass: healthy when the most recent pass had zero failed jobs, unhealthy when any job failed. A pass that cannot reload the config runs no job and also leaves the marker unhealthy. Empty-source skips count as success. A pass whose rsync ends with the vanished-files warning (exit 24) also counts as success: it logs `level=WARN msg="sync completed with vanished source files"` with the exit code and the byte counts, and leaves the marker healthy. The container recovers automatically on the next clean pass, no restart required. Within one daemon lifetime, health reflects the outcome of the last pass, whatever triggered it: the marker is written only after the pass has ended, from the exit status of every `rsync` it ran, so an `rsync` that cannot start or exits non-zero is a failed job and the container turns unhealthy. After a restart, built-in mode can restore health only from the last scheduled pass's record, because triggered passes never record. In built-in mode it begins unhealthy and flips after the startup pass, so size `healthcheck.start_period` for the time the initial pass may take (the baked default is 120s); when the record shows a successful scheduled pass within the interval, the startup pass is skipped and the container boots healthy on that record. Built-in mode also arms a freshness deadline of `2×SYNC_INTERVAL + jobs×SYNC_TIMEOUT`, so a wedged interval loop (marker present but never refreshed) eventually probes unhealthy. In external mode the container starts healthy (idle, nothing has failed), each triggered `sync` updates the marker, and no deadline is armed (a marker between sparse triggers must not expire).
 
 > An empty source is skipped as a success, so a job whose source silently becomes empty (for example a read-only bind mount that failed to mount and Docker materialised as an empty directory) keeps the container healthy and never logs at `level=ERROR`; it is invisible to both the error-level and heartbeat-absence alerts. Each skip emits a `level=WARN msg="skip empty source"` line and the `sync cycle complete` heartbeat carries a `skipped` count. Alert on a persistently non-zero `skipped` (or `skipped == jobs`) across several consecutive passes, or on the recurring warning, to catch a vanished source before the remote mirror goes stale.
 
@@ -182,11 +186,12 @@ groups:
           summary: "docker-rsync-scheduler has not completed a sync pass in 8h"
           description: >
             docker-rsync-scheduler logs a "sync cycle complete" line at the end
-            of every pass that runs; the built-in scheduler runs one at startup
-            and then every SYNC_INTERVAL (default 6h). None in 8h while the
-            container is up means the scheduler is wedged or dead, which a
-            fault-only ruleset misses because a stalled scheduler emits no
-            "sync failed" line either. Restart the container.
+            of every pass that runs; the built-in scheduler runs one every
+            SYNC_INTERVAL (default 6h), and a restart keeps that cadence, so two
+            heartbeats are never more than one interval plus one pass apart.
+            None in 8h while the container is up means the scheduler is wedged
+            or dead, which a fault-only ruleset misses because a stalled
+            scheduler emits no "sync failed" line either. Restart the container.
 ```
 
 `RsyncSchedulerStalled` matches an Info record, so it needs `LOG_LEVEL` at
@@ -203,8 +208,9 @@ job's completion line), which distinguishes "the trigger stopped firing" from
 "the container died".
 
 Thresholds and the `severity` label are starting points: size the stall window
-to your pass cadence (`SYNC_INTERVAL` in built-in mode, your external
-scheduler's period otherwise; the 8h default assumes 6h), adjust the
+to your pass cadence plus the longest pass (`SYNC_INTERVAL` + `jobs x SYNC_TIMEOUT`
+in built-in mode, your external scheduler's period otherwise; the 8h default
+assumes 6h with a few jobs at the 10m timeout), adjust the
 `container` selector (or `job` / `service`, depending on your log collector) to
 your deployment, and route by whatever labels your Alertmanager uses. Two
 classes count as a success and so never trip the fault rule: a source that has
@@ -264,7 +270,7 @@ This project packages [rsync](https://rsync.samba.org/) (GPL-3.0) and the [OpenS
 
 ## Contributing
 
-Issues and pull requests are welcome. Please open an issue first for larger changes so the approach can be discussed before implementation.
+Issues and pull requests are welcome. Please open an issue first for larger changes so the approach can be discussed before implementation. [CONTRIBUTING.md](CONTRIBUTING.md) covers the layout, the guardrails, and how to run the checks and the image smoke test locally.
 
 ## Disclaimer
 
