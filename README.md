@@ -280,4 +280,6 @@ This project was built with AI-assisted tooling using [Claude](https://claude.co
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE). The image carries the license text of every bundled component under `/usr/share/licenses/`. The Alpine packages in the image ship no license file upstream, so their license texts are kept under `licenses/` in this repository and copied in.
+
+The bundled component is rsync itself, which is GPL-3.0-or-later. The build fetches the pinned release tarball `https://download.samba.org/pub/rsync/src/rsync-3.5.0.tar.gz` (`RSYNC_VERSION=v3.5.0`), verifies the detached upstream signature and then the pinned SHA256, and applies no patches to the extracted source. rsync's own `COPYING` travels in the image at `/usr/share/licenses/rsync/COPYING`, and the upstream project is [RsyncProject/rsync](https://github.com/RsyncProject/rsync). That tarball and this repository's `Dockerfile` are the complete recipe for the rsync binary in the image, which is how anyone who receives it gets the corresponding source.
