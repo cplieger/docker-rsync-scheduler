@@ -17,6 +17,10 @@ COPY *.go ./
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /docker-rsync-scheduler .
+COPY LICENSE NOTICE ./
+COPY scripts/collect-licenses.sh scripts/
+RUN --mount=type=cache,target=/go/pkg/mod \
+    sh scripts/collect-licenses.sh --name docker-rsync-scheduler .
 
 FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS rsync-builder
 
@@ -72,7 +76,8 @@ RUN curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 5 --r
         --disable-openssl \
     && make -j"$(nproc)" \
     && strip rsync \
-    && install -D -m 755 rsync /out/usr/bin/rsync
+    && install -D -m 755 rsync /out/usr/bin/rsync \
+    && install -D -m 644 COPYING /out/usr/share/licenses/rsync/COPYING
 
 # Syft inventories the final image from APK metadata and Go buildinfo, so the
 # source-built rsync is invisible to the release SBOM. The fragment must land
@@ -114,7 +119,10 @@ RUN mkdir -p /data
 
 COPY --chmod=755 --from=rsync-builder /out/usr/bin/rsync /usr/bin/rsync
 COPY --from=rsync-builder /out/rsync-scheduler.cdx.json /usr/share/sbom/rsync-scheduler.cdx.json
+COPY --from=rsync-builder /out/usr/share/licenses /usr/share/licenses
 COPY --chmod=755 --from=go-builder /docker-rsync-scheduler /usr/local/bin/docker-rsync-scheduler
+COPY --from=go-builder /out/usr/share/licenses /usr/share/licenses
+COPY licenses/ /usr/share/licenses/
 
 # The final stage depends on this stage's marker, so the smoke test gates the default target.
 FROM base AS test
