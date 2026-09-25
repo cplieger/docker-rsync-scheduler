@@ -1,10 +1,10 @@
 # check=error=true
 
 # renovate: datasource=github-tags depName=RsyncProject/rsync
-ARG RSYNC_VERSION=v3.5.0
+ARG RSYNC_VERSION=v3.5.1
 # The src/ archive path keeps every release; its parent keeps only the current one, so pin from src/.
 # repin: dep=RsyncProject/rsync url=https://download.samba.org/pub/rsync/src/rsync-{version_nov}.tar.gz
-ARG RSYNC_SHA256=c7ffd1ef653e99540f661e47cb00b7f9cad1ee6b972399b16f93d672656e0d33
+ARG RSYNC_SHA256=c55f9c9dc10fb8bec397b399a0fdded53cc9a2d8e30891bb0d63724d25c37bef
 
 FROM golang:1.26-trixie@sha256:87ffdb09b6a2e29ff910748b745395e8a0299aa80b7c0551cdca9b55e3fd2b3e AS go-builder
 ENV GOTOOLCHAIN=auto
