@@ -43,10 +43,10 @@ RUN apk add --no-cache \
 ARG RSYNC_VERSION
 ARG RSYNC_SHA256
 WORKDIR /build/rsync
-# Andrew Tridgell's rsync release signing key, dearmored (fingerprint
-# 9FEF112DCE19A0DC7E882CB81BB24997A8535F6F).
-# https://rsync.samba.org/download.html names him as the signer of every
-# release from 3.4.0.
+# rsync release signing keys, dearmored: Andrew Tridgell
+# (9FEF112DCE19A0DC7E882CB81BB24997A8535F6F) and Zen Dodd
+# (C0E1054505704F757D925AB26A64E8AA2EFBCF5D, release authority per rsync NEWS 3.5.1).
+# gpgv fails on any signature whose key is missing, so every co-signer must be here.
 COPY rsync-release.gpg /usr/local/share/rsync-release.gpg
 # The dist tarball, not the auto-generated GitHub tag archive. Both gates are
 # fail-closed and the order matters: a bad signature stops the build before the

@@ -66,6 +66,9 @@ mechanics are tested in those libraries. This repo tests the policy on top.
 - The rsync tarball is verified twice before extraction (`gpgv` against the
   committed `rsync-release.gpg`, then `sha256sum -c`). Keep both gates; the
   digest ARG is recomputed by Renovate, the signature is what proves origin.
+  `gpgv` fails when any signature's key is missing, so a release co-signed by
+  a new maintainer needs that key appended to the keyring (verify it against
+  the maintainer's GitHub GPG keys and the signed release tag first).
 
 ## Conventions and gotchas
 
