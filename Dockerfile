@@ -74,6 +74,7 @@ RUN curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 5 --r
         --without-included-zlib \
         --disable-md2man \
         --disable-openssl \
+        --disable-idn \
     && make -j"$(nproc)" \
     && strip rsync \
     && install -D -m 755 rsync /out/usr/bin/rsync \
