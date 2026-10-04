@@ -140,7 +140,7 @@ COPY --from=test /tests-passed /tests-passed
 
 # start-period absorbs the first built-in pass (the container is unhealthy until
 # it completes). Size it to your slowest expected initial sync; override
-# per-deploy via compose healthcheck.start_period. See README "Healthcheck".
+# per-deploy via compose healthcheck.start_period. See docs/how-it-works.md "Health".
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=120s \
     CMD ["/usr/local/bin/docker-rsync-scheduler", "health"]
 ENTRYPOINT ["/usr/local/bin/docker-rsync-scheduler"]
