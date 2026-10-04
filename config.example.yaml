@@ -1,39 +1,41 @@
-# docker-rsync-scheduler — example configuration.
+# docker-rsync-scheduler example configuration.
 #
-# Copy to config.yaml and edit, then mount its containing directory at /config
-# (or point CONFIG_PATH elsewhere). For live updates, atomically rename the new
-# config into that directory. The container fails fast with a clear error if
-# the config is missing or invalid.
+# Copy this file to config.yaml, edit it, then mount its folder at /config.
+# CONFIG_PATH points the container at another path. To update the config while
+# the container runs, write the new file beside it and rename it into place.
+# The container stops with an error that names the problem when the config is
+# missing or invalid.
 #
-# Each job pushes <local>/ to <remote_host>:<remote_path>/ one-way over
-# rsync+ssh. An empty <local> directory skips that job rather than letting
-# --delete wipe the remote; a <local> path that does not exist fails the job.
-# Scheduling is controlled by the
-# SYNC_INTERVAL env var (default 6h built-in; set SYNC_INTERVAL=off to disable
-# the built-in loop and trigger passes externally via `docker-rsync-scheduler sync`).
+# Each job pushes <local>/ to <remote_host>:<remote_path>/ in one direction,
+# over rsync and ssh. A job whose <local> folder is empty is skipped, so
+# --delete cannot wipe the remote. A <local> path that does not exist fails the
+# job.
 #
-# Placeholder hosts use the RFC 5737 documentation range (192.0.2.0/24).
+# SYNC_INTERVAL sets the schedule and defaults to 6h. With SYNC_INTERVAL=off
+# the container runs a pass only when you run `docker-rsync-scheduler sync`.
+#
+# The example hosts use the RFC 5737 documentation range, 192.0.2.0/24.
 
 jobs:
-  - name: certs                          # required, unique; used as a log key
+  - name: certs                          # required and unique, used as a log key
     local: /sources/certs                # required, absolute path inside the container
     remote_host: root@192.0.2.10         # required, [user@]host
     remote_path: /srv/certs              # required, absolute path on the remote
-    remote_uid: 1000                     # optional; with remote_gid -> rsync --chown=uid:gid
+    remote_uid: 1000                     # optional, with remote_gid adds rsync --chown=uid:gid
     remote_gid: 1000                     # optional
-    ssh_key: /keys/id_ed25519            # required, private key path inside the container (host file mode 0600)
-    delete: true                         # optional (default false) -> rsync --delete when true
-    max_delete: 100                      # optional; with delete -> rsync --max-delete=N: deletes at
-                                         # most N, then skips the rest and FAILS the pass (exit 25 ->
-                                         # sync failed + unhealthy; exit 24 instead if a source file
-                                         # also vanished in that pass).
-                                         # 0 refuses all deletions and fails the pass if anything would have been deleted.
-                                         # Unset -> uncapped
-    excludes:                            # optional, per-job exclude patterns (plus the built-in globals)
+    ssh_key: /keys/id_ed25519            # required, private key path inside the container, host file mode 0600
+    delete: true                         # optional (default false), true adds rsync --delete
+    max_delete: 100                      # optional, with delete adds rsync --max-delete=N.
+                                         # rsync deletes at most N files, then skips the rest and
+                                         # fails the pass, which logs sync failed and turns the
+                                         # container unhealthy. 0 refuses every deletion and fails
+                                         # the pass when anything would have been deleted.
+                                         # Unset leaves deletions uncapped.
+    excludes:                            # optional, exclude patterns for this job, added to the built-in ones
       - "**/*.lock"
       - "logs"
 
-  - name: appconfig                      # a second, minimal job (no chown, no delete)
+  - name: appconfig                      # a second, minimal job with no chown and no delete
     local: /sources/appconfig
     remote_host: deploy@192.0.2.11
     remote_path: /etc/myapp
