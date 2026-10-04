@@ -124,7 +124,7 @@ Every job also gets a fixed set of excludes: `.stfolder`, `.stversions`, `.DS_St
 -e "ssh -i <key> -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10"
 ```
 
-When a `known_hosts` file is mounted, strict host-key checking replaces `accept-new`, as [Security](security.md#ssh-host-key-verification) describes.
+When a `known_hosts` file is mounted, strict host-key checking replaces `accept-new`, as [Security](hardening.md#ssh-host-key-verification) describes.
 
 ## Editing the config of a running container
 
@@ -135,7 +135,7 @@ For live updates, mount the folder that holds `config.yaml` at `/config` instead
 | Mount | Description |
 | --- | --- |
 | `/config/config.yaml` | The job file, mounted read-only |
-| `/config/known_hosts` | Optional. Pins the remote host keys, see [Security](security.md#ssh-host-key-verification) |
+| `/config/known_hosts` | Optional. Pins the remote host keys, see [Security](hardening.md#ssh-host-key-verification) |
 | `/keys/<name>` | SSH private keys, mounted read-only. The host file must be mode `0600` |
 | `/data` | Optional. Keeps the schedule when the container is recreated. Give it a folder of its own |
 | your source folders | The `local` folders of your jobs, mounted read-only |

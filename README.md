@@ -114,7 +114,7 @@ The container runs as root so it can read source files owned by any host user. M
 
 On first contact the container trusts the remote's host key and remembers it until the container is recreated. To pin keys instead, run `ssh-keyscan -t ed25519 192.0.2.10 > known_hosts`, check that the file is not empty, and mount it read-only at `/config/known_hosts`. The container then rejects a host whose key does not match, and it refuses to start when that file holds no entries.
 
-[Security](docs/security.md) covers a read-only root filesystem, the checks on each field and what the image contains.
+[Security](docs/hardening.md) covers a read-only root filesystem, the checks on each field and what the image contains.
 
 ## Troubleshooting
 
@@ -136,7 +136,7 @@ docker-rsync-scheduler has no metrics endpoint. It writes logfmt logs to the con
 
 - [Configuration](docs/configuration.md) lists every setting, both scheduling modes and the rsync command each job runs.
 - [How docker-rsync-scheduler works](docs/how-it-works.md) explains passes, the empty-source guard and health.
-- [Security](docs/security.md) covers hardening, host-key pinning and what the image contains.
+- [Security](docs/hardening.md) covers hardening, host-key pinning and what the image contains.
 - [Monitoring and alerts](docs/monitoring.md) lists the log lines and the alert rules.
 
 ## Credits
