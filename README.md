@@ -145,7 +145,7 @@ This project packages [rsync](https://rsync.samba.org/), licensed GPL-3.0-or-lat
 
 ## Contributing
 
-Issues and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers the layout, the guardrails and how to run the checks and the image smoke test locally.
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Disclaimer
 
