@@ -37,13 +37,10 @@ groups:
         annotations:
           summary: "docker-rsync-scheduler logged an error"
           description: >
-            The container logged an Error record. A failed job logs
-            "sync failed" with rsync_exit, timed_out and the end of rsync's
-            error output. A source-read failure logs its path and error instead.
-            A config edit the container cannot reload logs "config reload failed"
-            and runs no job. The affected remote copy is now stale. Check the
-            config, the source path, the remote host, the SSH key and the
-            connection.
+            docker-rsync-scheduler logged an Error record, so a remote copy
+            is now stale. Read the "sync failed" or "config reload failed"
+            line, then check the config, the source path, the remote host,
+            the SSH key and the connection.
       - alert: RsyncSchedulerStalled
         expr: |
           absent_over_time({container="rsync"} |= `sync cycle complete` [8h])
@@ -53,15 +50,14 @@ groups:
         annotations:
           summary: "docker-rsync-scheduler has not completed a sync pass in 8h"
           description: >
-            docker-rsync-scheduler logs a "sync cycle complete" line at the end
-            of every pass that runs. The built-in scheduler runs one every
-            SYNC_INTERVAL, 6h by default, and a restart keeps that schedule, so
-            two lines are never more than one interval plus one pass apart. No
-            line in 8h usually means passes stopped running, which a fault rule
-            misses because a stopped scheduler logs no error either. Rule out a
-            stopped or renamed container and a stopped log pipeline, then
-            restart the container.
+            No "sync cycle complete" line in 8h, so passes have probably
+            stopped running. Rule out a stopped or renamed container and a
+            stopped log pipeline, then restart the container.
 ```
+
+`RsyncSchedulerSyncFailed` fires on any Error record. A failed job logs `sync failed` with `rsync_exit`, `timed_out` and the end of rsync's error output. A source-read failure logs its path and error instead. A config edit the container cannot reload logs `config reload failed`, and then no job runs.
+
+`RsyncSchedulerStalled` relies on the `sync cycle complete` line at the end of every pass. The built-in scheduler runs a pass every `SYNC_INTERVAL`, 6h by default, and a restart keeps that schedule. So two lines are never more than one interval plus one pass apart. The fault rule misses a stopped scheduler, because a stopped scheduler logs no error either.
 
 `RsyncSchedulerStalled` matches an Info record, so it needs `LOG_LEVEL` at `debug` or `info`. At `warn` or `error` the line is never written and the rule fires permanently. The fault rule keys on Error records and works at every level.
 
