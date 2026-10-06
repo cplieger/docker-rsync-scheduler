@@ -1350,8 +1350,8 @@ func TestValidate_sharedDestinationsIdentityIsTheHostComponent(t *testing.T) {
 	const warning = "jobs share a remote destination tree and one deletes"
 
 	tests := []struct{ name, hostA, hostB string }{
-		{"bare host and root@host are one host", "defiant", "root@defiant"},
-		{"DNS case is insignificant", "Defiant", "defiant"},
+		{"bare host and root@host are one host", "backup-host", "root@backup-host"},
+		{"DNS case is insignificant", "Backup-Host", "backup-host"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

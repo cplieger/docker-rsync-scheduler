@@ -45,7 +45,7 @@ services:
 
     volumes:
       # Copy config.example.yaml to config.yaml and list your jobs before the first start.
-      # Its first job deletes remote files that are gone from the source. Remove delete unless you want that.
+      # Its first job deletes remote files that are gone from the source. To keep them, remove its "delete: true" line.
       - "./config.yaml:/config/config.yaml:ro"
       # Create a dedicated key with ssh-keygen and add id_ed25519.pub to authorized_keys on the remote.
       # The remote needs rsync installed.
